@@ -15,6 +15,7 @@ from port_entity_matching.config import MatchConfig, config_from_dict, config_to
 from port_entity_matching.features import FEATURE_NAMES, build_features
 from port_entity_matching.maps import AttributeMaps
 from port_entity_matching.memory import CallSignMemory
+from port_entity_matching.pipeline import Matcher, Prediction, run_submission
 from port_entity_matching.ranker import score_pairs, select_top1, train_ranker
 from port_entity_matching.version import __version__
 
@@ -31,11 +32,14 @@ __all__ = [
     "CandidateSet",
     "CatalogIndex",
     "MatchConfig",
+    "Matcher",
+    "Prediction",
     "__version__",
     "build_features",
     "config_from_dict",
     "config_to_dict",
     "generate_candidates",
+    "run_submission",
     "score_pairs",
     "select_top1",
     "train_ranker",

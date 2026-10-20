@@ -62,6 +62,7 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101", "S105", "S106", "E402", "N802", "N803", "N806", "N813", "N814", "ARG", "I001", "RUF059", "F841", "PT015", "PT018", "B011", "RUF003", "F401", "SIM210", "SIM108", "B009", "SIM300"]
 "tools/verify.py" = ["T201", "S607"]
+"tools/build_submit.py" = ["T201", "S607"]
 
 [tool.ruff.lint.mccabe]
 max-complexity = 15
