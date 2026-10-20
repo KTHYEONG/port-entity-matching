@@ -1,0 +1,277 @@
+"""Contract tests for the pair feature matrix."""
+
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from port_entity_matching.candidates import SRC_NAME, SRC_TOKEN, CandidateSet
+from port_entity_matching.catalog import CatalogIndex
+from port_entity_matching.config import MatchConfig
+from port_entity_matching.features import FEATURE_NAMES, build_features
+from port_entity_matching.maps import AttributeMaps
+from port_entity_matching.records import QueryRecord
+
+
+def _index() -> CatalogIndex:
+    frame = pd.DataFrame(
+        [
+            {
+                "vessel_id": "V0",
+                "vessel_name": "GRAND ACE 11",
+                "gross_tonnage": 100,
+                "vessel_type": "Container",
+                "flag_name": "Panama",
+            },
+            {
+                "vessel_id": "V1",
+                "vessel_name": "Grand Ace1",
+                "gross_tonnage": 100,
+                "vessel_type": "Container",
+                "flag_name": "Panama",
+            },
+            {
+                "vessel_id": "V2",
+                "vessel_name": "Grand Ace 11",
+                "gross_tonnage": 101,
+                "vessel_type": "Bulk",
+                "flag_name": "Liberia",
+            },
+            {
+                "vessel_id": "V3",
+                "vessel_name": "Glovis Spirit",
+                "gross_tonnage": 5000,
+                "vessel_type": "Tanker",
+                "flag_name": "Marshall Islands",
+            },
+        ]
+    )
+    return CatalogIndex.build(frame)
+
+
+def _maps(index: CatalogIndex) -> AttributeMaps:
+    train = pd.DataFrame(
+        [
+            {"vessel_type": "컨테이너선", "flag_name": "파나마", "target_vessel_id": "V0"},
+            {"vessel_type": "컨테이너선", "flag_name": "파나마", "target_vessel_id": "V1"},
+            {"vessel_type": "벌크선", "flag_name": "라이베리아", "target_vessel_id": "V2"},
+        ]
+    )
+    return AttributeMaps.fit(train, index)
+
+
+def _record(
+    name: str,
+    *,
+    igt: float | None = None,
+    gt: float | None = None,
+    vessel_type: str | None = "컨테이너선",
+    flag: str | None = "파나마",
+) -> QueryRecord:
+    return QueryRecord(
+        sample_id="S",
+        vessel_name=name,
+        call_sign=None,
+        gross_tonnage=gt,
+        international_gross_tonnage=igt,
+        flag_name=flag,
+        vessel_type=vessel_type,
+        arrival_year=2020,
+    )
+
+
+def _candidate_set(positions: list[int], sources: int = SRC_NAME) -> CandidateSet:
+    return CandidateSet(
+        np.asarray(positions, dtype=np.int64),
+        np.full(len(positions), sources, dtype=np.uint8),
+    )
+
+
+def _column(name: str) -> int:
+    return FEATURE_NAMES.index(name)
+
+
+def _build(
+    records: list[QueryRecord],
+    sets: list[CandidateSet],
+    index: CatalogIndex | None = None,
+) -> np.ndarray:
+    catalog_index = index or _index()
+    return build_features(records, sets, catalog_index, _maps(catalog_index), MatchConfig())
+
+
+def test_shape_and_names() -> None:
+    records = [_record("GRAND ACE 11", igt=100), _record("글로비스 스피릿", igt=5000)]
+    sets = [_candidate_set([0, 1, 2]), _candidate_set([3, 0])]
+    matrix = _build(records, sets)
+    assert matrix.shape == (5, len(FEATURE_NAMES))
+    assert matrix.dtype == np.float32
+
+
+def test_script_gated_nans() -> None:
+    hangul_rows = _build([_record("글로비스 스피릿", igt=5000)], [_candidate_set([3, 0])])
+    for name in ("lat_dl_sim", "lat_lev_sim", "lat_jw_sim", "lat_token_set", "lat_partial", "lat_prefix", "lat_exact"):
+        assert np.all(np.isnan(hangul_rows[:, _column(name)]))
+    assert np.all(np.isfinite(hangul_rows[:, _column("kor_cons_sim")]))
+    assert hangul_rows[0, _column("is_hangul")] == 1.0
+
+    latin_rows = _build([_record("GRAND ACE 11", igt=100)], [_candidate_set([0, 1])])
+    assert np.all(np.isnan(latin_rows[:, _column("kor_cons_sim")]))
+    assert np.all(np.isnan(latin_rows[:, _column("kor_vow_sim")]))
+    assert np.all(np.isnan(latin_rows[:, _column("kor_cons_jw")]))
+    assert np.all(np.isfinite(latin_rows[:, _column("lat_dl_sim")]))
+    assert latin_rows[0, _column("is_hangul")] == 0.0
+
+
+def test_tonnage_band_flags() -> None:
+    perturbed = _build([_record("GRAND ACE 11", igt=104)], [_candidate_set([0])])
+    assert perturbed[0, _column("band_igt")] == 1.0
+    assert perturbed[0, _column("exact_igt")] == 0.0
+    assert perturbed[0, _column("near_igt")] == 0.0
+
+    exact = _build([_record("GRAND ACE 11", igt=100)], [_candidate_set([0])])
+    assert exact[0, _column("exact_igt")] == 1.0
+    assert exact[0, _column("band_igt")] == 0.0
+
+
+def test_missing_tonnage_is_nan() -> None:
+    matrix = _build([_record("GRAND ACE 11")], [_candidate_set([0])])
+    assert np.isnan(matrix[0, _column("logratio_igt")])
+    assert np.isnan(matrix[0, _column("logratio_gt")])
+    assert matrix[0, _column("query_tonnage_missing")] == 1.0
+
+
+def test_digit_features() -> None:
+    matrix = _build([_record("GRAND ACE 11")], [_candidate_set([1, 2])])
+    assert matrix[0, _column("digits_equal")] == 0.0
+    assert matrix[1, _column("digits_equal")] == 1.0
+    assert np.all(matrix[:, _column("digits_xor")] == 0.0)
+
+
+def test_row_local_rank() -> None:
+    matrix = _build([_record("GRAND ACE 11", igt=100)], [_candidate_set([0, 1, 2])])
+    ranks = matrix[:, _column("primary_rank")]
+    assert int(np.count_nonzero(ranks == 1)) == 1
+    best = int(np.flatnonzero(ranks == 1)[0])
+    assert matrix[best, _column("primary_gap")] == pytest.approx(0.0)
+    assert matrix[:, _column("log_n_candidates")] == pytest.approx(np.log(3))
+
+
+def test_row_independence() -> None:
+    first = _record("GRAND ACE 11", igt=100)
+    second = _record("글로비스 스피릿", igt=5000)
+    sets = [_candidate_set([0, 1, 2]), _candidate_set([3, 0])]
+    together = _build([first, second], sets)
+    alone = _build([first], sets[:1])
+    assert np.array_equal(together[:3], alone, equal_nan=True)
+
+
+def test_source_flags() -> None:
+    index = _index()
+    records = [_record("GRAND ACE 11", igt=100)]
+    sets = [_candidate_set([0, 1], sources=SRC_NAME | SRC_TOKEN)]
+    matrix = _build(records, sets, index)
+    assert np.all(matrix[:, _column("src_name")] == 1.0)
+    assert np.all(matrix[:, _column("src_token")] == 1.0)
+    assert np.all(matrix[:, _column("src_tonnage")] == 0.0)
+
+
+def test_missing_record_attributes_are_nan() -> None:
+    matrix = _build(
+        [_record("GRAND ACE 11", igt=100, vessel_type=None, flag=None)],
+        [_candidate_set([0])],
+    )
+    assert np.isnan(matrix[0, _column("type_logprob")])
+    assert np.isnan(matrix[0, _column("flag_logprob")])
+    assert np.isfinite(matrix[0, _column("type_logprior")])
+
+
+def test_mismatched_lengths_rejected() -> None:
+    with pytest.raises(ValueError, match="same length"):
+        _build([_record("GRAND ACE 11")], [])
+
+
+def test_hangul_acronym_hit() -> None:
+    index = CatalogIndex.build(
+        pd.DataFrame(
+            [
+                {"vessel_id": "K0", "vessel_name": "KMTC VENTURE", "gross_tonnage": 100, "vessel_type": "Tanker", "flag_name": "Panama"},
+                {"vessel_id": "K1", "vessel_name": "OTHER SHIP", "gross_tonnage": 100, "vessel_type": "Tanker", "flag_name": "Panama"},
+            ]
+        )
+    )
+    matrix = _build([_record("케이엠티씨", igt=100)], [_candidate_set([0, 1])], index)
+    assert matrix[0, _column("kor_acronym_hit")] == pytest.approx(1.0)
+    assert matrix[1, _column("kor_acronym_hit")] == pytest.approx(0.0)
+
+
+def test_missing_catalog_tonnage_is_nan() -> None:
+    index = CatalogIndex.build(
+        pd.DataFrame(
+            [
+                {"vessel_id": "G0", "vessel_name": "Alpha", "gross_tonnage": None, "vessel_type": "Tanker", "flag_name": "Panama"},
+            ]
+        )
+    )
+    matrix = _build([_record("ALPHA", igt=100)], [_candidate_set([0])], index)
+    assert np.isnan(matrix[0, _column("logratio_igt")])
+    assert matrix[0, _column("catalog_gt_missing")] == 1.0
+    assert np.isfinite(matrix[0, _column("log_same_gt_count")])
+
+
+def test_empty_canonical_names_yield_nan_prefix() -> None:
+    index = CatalogIndex.build(
+        pd.DataFrame(
+            [
+                {"vessel_id": "E0", "vessel_name": "###", "gross_tonnage": 100, "vessel_type": "Tanker", "flag_name": "Panama"},
+            ]
+        )
+    )
+    matrix = _build([_record("###")], [_candidate_set([0])], index)
+    assert np.isnan(matrix[0, _column("lat_prefix")])
+
+
+def test_missing_catalog_tonnage_does_not_become_a_mismatch() -> None:
+    index = CatalogIndex.build(pd.DataFrame({
+        "vessel_id": ["A", "B"], "vessel_name": ["Alpha", "Beta"], "gross_tonnage": [100, np.nan],
+    }))
+    matrix = _build([_record("Alpha", igt=100, gt=100)], [_candidate_set([0, 1])], index)
+    assert matrix[0, _column("any_exact")] == 1
+    assert np.isnan(matrix[1, _column("any_exact")])
+    assert np.isnan(matrix[1, _column("min_abs_logratio")])
+    assert np.all(matrix[:, _column("n_exact_in_row")] == 1)
+
+
+def test_primary_ties_use_catalog_position_not_array_offset() -> None:
+    matrix = _build([_record("GRAND ACE 11")], [_candidate_set([2, 0])])
+    assert matrix[:, _column("primary_rank")].tolist() == [2, 1]
+
+
+@pytest.mark.parametrize("name", ["GRAND GRAND ACE 11", "케이엠티씨 희망호"])
+def test_rare_overlap_counts_shared_tokens_once(name: str) -> None:
+    index = CatalogIndex.build(pd.DataFrame({
+        "vessel_id": ["A"], "vessel_name": ["GRAND ACE 11 KMTC"], "gross_tonnage": [100],
+    }))
+    matrix = _build([_record(name)], [_candidate_set([0])], index)
+    expected = 3 if name.startswith("GRAND") else 1
+    assert matrix[0, _column("rare_token_overlap")] == expected
+
+
+def test_shuffling_records_does_not_change_features() -> None:
+    records = [_record("GRAND ACE 11", igt=100), _record("글로비스 스피릿", igt=5000)]
+    sets = [_candidate_set([0, 1]), _candidate_set([3, 0])]
+    original = _build(records, sets)
+    shuffled = _build(records[::-1], sets[::-1])
+    np.testing.assert_array_equal(original[:2], shuffled[2:])
+    np.testing.assert_array_equal(original[2:], shuffled[:2])
+
+
+@pytest.mark.parametrize(("query", "catalog"), [(1e-300, 1e300), (1e300, 1e-300)])
+def test_log_tonnage_ratio_remains_finite_at_float_extremes(query: float, catalog: float) -> None:
+    index = CatalogIndex.build(pd.DataFrame({
+        "vessel_id": ["A"], "vessel_name": ["Alpha"], "gross_tonnage": [catalog],
+    }))
+    matrix = _build([_record("Alpha", igt=query)], [_candidate_set([0])], index)
+    assert np.isfinite(matrix[0, _column("logratio_igt")])
+    assert matrix[0, _column("logratio_igt")] == pytest.approx(np.log(query) - np.log(catalog), rel=1e-6)

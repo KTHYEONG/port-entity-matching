@@ -48,6 +48,7 @@ Stable summary of data findings and the decisions they drive, organized by the f
 | Official RF baseline, 5-fold vessel-disjoint GroupKFold | 0.252 | 0.982 | 0.471 | Korean recall@40 is only 0.686 (tonnage-only candidates) |
 | Rule-based jamo phonetic key + tonnage window (no learning) | 0.968 | — | — | 0.986 when tonnage is exact, 0.923 when perturbed |
 | Latin full-catalog Damerau cdist + tonnage bonus (no learning) | — | 0.9987 | — | residual errors are mostly renames |
+| Matcher v1 Part 3: LightGBM lambdarank over 39 pair features, 5-fold vessel-disjoint CV | 0.9798 | 0.9992 | 0.9856 | retrieval recall 1.000 in both buckets |
 
 Caveat: the Korean rules were written after inspecting train names, so 0.968 is optimistic. Learned components must be measured in vessel-disjoint folds.
 
@@ -63,6 +64,20 @@ The 1.000 total recall is expected with in-sample memory; it does not establish 
 
 Runtime on the full catalog (78,595 rows): index build 1.5 s, candidates for all 12,222 train rows 90 s, peak RSS 0.25 GB — far inside the 30-minute inference budget.
 
+### 2.2 Learned Ranker (Matcher v1 Part 3)
+A LightGBM lambdarank model scores each (record, candidate) pair over 39 features: script-gated Latin string similarities (Damerau/Levenshtein/Jaro-Winkler, token-set, partial, prefix), Hangul jamo-phonetic similarities (consonant/vowel keys, length ratio, decoded acronym hit), tonnage agreement (log ratio, exact, ±2.5–5.5% band, ±1% near), digit agreement, smoothed vessel-type/flag compatibility tables, and row-local context (primary rank and gap, exact-match count, candidate count, retrieval source flags). Missing values stay NaN so LightGBM can split on them; all context features are computed inside a single record's candidate set, so a row's features never depend on other rows.
+
+Initial implementation, vessel-disjoint 5-fold CV (`GroupKFold` on `target_vessel_id`, call-sign memory disabled because a disjoint fold cannot measure it):
+
+| Metric | Value |
+|---|---|
+| Korean accuracy | 0.9798 (1,191 rows) |
+| Non-Korean accuracy | 0.9992 (11,031 rows) |
+| Weighted score (0.7/0.3) | 0.9856 |
+| Retrieval recall (both buckets) | 1.000 |
+
+Per-fold Korean accuracy ranges 0.963–1.000, so the result does not depend on a single fold. Out-of-fold diagnostics (score, runner-up, margin, retrieval flag) are written to `artifacts/cv_oof.csv` for error analysis. The fitted artifacts are small: `model.txt` 0.8 MB, `maps.json` 21 kB, `memory.json` 263 kB, which keeps the submission ZIP far below the size limit.
+
 ### Decisions
 - **No LLMs or large neural models.** CPU rules plus a learned transliteration cost and a GBDT ranker already reach the target. This keeps inference time and ZIP size small, which are the tie-breakers, and avoids synthetic-label compliance questions.
 - **Call-sign memory: adopted as a deterministic override.** It is a lookup table fitted on `train.csv` (allowed training artifact, row-independent). The hash is a stable vessel identity: 1:1 in train and invariant to renames and script. It has no effect if test is vessel-disjoint and is exact otherwise. Vessel-disjoint CV cannot learn its weight, so it is applied as a rule after ranking rather than as a ranker feature. Its effect is measured by an on/off LB probe.
@@ -75,6 +90,18 @@ Residual Korean errors of the rule prototype:
 4. **Tonnage outside ±6%** (~0.8%): needs name-only retrieval over the full catalog.
 
 Residual Latin errors are renames, recoverable via exact tonnage plus a shared rare token plus type compatibility.
+
+### 3.1 Residuals of the learned ranker
+The out-of-fold run leaves 33 errors over 12,222 rows (24 Korean rows over 13 vessels, 9 non-Korean rows). Clusters:
+
+1. **Korean numbering forms** — `제2 오션파이오니어` → `Ocean Pioneer No. 2` is beaten by the sibling `No.3 Ocean Pioneer`; the `제N` rule and the `No. N` catalog form disagree about digit placement.
+2. **Similar names in the phonetic key space** — `마스그라치` (Marsgracht) vs Maasgracht, `산동 푸 후이` (Shandong Fu Hui) vs Shandong Fu Yi, `샨동 푸 유안` (Shandong Fu Yuan) vs Shandong Fu En. These errors do not establish irreducibility; external vessel registries are outside the competition allowlist.
+3. **Other Korean-name confusions** — `그레이트 호프` (Great Hope) vs Egor Letov, `스카이 글로리` (Sky Glory) vs Sky Aurora, `에버 얼라이언스` (Ever Alliance) vs Ever Reliance, `메이플 하버` (Maple Harbour) vs V Bravo. Syllable-level similarities are a possible experiment, not a demonstrated remedy.
+4. **Korean name variants of the same vessel** — `신간` (Singan) vs Sungkiang, `흥아영` (Heung-A Young) vs An Hong, `펭슈하이` (Feng Xiu Hai) vs Feng Shou Hai: the Korean spelling differs from the romanized catalog name.
+5. **Digit disagreement despite an explicit digit feature** — `그랜드 에이스11` (Grand Ace 11) vs Grand Ace1. `digit_tokens` already extracts `11` from the concatenated spelling; the ranker nevertheless prefers the wrong candidate.
+6. **Non-Korean name changes and look-alikes** (9 rows) — examples include `BOW SUCCESS` → Fairchem Success, `HAFNIA WREN` → BW Wren, `HAFNIA MERLIN` → BW Merlin, `NAVIG8 VICTORIA` → Hafnia Viridian, and the spelling confusion `DIIJLAH` → Dijilah vs Dijlah. All targets were retrieved; retrieval failure is not the cause of these ranking errors.
+
+Error margins are informative for the field workflow: 5 of the 24 Korean errors have a top-1/top-2 margin below 1.3, i.e. a low-margin review queue would catch roughly a fifth of them, while the remaining errors have a large margin and need better features rather than better ranking.
 
 ## 4. Field Applicability
 - Operator workflow: top-k candidate recommendation with score margin; low-margin rows go to a human review queue in the field (not in the competition output).
