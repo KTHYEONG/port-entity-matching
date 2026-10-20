@@ -48,7 +48,7 @@ Stable summary of data findings and the decisions they drive, organized by the f
 | Official RF baseline, 5-fold vessel-disjoint GroupKFold | 0.252 | 0.982 | 0.471 | Korean recall@40 is only 0.686 (tonnage-only candidates) |
 | Rule-based jamo phonetic key + tonnage window (no learning) | 0.968 | — | — | 0.986 when tonnage is exact, 0.923 when perturbed |
 | Latin full-catalog Damerau cdist + tonnage bonus (no learning) | — | 0.9987 | — | residual errors are mostly renames |
-| Matcher v1 Part 3: LightGBM lambdarank over 39 pair features, 5-fold vessel-disjoint CV | 0.9798 | 0.9992 | 0.9856 | retrieval recall 1.000 in both buckets |
+| Matcher v1 Part 3: LightGBM lambdarank over 39 pair features, 5-fold vessel-disjoint CV | 0.9798 | 0.9993 | 0.9857 | retrieval recall 1.000 in both buckets |
 
 Caveat: the Korean rules were written after inspecting train names, so 0.968 is optimistic. Learned components must be measured in vessel-disjoint folds.
 
@@ -72,8 +72,8 @@ Initial implementation, vessel-disjoint 5-fold CV (`GroupKFold` on `target_vesse
 | Metric | Value |
 |---|---|
 | Korean accuracy | 0.9798 (1,191 rows) |
-| Non-Korean accuracy | 0.9992 (11,031 rows) |
-| Weighted score (0.7/0.3) | 0.9856 |
+| Non-Korean accuracy | 0.9993 (11,031 rows) |
+| Weighted score (0.7/0.3) | 0.9857 |
 | Retrieval recall (both buckets) | 1.000 |
 
 Per-fold Korean accuracy ranges 0.963–1.000, so the result does not depend on a single fold. Out-of-fold diagnostics (score, runner-up, margin, retrieval flag) are written to `artifacts/cv_oof.csv` for error analysis. The fitted artifacts are small: `model.txt` 0.8 MB, `maps.json` 21 kB, `memory.json` 263 kB, which keeps the submission ZIP far below the size limit.
@@ -92,16 +92,16 @@ Residual Korean errors of the rule prototype:
 Residual Latin errors are renames, recoverable via exact tonnage plus a shared rare token plus type compatibility.
 
 ### 3.1 Residuals of the learned ranker
-The out-of-fold run leaves 33 errors over 12,222 rows (24 Korean rows over 13 vessels, 9 non-Korean rows). Clusters:
+The out-of-fold run leaves 32 errors over 12,222 rows (24 Korean rows over 13 vessels, 8 non-Korean rows). Clusters:
 
-1. **Korean numbering forms** — `제2 오션파이오니어` → `Ocean Pioneer No. 2` is beaten by the sibling `No.3 Ocean Pioneer`; the `제N` rule and the `No. N` catalog form disagree about digit placement.
+1. **Korean numbering forms** — `제2 오션파이오니어` → `Ocean Pioneer No. 2` is beaten by the sibling `No.3 Ocean Pioneer`; the `제N` rule and the `No. N` catalog form disagree about digit placement. `씨와이 인터오션 투` → `CY Interocean II` is beaten by `CY Interocean I` for the same reason.
 2. **Similar names in the phonetic key space** — `마스그라치` (Marsgracht) vs Maasgracht, `산동 푸 후이` (Shandong Fu Hui) vs Shandong Fu Yi, `샨동 푸 유안` (Shandong Fu Yuan) vs Shandong Fu En. These errors do not establish irreducibility; external vessel registries are outside the competition allowlist.
-3. **Other Korean-name confusions** — `그레이트 호프` (Great Hope) vs Egor Letov, `스카이 글로리` (Sky Glory) vs Sky Aurora, `에버 얼라이언스` (Ever Alliance) vs Ever Reliance, `메이플 하버` (Maple Harbour) vs V Bravo. Syllable-level similarities are a possible experiment, not a demonstrated remedy.
+3. **Other Korean-name confusions** — `그레이트 호프` (Great Hope) vs Egor Letov, `스카이 글로리` (Sky Glory) vs Sky Aurora, `메이플 하버` (Maple Harbour) vs V Bravo, `글로비스 코러스` (Glovis Chorus) vs Glovis Corona. Syllable-level similarities are a possible experiment, not a demonstrated remedy.
 4. **Korean name variants of the same vessel** — `신간` (Singan) vs Sungkiang, `흥아영` (Heung-A Young) vs An Hong, `펭슈하이` (Feng Xiu Hai) vs Feng Shou Hai: the Korean spelling differs from the romanized catalog name.
 5. **Digit disagreement despite an explicit digit feature** — `그랜드 에이스11` (Grand Ace 11) vs Grand Ace1. `digit_tokens` already extracts `11` from the concatenated spelling; the ranker nevertheless prefers the wrong candidate.
-6. **Non-Korean name changes and look-alikes** (9 rows) — examples include `BOW SUCCESS` → Fairchem Success, `HAFNIA WREN` → BW Wren, `HAFNIA MERLIN` → BW Merlin, `NAVIG8 VICTORIA` → Hafnia Viridian, and the spelling confusion `DIIJLAH` → Dijilah vs Dijlah. All targets were retrieved; retrieval failure is not the cause of these ranking errors.
+6. **Non-Korean name changes and look-alikes** (8 rows) — examples include `BOW SUCCESS` → Fairchem Success, `HAFNIA WREN` → BW Wren, `HAFNIA MERLIN` → BW Merlin, `NAVIG8 VICTORIA` → Hafnia Viridian, and the spelling confusion `DIIJLAH` → Dijilah vs Dijlah. All targets were retrieved; retrieval failure is not the cause of these ranking errors.
 
-Error margins are informative for the field workflow: 5 of the 24 Korean errors have a top-1/top-2 margin below 1.3, i.e. a low-margin review queue would catch roughly a fifth of them, while the remaining errors have a large margin and need better features rather than better ranking.
+Error margins are informative for the field workflow: 6 of the 24 Korean errors have a top-1/top-2 margin below 1.3, i.e. a low-margin review queue would catch roughly a quarter of them, while the remaining errors have a large margin and need better features rather than better ranking.
 
 ## 4. Field Applicability
 - Operator workflow: top-k candidate recommendation with score margin; low-margin rows go to a human review queue in the field (not in the competition output).
