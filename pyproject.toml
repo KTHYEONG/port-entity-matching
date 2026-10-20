@@ -3,7 +3,13 @@ name = "port-entity-matching"
 version = "0.1.0"
 description = "Port entity matching and resolution pipeline"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "pandas==2.0.3",
+    "numpy==1.26.4",
+    "rapidfuzz==3.14.3",
+    "lightgbm==4.6.0",
+    "scikit-learn==1.5.2",
+]
 
 [build-system]
 requires = ["setuptools>=61.0"]
