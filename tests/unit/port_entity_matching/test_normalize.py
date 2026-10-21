@@ -10,9 +10,11 @@ from port_entity_matching.normalize import (
     decode_letter_acronym,
     digit_tokens,
     hangul_phonetic_key,
+    hangul_phonetic_key_v2,
     hangul_variants,
     is_hangul_name,
     latin_phonetic_key,
+    latin_phonetic_key_v2,
     latin_tokens,
     normalize_text,
 )
@@ -139,6 +141,8 @@ def test_empty_and_nonstring_normalization(value: object) -> None:
     assert is_hangul_name(value) is False
     assert latin_phonetic_key(value, False) == ""
     assert hangul_phonetic_key(value, True) == ""
+    assert latin_phonetic_key_v2(value, False) == ""
+    assert hangul_phonetic_key_v2(value, True) == ""
 
 
 @pytest.mark.parametrize(
@@ -158,3 +162,78 @@ def test_variant_token_position_and_unicode_boundaries() -> None:
     assert latin_phonetic_key("Réflection", False) == latin_phonetic_key("Reflection", False)
     assert canonical_latin("MVELO 한글") == "MVELO"
     assert latin_tokens("M/V DENVER") == ("DENVER",)
+
+
+def test_non_rhotic_r_dropped_before_consonant() -> None:
+    latin_key = latin_phonetic_key_v2("MARSGRACHT", with_vowels=True)
+    hangul_key = hangul_phonetic_key_v2("마스그라치", with_vowels=True)
+
+    assert latin_key == "MASKRAJT"
+    assert "MARS" in latin_phonetic_key("MARSGRACHT", with_vowels=True)
+    assert Levenshtein.distance(latin_key, hangul_key) < Levenshtein.distance(
+        latin_phonetic_key("MARSGRACHT", with_vowels=True),
+        hangul_phonetic_key("마스그라치", with_vowels=True),
+    )
+
+
+def test_r_kept_before_vowel() -> None:
+    assert "R" in latin_phonetic_key_v2("MARINA", with_vowels=True)
+
+
+def test_onset_h_kept_on_both_sides() -> None:
+    latin_key = latin_phonetic_key_v2("HEUNG A", with_vowels=True)
+    hangul_key = hangul_phonetic_key_v2("흥아", with_vowels=True)
+
+    assert latin_key == "HEUNA"
+    assert hangul_key == "HNA"
+    assert latin_key.startswith("H")
+    assert hangul_key.startswith("H")
+    assert not latin_phonetic_key("HEUNG A", with_vowels=True).startswith("H")
+    assert not hangul_phonetic_key("흥아", with_vowels=True).startswith("H")
+
+
+def test_coda_h_dropped() -> None:
+    assert "H" not in latin_phonetic_key_v2("JOHN", with_vowels=False)
+
+
+def test_y_read_as_vowel_unless_followed_by_vowel() -> None:
+    assert latin_phonetic_key_v2("SKY", with_vowels=True).endswith("I")
+    assert "I" not in latin_phonetic_key_v2("YANG", with_vowels=True)
+
+
+def test_y_emits_nothing_without_vowels() -> None:
+    assert latin_phonetic_key_v2("SKY", with_vowels=False) == latin_phonetic_key_v2("SK", with_vowels=False)
+
+
+def test_w_dropped() -> None:
+    assert latin_phonetic_key_v2("WREN", with_vowels=True) == latin_phonetic_key_v2("REN", with_vowels=True)
+
+
+def test_word_boundary_governs_end_of_word_r() -> None:
+    assert latin_phonetic_key_v2("STAR ACE", with_vowels=True) != latin_phonetic_key_v2("STARACE", with_vowels=True)
+
+
+def test_digits_preserved_in_v2_keys() -> None:
+    assert latin_phonetic_key_v2("GRAND ACE 12", with_vowels=True) == "KRANTASE12"
+    assert latin_phonetic_key_v2("GRAND ACE 11", with_vowels=True) == "KRANTASE1"
+
+
+def test_v1_keys_unchanged_by_v2_keys() -> None:
+    assert latin_phonetic_key("MARSGRACHT", with_vowels=True) == "MARSKRAJT"
+    assert latin_phonetic_key("HEUNG A", with_vowels=True) == "EUNA"
+    assert latin_phonetic_key("GRAND ACE 11", with_vowels=True) == "KRANTASE1"
+    assert hangul_phonetic_key("흥아", with_vowels=True) == "NA"
+    assert hangul_phonetic_key("마스그라치", with_vowels=True) == "MASKRAJI"
+
+
+def test_v2_keys_are_deterministic() -> None:
+    assert latin_phonetic_key_v2("MARSGRACHT 12", True) == latin_phonetic_key_v2("MARSGRACHT 12", True)
+    assert hangul_phonetic_key_v2("마스그라치 12", True) == hangul_phonetic_key_v2("마스그라치 12", True)
+
+
+def test_v2_key_handles_latin_runs_inside_hangul_literals() -> None:
+    assert hangul_phonetic_key_v2("마스 KMTC", with_vowels=True) == "MASKMTK"
+
+
+def test_v2_key_keeps_digits_inside_mixed_words() -> None:
+    assert latin_phonetic_key_v2("MSK1", with_vowels=False) == "MSK1"

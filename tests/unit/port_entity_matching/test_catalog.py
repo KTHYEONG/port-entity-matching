@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 
 from port_entity_matching.catalog import CatalogIndex
+from port_entity_matching.normalize import latin_phonetic_key_v2
 
 
 def _catalog(rows: list[dict[str, object]]) -> pd.DataFrame:
@@ -137,3 +138,19 @@ def test_duplicate_ids_checked_after_text_conversion() -> None:
     frame = pd.DataFrame({"vessel_id": [None, np.nan], "vessel_name": ["A", "B"], "gross_tonnage": [100, 200]})
     with pytest.raises(ValueError, match="duplicate vessel_id"):
         CatalogIndex.build(frame)
+
+
+def test_key_v2_columns_align_with_catalog_rows() -> None:
+    frame = _catalog(
+        [
+            {"vessel_id": "A0", "vessel_name": "M/V Stena Promise 16", "gross_tonnage": 100},
+            {"vessel_id": "A1", "vessel_name": "Glovis Spirit", "gross_tonnage": 200},
+            {"vessel_id": "A2", "vessel_name": "BW Wren", "gross_tonnage": 300},
+        ]
+    )
+    index = CatalogIndex.build(frame)
+
+    assert len(index.key2_cons) == len(index.key2_vow) == 3
+    for position, name in enumerate(index.names):
+        assert index.key2_cons[position] == latin_phonetic_key_v2(name, False)
+        assert index.key2_vow[position] == latin_phonetic_key_v2(name, True)

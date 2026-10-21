@@ -12,6 +12,7 @@ from port_entity_matching.normalize import (
     canonical_latin,
     digit_tokens,
     latin_phonetic_key,
+    latin_phonetic_key_v2,
     latin_tokens,
 )
 
@@ -31,6 +32,8 @@ class CatalogIndex:
     digits: list[tuple[str, ...]]
     key_cons: list[str]
     key_vow: list[str]
+    key2_cons: list[str]
+    key2_vow: list[str]
     gt: NDArray[np.float64]
     vessel_type: tuple[str, ...]
     flag: tuple[str, ...]
@@ -66,6 +69,8 @@ class CatalogIndex:
         digits = [digit_tokens(name) for name in names]
         key_cons = [latin_phonetic_key(name, False) for name in names]
         key_vow = [latin_phonetic_key(name, True) for name in names]
+        key2_cons = [latin_phonetic_key_v2(name, False) for name in names]
+        key2_vow = [latin_phonetic_key_v2(name, True) for name in names]
         gt = _gross_tonnages(catalog["gross_tonnage"])
         vessel_type = tuple(_as_text(value) for value in catalog["vessel_type"].tolist()) if "vessel_type" in catalog.columns else tuple("" for _ in names)
         flag = tuple(_as_text(value) for value in catalog["flag_name"].tolist()) if "flag_name" in catalog.columns else tuple("" for _ in names)
@@ -88,6 +93,8 @@ class CatalogIndex:
             digits=digits,
             key_cons=key_cons,
             key_vow=key_vow,
+            key2_cons=key2_cons,
+            key2_vow=key2_vow,
             gt=gt,
             vessel_type=vessel_type,
             flag=flag,

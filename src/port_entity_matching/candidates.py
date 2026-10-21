@@ -15,7 +15,7 @@ from port_entity_matching.config import MatchConfig
 from port_entity_matching.memory import CallSignMemory
 from port_entity_matching.normalize import (
     canonical_latin,
-    hangul_phonetic_key,
+    hangul_phonetic_key_v2,
     hangul_variants,
     is_hangul_name,
     latin_tokens,
@@ -72,6 +72,8 @@ def generate_candidates(
         raise ValueError("query_chunk and max_candidates must be positive")
     if min(config.name_top_k, config.hangul_key_top_k, config.hangul_window_keep, config.latin_exact_gt_cap) < 0:
         raise ValueError("Retrieval limits must be non-negative")
+    if config.hangul_tonnage_window < 0:
+        raise ValueError("hangul_tonnage_window must be non-negative")
     results: list[CandidateSet] = []
     step = config.query_chunk
     for start in range(0, len(records), step):
@@ -113,8 +115,8 @@ def _prepare(record: QueryRecord) -> _Prepared:
             is_hangul=True,
             latin_key="",
             query_tokens=(),
-            cons_keys=tuple(hangul_phonetic_key(variant, False) for variant in variants),
-            vowel_keys=tuple(hangul_phonetic_key(variant, True) for variant in variants),
+            cons_keys=tuple(hangul_phonetic_key_v2(variant, False) for variant in variants),
+            vowel_keys=tuple(hangul_phonetic_key_v2(variant, True) for variant in variants),
             tonnages=tonnages,
         )
     return _Prepared(
@@ -171,7 +173,7 @@ def _hangul_name_scores(
         keys = unique[start : start + config.query_chunk]
         matrix = process.cdist(
             keys,
-            index.key_cons,
+            index.key2_cons,
             scorer=Levenshtein.normalized_similarity,
             workers=config.num_threads,
             dtype=np.float32,
@@ -206,7 +208,7 @@ def _latin_tonnage(item: _Prepared, index: CatalogIndex, config: MatchConfig) ->
 
 def _hangul_tonnage(item: _Prepared, index: CatalogIndex, config: MatchConfig) -> tuple[Positions, Positions]:
     ranges = [
-        index.gt_range(tonnage * (1.0 - config.tonnage_window), tonnage * (1.0 + config.tonnage_window))
+        index.gt_range(tonnage * (1.0 - config.hangul_tonnage_window), tonnage * (1.0 + config.hangul_tonnage_window))
         for tonnage in item.tonnages
     ]
     window = _union(ranges)
@@ -217,8 +219,8 @@ def _hangul_tonnage(item: _Prepared, index: CatalogIndex, config: MatchConfig) -
     def score(position: int) -> float:
         return max(
             0.5 * (
-                Levenshtein.normalized_similarity(cons_key, index.key_cons[position])
-                + Levenshtein.normalized_similarity(vowel_key, index.key_vow[position])
+                Levenshtein.normalized_similarity(cons_key, index.key2_cons[position])
+                + Levenshtein.normalized_similarity(vowel_key, index.key2_vow[position])
             )
             for cons_key, vowel_key in zip(item.cons_keys, item.vowel_keys, strict=True)
         )
@@ -280,7 +282,7 @@ def _assemble(
         for position in masks:
             if position not in score_of:
                 if item.is_hangul:
-                    score = max(Levenshtein.normalized_similarity(key, index.key_cons[position]) for key in item.cons_keys)
+                    score = max(Levenshtein.normalized_similarity(key, index.key2_cons[position]) for key in item.cons_keys)
                 else:
                     score = DamerauLevenshtein.normalized_similarity(item.latin_key, index.canonical[position])
                 score_of[position] = float(np.float32(score))

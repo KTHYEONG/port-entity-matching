@@ -19,7 +19,7 @@ from port_entity_matching.catalog import CatalogIndex
 from port_entity_matching.config import MatchConfig
 from port_entity_matching.memory import CallSignMemory
 from port_entity_matching.records import QueryRecord
-from port_entity_matching.normalize import hangul_phonetic_key, hangul_variants
+from port_entity_matching.normalize import hangul_phonetic_key_v2, hangul_variants
 
 
 def _catalog_frame(entries: list[tuple[str, str, float]]) -> pd.DataFrame:
@@ -333,8 +333,8 @@ def test_hangul_variants_match_full_score_reference_for_all_chunk_sizes() -> Non
         config = MatchConfig(query_chunk=chunk_size, hangul_key_top_k=2)
         batch = generate_candidates(records, index, None, config)
         for record, result in zip(records, batch, strict=True):
-            keys = [hangul_phonetic_key(v, False) for v in hangul_variants(record.vessel_name)]
-            scores = [max(np.float32(Levenshtein.normalized_similarity(key, name)) for key in keys) for name in index.key_cons]
+            keys = [hangul_phonetic_key_v2(v, False) for v in hangul_variants(record.vessel_name)]
+            scores = [max(np.float32(Levenshtein.normalized_similarity(key, name)) for key in keys) for name in index.key2_cons]
             expected = sorted(sorted(range(len(index)), key=lambda p: (-scores[p], p))[:2])
             assert result.positions.tolist() == expected
             assert result.sources.tolist() == [SRC_NAME] * 2
@@ -355,10 +355,10 @@ def test_hangul_window_ranking_matches_variant_mean_reference() -> None:
     ]))
     record = _record("s", "글로비스호", gross_tonnage=1000)
     config = MatchConfig(hangul_key_top_k=0, hangul_window_keep=1)
-    pairs = [(hangul_phonetic_key(v, False), hangul_phonetic_key(v, True)) for v in hangul_variants(record.vessel_name)]
-    window = index.gt_range(940.0, 1060.0).tolist()
+    pairs = [(hangul_phonetic_key_v2(v, False), hangul_phonetic_key_v2(v, True)) for v in hangul_variants(record.vessel_name)]
+    window = index.gt_range(900.0, 1100.0).tolist()
     scores = {
-        p: max((Levenshtein.normalized_similarity(kc, index.key_cons[p]) + Levenshtein.normalized_similarity(kv, index.key_vow[p])) / 2 for kc, kv in pairs)
+        p: max((Levenshtein.normalized_similarity(kc, index.key2_cons[p]) + Levenshtein.normalized_similarity(kv, index.key2_vow[p])) / 2 for kc, kv in pairs)
         for p in window
     }
     best = min(window, key=lambda p: (-scores[p], p))
@@ -383,3 +383,116 @@ def test_invalid_retrieval_limits_rejected(config: MatchConfig) -> None:
     index = CatalogIndex.build(_catalog_frame([("V0", "Alpha", 1000.0)]))
     with pytest.raises(ValueError, match="must be"):
         generate_candidates([_record("s", "Alpha")], index, None, config)
+
+
+def test_negative_hangul_tonnage_window_rejected() -> None:
+    index = CatalogIndex.build(_catalog_frame([("V0", "Alpha", 1000.0)]))
+    with pytest.raises(ValueError, match="must be"):
+        generate_candidates(
+            [_record("s", "알파")], index, None, MatchConfig(hangul_tonnage_window=-0.01)
+        )
+
+
+def test_hangul_tonnage_window_is_ten_percent() -> None:
+    index = CatalogIndex.build(
+        _catalog_frame(
+            [
+                ("V0", "Alpha", 1000.0),
+                ("V1", "Unrelated Ship", 1090.0),
+            ]
+        )
+    )
+    record = _record("s1", "글로비스호", gross_tonnage=1000.0)
+
+    widened = generate_candidates([record], index, None, MatchConfig())[0]
+    narrowed = generate_candidates([record], index, None, MatchConfig(hangul_tonnage_window=0.06))[0]
+
+    assert _sources_of(widened, 1) & SRC_TONNAGE
+    assert not _sources_of(narrowed, 1) & SRC_TONNAGE
+
+
+def test_latin_rare_token_filter_keeps_six_percent_window() -> None:
+    entries = [(f"F{position}", f"Hafnia {position}", 1000.0 + position) for position in range(40)]
+    entries.append(("WREN", "BW Wren", 1090.0))
+    index = CatalogIndex.build(_catalog_frame(entries))
+    record = _record("s1", "HAFNIA WREN", gross_tonnage=1000.0)
+
+    result = generate_candidates([record], index, None, MatchConfig())[0]
+
+    assert not _sources_of(result, 40) & SRC_TOKEN
+
+
+def test_hangul_retrieval_uses_key_v2() -> None:
+    index = CatalogIndex.build(
+        _catalog_frame(
+            [
+                ("V0", "Meker Jaya", 50000.0),
+                ("V1", "MARSGRACHT", 60000.0),
+            ]
+        )
+    )
+    result = generate_candidates(
+        [_record("s1", "마스그라치")], index, None, MatchConfig(hangul_key_top_k=1)
+    )[0]
+
+    assert _sources_of(result, 1) & SRC_NAME
+    assert result.positions.tolist() == [1]
+
+
+def test_latin_candidates_are_unchanged_by_hangul_key_switch() -> None:
+    index = CatalogIndex.build(
+        _catalog_frame(
+            [
+                ("V0", "Stena Promise", 15000.0),
+                ("V1", "Glovis Spirit", 64650.0),
+                ("V2", "BW Wren", 29768.0),
+                ("V3", "Other Ship", 5000.0),
+            ]
+        )
+    )
+    records = [
+        _record("s1", "STENA PROMIISE", gross_tonnage=15000.0),
+        _record("s2", "HAFNIA WREN", gross_tonnage=29765.0),
+        _record("s3", "ZZZ UNRELATED", gross_tonnage=5000.0),
+    ]
+
+    narrow = generate_candidates(records, index, None, MatchConfig(name_top_k=1))
+    default = generate_candidates(records, index, None, MatchConfig())
+
+    assert [candidate.positions.tolist() for candidate in narrow] == [[0], [2], [2, 3]]
+    assert [candidate.sources.tolist() for candidate in narrow] == [
+        [SRC_NAME | SRC_TONNAGE | SRC_TOKEN],
+        [SRC_NAME | SRC_TOKEN],
+        [SRC_NAME, SRC_TONNAGE],
+    ]
+    assert [candidate.positions.tolist() for candidate in default] == [[0, 1, 2, 3]] * 3
+    assert [candidate.sources.tolist() for candidate in default] == [
+        [SRC_NAME | SRC_TONNAGE | SRC_TOKEN, SRC_NAME, SRC_NAME, SRC_NAME],
+        [SRC_NAME, SRC_NAME, SRC_NAME | SRC_TOKEN, SRC_NAME],
+        [SRC_NAME, SRC_NAME, SRC_NAME, SRC_NAME | SRC_TONNAGE],
+    ]
+
+
+def test_candidate_generation_is_row_independent_with_key_v2() -> None:
+    index = CatalogIndex.build(
+        _catalog_frame(
+            [
+                ("V0", "Stena Promise", 15000.0),
+                ("V1", "Glovis Spirit", 64650.0),
+                ("V2", "MARSGRACHT", 60000.0),
+            ]
+        )
+    )
+    records = [
+        _record("s1", "STENA PROMIISE", gross_tonnage=15000.0),
+        _record("s2", "글로비스 스피릿", international_gross_tonnage=64824.0),
+        _record("s3", "마스그라치"),
+    ]
+    config = MatchConfig()
+
+    batch = generate_candidates(records, index, None, config)
+    individual = [generate_candidates([record], index, None, config)[0] for record in records]
+
+    for position in range(len(records)):
+        assert batch[position].positions.tolist() == individual[position].positions.tolist()
+        assert batch[position].sources.tolist() == individual[position].sources.tolist()

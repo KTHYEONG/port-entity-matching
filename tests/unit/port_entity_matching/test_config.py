@@ -32,3 +32,14 @@ def test_missing_keys_use_defaults() -> None:
 
     assert config.name_top_k == 5
     assert config == MatchConfig(name_top_k=5)
+
+
+def test_hangul_tonnage_window_default_and_round_trip() -> None:
+    assert MatchConfig().hangul_tonnage_window == 0.10
+    assert config_from_dict({"name_top_k": 5}).hangul_tonnage_window == 0.10
+    assert config_from_dict({"hangul_tonnage_window": 0.08}).hangul_tonnage_window == 0.08
+    assert config_from_dict(config_to_dict(MatchConfig(hangul_tonnage_window=0.08))).hangul_tonnage_window == 0.08
+
+
+def test_latin_tonnage_window_is_untouched_by_hangul_window() -> None:
+    assert MatchConfig().tonnage_window == 0.06

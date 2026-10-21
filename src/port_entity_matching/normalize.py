@@ -20,9 +20,11 @@ __all__ = [
     "decode_letter_acronym",
     "digit_tokens",
     "hangul_phonetic_key",
+    "hangul_phonetic_key_v2",
     "hangul_variants",
     "is_hangul_name",
     "latin_phonetic_key",
+    "latin_phonetic_key_v2",
     "latin_tokens",
     "normalize_text",
 ]
@@ -209,6 +211,8 @@ _LATIN_CLASS = {
     "Y": "",
 }
 _VOWELS = "AEIOU"
+# Word-edge neighbours are empty strings, so vowel tests need a set: "" is a substring of _VOWELS.
+_VOWEL_SET = frozenset("AEIOU")
 _LATIN_REWRITES: tuple[tuple[str, str], ...] = (
     ("TION", "SON"),
     ("SION", "SON"),
@@ -224,6 +228,21 @@ _LATIN_REWRITES: tuple[tuple[str, str], ...] = (
     ("GH", ""),
     ("NG", "N"),
 )
+_LATIN_V2_SUBSTRING_REWRITES: tuple[tuple[str, str], ...] = (
+    ("TION", "SON"),
+    ("SION", "SON"),
+    ("PH", "F"),
+    ("CH", "J"),
+    ("SH", "S"),
+    ("TH", "S"),
+    ("CK", "K"),
+    ("QU", "K"),
+    ("X", "KS"),
+    ("GH", ""),
+)
+_LATIN_V2_SOFT_C_RE = re.compile(r"C(?=[EIY])")
+_LATIN_V2_SOFT_G_RE = re.compile(r"G(?=[EIY])")
+_LATIN_V2_WORD_SPLIT_RE = re.compile(r"[^A-Z0-9]+")
 
 _LETTER_UNITS: dict[str, str] = {
     "에이": "A",
@@ -389,6 +408,83 @@ def hangul_phonetic_key(literal: str, with_vowels: bool) -> str:
         else:
             index += 1
     return _collapse("".join(key))
+
+
+def latin_phonetic_key_v2(value: str, with_vowels: bool) -> str:
+    """Key-v2 sound-class key of Latin text (Korean-loanword rules); '' for empty input."""
+    text = normalize_text(value)
+    decomposed = unicodedata.normalize("NFKD", text)
+    stripped = "".join(char for char in decomposed if not unicodedata.combining(char)).upper()
+    words = [word for word in _LATIN_V2_WORD_SPLIT_RE.split(stripped) if word]
+    parts: list[str] = []
+    for word in words:
+        if word.isdigit():
+            parts.append(word)
+            continue
+        for pattern, replacement in _LATIN_V2_SUBSTRING_REWRITES:
+            word = word.replace(pattern, replacement)
+        word = _LATIN_V2_SOFT_C_RE.sub("S", word)
+        word = _LATIN_V2_SOFT_G_RE.sub("J", word)
+        word = word.replace("NG", "N")
+        parts.append(_latin_v2_word_key(word, with_vowels))
+    return _collapse("".join(parts))
+
+
+def hangul_phonetic_key_v2(literal: str, with_vowels: bool) -> str:
+    """Key-v2 key of a Hangul literal (may contain Latin runs and digits) in the key-v2 space."""
+    text = normalize_text(literal)
+    key: list[str] = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if _is_hangul_syllable(char):
+            initial, medial, final = _decompose_syllable(char)
+            key.append("H" if initial == "ㅎ" else _INITIAL_CLASS[initial])
+            if with_vowels:
+                key.append(_VOWEL_CLASS[medial])
+            key.append(_FINAL_CLASS[_COMPOUND_FINAL_HEAD.get(final, final)])
+            index += 1
+        elif "A" <= char <= "Z":
+            end = index
+            while end < len(text) and "A" <= text[end] <= "Z":
+                end += 1
+            key.append(latin_phonetic_key_v2(text[index:end], with_vowels))
+            index = end
+        elif char.isdigit():
+            key.append(char)
+            index += 1
+        else:
+            index += 1
+    return _collapse("".join(key))
+
+
+def _latin_v2_word_key(word: str, with_vowels: bool) -> str:
+    """Sound-class key of one already-rewritten word; neighbours are '' at the word edges."""
+    key: list[str] = []
+    length = len(word)
+    for position, char in enumerate(word):
+        prev = word[position - 1] if position else ""
+        nxt = word[position + 1] if position + 1 < length else ""
+        if char in _VOWEL_SET:
+            if with_vowels:
+                key.append(char)
+        elif char == "Y":
+            if with_vowels and nxt not in _VOWEL_SET:
+                key.append("I")
+        elif char == "H":
+            if nxt in _VOWEL_SET and prev not in _VOWEL_SET:
+                key.append("H")
+        elif char == "R":
+            if prev in _VOWEL_SET and (nxt == "" or (nxt not in _VOWEL_SET and nxt != "Y")):
+                continue
+            key.append("R")
+        elif char == "W":
+            continue
+        elif char.isdigit():
+            key.append(char)
+        else:
+            key.append(_LATIN_CLASS.get(char, char))
+    return "".join(key)
 
 
 def _strip_vessel_prefix(text: str) -> str:
