@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import dataclasses
 import subprocess
 import sys
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -18,6 +20,7 @@ from port_entity_matching.train import (
     DIAGNOSTIC_COLUMNS,
     build_training_data,
     cross_validate,
+    cross_validate_run,
     fit_bundle,
     fold_indices,
     main,
@@ -339,3 +342,79 @@ def test_fit_bundle_is_deterministic() -> None:
         score_ensemble(second.ranker, features, config),
     )
     assert Matcher(index, first).predict_topk(records) == Matcher(index, second).predict_topk(records)
+
+
+def _hangul_only_perturbation(record):
+    from port_entity_matching.normalize import is_hangul_name
+
+    if not is_hangul_name(record.vessel_name):
+        return None
+    return dataclasses.replace(record, gross_tonnage=None, international_gross_tonnage=None)
+
+
+def test_cv_run_reproduces_the_clean_report_and_diagnostics(tmp_path) -> None:
+    path = tmp_path / "cv.csv"
+    report = cross_validate(_train_frame(), _catalog_frame(), _config(), path)
+    run = cross_validate_run(_train_frame(), _catalog_frame(), _config())
+    assert run.report == report
+    expected = tmp_path / "expected.csv"
+    run.oof.drop(columns=["scenario"]).loc[:, list(DIAGNOSTIC_COLUMNS)].to_csv(expected, index=False)
+    assert path.read_bytes() == expected.read_bytes()
+
+
+def test_scenario_rows_are_scored_with_the_fold_model(monkeypatch) -> None:
+    from port_entity_matching import train as train_module
+
+    calls: list[int] = []
+    original = train_module.train_ensemble
+
+    def counting_train_ensemble(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(train_module, "train_ensemble", counting_train_ensemble)
+    train = _train_frame()
+    config = _config()
+    run = cross_validate_run(train, _catalog_frame(), config, scenarios={"no_tonnage": _hangul_only_perturbation})
+
+    hangul_rows = int((run.oof["scenario"] == "clean").sum())
+    scenario_rows = int((run.oof["scenario"] == "no_tonnage").sum())
+    assert hangul_rows == len(train)
+    assert scenario_rows == int(run.oof[run.oof["scenario"] == "clean"]["is_hangul"].sum())
+    assert len(calls) == config.cv_splits
+    assert run.report == cross_validate_run(train, _catalog_frame(), config).report
+
+
+def test_inapplicable_scenario_adds_no_rows() -> None:
+    run = cross_validate_run(
+        _train_frame(),
+        _catalog_frame(),
+        _config(),
+        scenarios={"never": lambda record: None},
+    )
+    assert set(run.oof["scenario"]) == {"clean"}
+    assert len(run.oof) == len(_ROWS)
+
+
+def test_reserved_scenario_name_rejected() -> None:
+    with pytest.raises(ValueError, match="clean"):
+        cross_validate_run(_train_frame(), _catalog_frame(), _config(), scenarios={"clean": lambda record: record})
+
+
+def test_oof_column_and_row_order() -> None:
+    run = cross_validate_run(
+        _train_frame(),
+        _catalog_frame(),
+        _config(),
+        scenarios={"no_tonnage": _hangul_only_perturbation},
+    )
+    assert list(run.oof.columns) == ["scenario", *DIAGNOSTIC_COLUMNS]
+    scenarios_in_order = list(dict.fromkeys(run.oof["scenario"]))
+    assert scenarios_in_order[0] == "clean"
+    assert scenarios_in_order[-1] == "no_tonnage"
+
+
+def test_shipped_modules_stay_evaluation_free() -> None:
+    package = Path(__file__).resolve().parents[3] / "src" / "port_entity_matching"
+    for module in sorted(package.glob("*.py")):
+        assert "port_entity_matching.evaluation" not in module.read_text(encoding="utf-8"), module.name

@@ -5,7 +5,8 @@ from __future__ import annotations
 import argparse
 import logging
 import math
-from collections.abc import Sequence
+import time
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,19 +24,23 @@ from port_entity_matching.features import build_features
 from port_entity_matching.maps import AttributeMaps
 from port_entity_matching.memory import CallSignMemory
 from port_entity_matching.normalize import is_hangul_name
-from port_entity_matching.ranker import score_ensemble, train_ensemble
+from port_entity_matching.ranker import RankerEnsemble, score_ensemble, train_ensemble
 from port_entity_matching.records import (
     CATALOG_COLUMNS,
     RECORD_COLUMNS,
+    QueryRecord,
     read_csv_checked,
     records_from_frame,
 )
 
 __all__ = [
     "CVReport",
+    "CVRun",
+    "RecordPerturbation",
     "TrainingData",
     "build_training_data",
     "cross_validate",
+    "cross_validate_run",
     "fit_bundle",
     "fold_indices",
     "main",
@@ -56,6 +61,10 @@ DIAGNOSTIC_COLUMNS: tuple[str, ...] = (
     "target_retrieved",
     "n_candidates",
 )
+
+_OOF_COLUMNS: tuple[str, ...] = ("scenario", *DIAGNOSTIC_COLUMNS)
+
+RecordPerturbation = Callable[[QueryRecord], QueryRecord | None]
 
 
 @dataclass(frozen=True)
@@ -80,6 +89,14 @@ class CVReport:
     recall_latin: float
     n_hangul: int
     n_non_hangul: int
+
+
+@dataclass(frozen=True)
+class CVRun:
+    """Bucket report plus a long-format OOF frame (one row per scored record and scenario)."""
+
+    report: CVReport
+    oof: pd.DataFrame
 
 
 def fold_indices(train: pd.DataFrame, n_splits: int) -> list[tuple[NDArray[np.int64], NDArray[np.int64]]]:
@@ -187,20 +204,36 @@ def cross_validate(
     diagnostics_path: str | Path | None = None,
 ) -> CVReport:
     """Run vessel-disjoint cross-validation without call-sign memory and report the bucket metrics."""
+    run = cross_validate_run(train, catalog, config, scenarios=None)
+    if diagnostics_path is not None:
+        clean = run.oof.drop(columns=["scenario"]).loc[:, list(DIAGNOSTIC_COLUMNS)]
+        _write_diagnostics(diagnostics_path, clean)
+        logger.info("[DATA] diagnostics written rows=%d path=%s", len(clean), diagnostics_path)
+    return run.report
+
+
+def cross_validate_run(
+    train: pd.DataFrame,
+    catalog: pd.DataFrame,
+    config: MatchConfig,
+    scenarios: Mapping[str, RecordPerturbation] | None = None,
+) -> CVRun:
+    """Vessel-disjoint CV with memory off; each fold's ensemble scores clean rows and every scenario's perturbed rows."""
+    scenario_map = dict(scenarios or {})
+    if "clean" in scenario_map:
+        raise ValueError("Scenario name 'clean' is reserved for the unperturbed rows")
+    started = time.perf_counter()
     index = CatalogIndex.build(catalog)
     folds = fold_indices(train, config.cv_splits)
     logger.info(
-        "[DATA] cv start train_rows=%d catalog_rows=%d folds=%d",
+        "[DATA] cv start train_rows=%d catalog_rows=%d folds=%d scenarios=%d",
         len(train),
         len(index),
         len(folds),
+        len(scenario_map),
     )
 
-    diagnostic_rows: list[dict[str, object]] = []
-    hangul_correct = latin_correct = 0
-    hangul_total = latin_total = 0
-    hangul_retrieved = latin_retrieved = 0
-
+    rows: list[dict[str, object]] = []
     for fold_number, (train_index, valid_index) in enumerate(folds, start=1):
         fold_train = train.iloc[train_index]
         fold_valid = train.iloc[valid_index]
@@ -220,85 +253,135 @@ def cross_validate(
 
         records = records_from_frame(fold_valid)
         fold_targets = [str(value) for value in fold_valid["target_vessel_id"].tolist()]
-        candidate_sets = generate_candidates(records, index, None, config)
-        features = build_features(records, candidate_sets, index, maps, config)
-        scores = score_ensemble(ranker, features, config)
+        clean_rows = _diagnostic_rows(records, fold_targets, index, maps, config, ranker)
+        rows.extend({"scenario": "clean", **row} for row in clean_rows)
+        _log_fold_metrics(fold_number, None, clean_rows)
 
-        sizes = [len(candidate_set.positions) for candidate_set in candidate_sets]
-        offsets = np.cumsum([0, *sizes])
-        fold_hangul = fold_hangul_correct = 0
-        fold_latin = fold_latin_correct = 0
-        for position, record in enumerate(records):
-            start = int(offsets[position])
-            end = int(offsets[position + 1])
-            chunk = scores[start:end]
-            catalog_positions = candidate_sets[position].positions
-            top_offset, top_score, second_id, second_score = _best_two(chunk, catalog_positions, index)
-            predicted = index.vessel_ids[catalog_positions[top_offset]]
-            target = fold_targets[position]
-            hangul = is_hangul_name(record.vessel_name)
-            retrieved = target in {index.vessel_ids[catalog_position] for catalog_position in catalog_positions}
-            correct = predicted == target
-            margin = float(top_score - second_score) if second_score is not None else math.nan
-            diagnostic_rows.append(
-                {
-                    "sample_id": record.sample_id,
-                    "is_hangul": int(hangul),
-                    "target_vessel_id": target,
-                    "pred_vessel_id": predicted,
-                    "correct": int(correct),
-                    "top1_score": float(top_score),
-                    "top2_vessel_id": second_id,
-                    "top2_score": float(second_score) if second_score is not None else math.nan,
-                    "margin": margin,
-                    "target_retrieved": int(retrieved),
-                    "n_candidates": len(catalog_positions),
-                }
-            )
-            if hangul:
-                fold_hangul += 1
-                fold_hangul_correct += int(correct)
-                hangul_retrieved += int(retrieved)
-            else:
-                fold_latin += 1
-                fold_latin_correct += int(correct)
-                latin_retrieved += int(retrieved)
+        for scenario_name, perturb in scenario_map.items():
+            perturbed_records: list[QueryRecord] = []
+            perturbed_targets: list[str] = []
+            for record, target in zip(records, fold_targets, strict=True):
+                perturbed = perturb(record)
+                if perturbed is None:
+                    continue
+                perturbed_records.append(perturbed)
+                perturbed_targets.append(target)
+            if not perturbed_records:
+                _log_fold_metrics(fold_number, scenario_name, [])
+                continue
+            scenario_rows = _diagnostic_rows(perturbed_records, perturbed_targets, index, maps, config, ranker)
+            rows.extend({"scenario": scenario_name, **row} for row in scenario_rows)
+            _log_fold_metrics(fold_number, scenario_name, scenario_rows)
 
-        hangul_total += fold_hangul
-        hangul_correct += fold_hangul_correct
-        latin_total += fold_latin
-        latin_correct += fold_latin_correct
-        logger.info(
-            "[EVAL] fold=%d hangul_accuracy=%.4f (%d rows) non_hangul_accuracy=%.4f (%d rows)",
-            fold_number,
-            fold_hangul_correct / fold_hangul if fold_hangul else math.nan,
-            fold_hangul,
-            fold_latin_correct / fold_latin if fold_latin else math.nan,
-            fold_latin,
-        )
-
-    hangul_accuracy = hangul_correct / hangul_total if hangul_total else math.nan
-    latin_accuracy = latin_correct / latin_total if latin_total else math.nan
-    weighted = 0.7 * hangul_accuracy + 0.3 * latin_accuracy
+    oof = pd.DataFrame(rows, columns=list(_OOF_COLUMNS))
+    report = _report_from_rows(oof[oof["scenario"] == "clean"])
     logger.info(
         "[EVAL] overall hangul_accuracy=%.4f non_hangul_accuracy=%.4f weighted_score=%.4f",
-        hangul_accuracy,
-        latin_accuracy,
-        weighted,
+        report.hangul_accuracy,
+        report.non_hangul_accuracy,
+        report.weighted_score,
     )
+    logger.info("[SYS] cv elapsed_seconds=%.1f", time.perf_counter() - started)
+    return CVRun(report=report, oof=oof)
 
-    if diagnostics_path is not None:
-        _write_diagnostics(diagnostics_path, diagnostic_rows)
-        logger.info("[DATA] diagnostics written rows=%d path=%s", len(diagnostic_rows), diagnostics_path)
 
+def _diagnostic_rows(
+    records: Sequence[QueryRecord],
+    targets: Sequence[str],
+    index: CatalogIndex,
+    maps: AttributeMaps,
+    config: MatchConfig,
+    ranker: RankerEnsemble,
+) -> list[dict[str, object]]:
+    """Score records with a fold ensemble and return one diagnostic row per record."""
+    candidate_sets = generate_candidates(records, index, None, config)
+    features = build_features(records, candidate_sets, index, maps, config)
+    scores = score_ensemble(ranker, features, config)
+
+    sizes = [len(candidate_set.positions) for candidate_set in candidate_sets]
+    offsets = np.cumsum([0, *sizes])
+    rows: list[dict[str, object]] = []
+    for position, record in enumerate(records):
+        start = int(offsets[position])
+        end = int(offsets[position + 1])
+        chunk = scores[start:end]
+        catalog_positions = candidate_sets[position].positions
+        top_offset, top_score, second_id, second_score = _best_two(chunk, catalog_positions, index)
+        predicted = index.vessel_ids[catalog_positions[top_offset]]
+        target = targets[position]
+        hangul = is_hangul_name(record.vessel_name)
+        retrieved = target in {index.vessel_ids[catalog_position] for catalog_position in catalog_positions}
+        correct = predicted == target
+        margin = float(top_score - second_score) if second_score is not None else math.nan
+        rows.append(
+            {
+                "sample_id": record.sample_id,
+                "is_hangul": int(hangul),
+                "target_vessel_id": target,
+                "pred_vessel_id": predicted,
+                "correct": int(correct),
+                "top1_score": float(top_score),
+                "top2_vessel_id": second_id,
+                "top2_score": float(second_score) if second_score is not None else math.nan,
+                "margin": margin,
+                "target_retrieved": int(retrieved),
+                "n_candidates": len(catalog_positions),
+            }
+        )
+    return rows
+
+
+def _report_from_rows(rows: pd.DataFrame) -> CVReport:
+    """Summarize the clean out-of-fold rows into the bucket report."""
+    hangul = rows["is_hangul"].astype(bool).to_numpy()
+    correct = rows["correct"].astype(bool).to_numpy()
+    retrieved = rows["target_retrieved"].astype(int).to_numpy()
+    hangul_total = int(hangul.sum())
+    latin_total = int((~hangul).sum())
+    hangul_correct = int(correct[hangul].sum())
+    latin_correct = int(correct[~hangul].sum())
+    hangul_retrieved = int(retrieved[hangul].sum())
+    latin_retrieved = int(retrieved[~hangul].sum())
+    hangul_accuracy = hangul_correct / hangul_total if hangul_total else math.nan
+    latin_accuracy = latin_correct / latin_total if latin_total else math.nan
     return CVReport(
         hangul_accuracy=hangul_accuracy,
         non_hangul_accuracy=latin_accuracy,
-        weighted_score=weighted,
+        weighted_score=0.7 * hangul_accuracy + 0.3 * latin_accuracy,
         recall_hangul=hangul_retrieved / hangul_total if hangul_total else 0.0,
         recall_latin=latin_retrieved / latin_total if latin_total else 0.0,
         n_hangul=hangul_total,
         n_non_hangul=latin_total,
+    )
+
+
+def _log_fold_metrics(fold_number: int, scenario: str | None, rows: Sequence[dict[str, object]]) -> None:
+    """Log the row counts and bucket accuracies of one fold/scenario without record identifiers."""
+    hangul_rows = [row for row in rows if row["is_hangul"]]
+    latin_rows = [row for row in rows if not row["is_hangul"]]
+    hangul_correct = sum(1 for row in hangul_rows if row["correct"])
+    latin_correct = sum(1 for row in latin_rows if row["correct"])
+    hangul_accuracy = hangul_correct / len(hangul_rows) if hangul_rows else math.nan
+    latin_accuracy = latin_correct / len(latin_rows) if latin_rows else math.nan
+    if scenario is None:
+        logger.info(
+            "[EVAL] fold=%d hangul_accuracy=%.4f (%d rows) non_hangul_accuracy=%.4f (%d rows)",
+            fold_number,
+            hangul_accuracy,
+            len(hangul_rows),
+            latin_accuracy,
+            len(latin_rows),
+        )
+        return
+    logger.info(
+        "[EVAL] fold=%d scenario=%s rows=%d hangul_accuracy=%.4f (%d rows) non_hangul_accuracy=%.4f (%d rows)",
+        fold_number,
+        scenario,
+        len(rows),
+        hangul_accuracy,
+        len(hangul_rows),
+        latin_accuracy,
+        len(latin_rows),
     )
 
 
@@ -352,11 +435,10 @@ def _best_two(
     return best, float(scores[best]), second_id, second_score
 
 
-def _write_diagnostics(path: str | Path, rows: Sequence[dict[str, object]]) -> None:
+def _write_diagnostics(path: str | Path, frame: pd.DataFrame) -> None:
     destination = Path(path)
     if destination.parent != Path(""):
         destination.parent.mkdir(parents=True, exist_ok=True)
-    frame = pd.DataFrame(rows, columns=list(DIAGNOSTIC_COLUMNS))
     frame.to_csv(destination, index=False, encoding="utf-8")
 
 

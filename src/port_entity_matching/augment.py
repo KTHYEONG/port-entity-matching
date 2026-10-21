@@ -17,7 +17,7 @@ from port_entity_matching.config import MatchConfig
 from port_entity_matching.normalize import is_hangul_name
 from port_entity_matching.records import QueryRecord
 
-__all__ = ["degraded_copies"]
+__all__ = ["degraded_copies", "drop_hangul_syllable"]
 
 _SYLLABLE_FIRST = 0xAC00
 _SYLLABLE_LAST = 0xD7A3
@@ -67,8 +67,8 @@ def _without_tonnage(record: QueryRecord) -> QueryRecord:
     )
 
 
-def _with_dropped_syllable(record: QueryRecord, rng: np.random.Generator, min_syllables: int) -> QueryRecord:
-    name = record.vessel_name
+def drop_hangul_syllable(name: str, rng: np.random.Generator, min_syllables: int) -> str:
+    """Remove one randomly chosen Hangul syllable when the name has at least min_syllables; else return name unchanged."""
     positions = [
         position
         for position, char in enumerate(name)
@@ -76,5 +76,10 @@ def _with_dropped_syllable(record: QueryRecord, rng: np.random.Generator, min_sy
     ]
     if positions and len(positions) >= min_syllables:
         target = positions[int(rng.integers(len(positions)))]
-        name = name[:target] + name[target + 1 :]
+        return name[:target] + name[target + 1 :]
+    return name
+
+
+def _with_dropped_syllable(record: QueryRecord, rng: np.random.Generator, min_syllables: int) -> QueryRecord:
+    name = drop_hangul_syllable(record.vessel_name, rng, min_syllables)
     return dataclasses.replace(record, sample_id=f"{record.sample_id}#aug2", vessel_name=name)

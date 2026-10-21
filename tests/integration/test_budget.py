@@ -13,7 +13,7 @@ import pytest
 from port_entity_matching.config import MatchConfig
 from port_entity_matching.pipeline import run_submission
 from port_entity_matching.records import CATALOG_COLUMNS, RECORD_COLUMNS, read_csv_checked
-from port_entity_matching.train import cross_validate
+from port_entity_matching.train import cross_validate, cross_validate_run
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = REPO_ROOT / "data" / "raw" / "open"
@@ -70,6 +70,21 @@ def test_cv_regression_guard() -> None:
     report = cross_validate(train, catalog, MatchConfig())
     assert report.hangul_accuracy >= HANGUL_FLOOR, f"hangul accuracy {report.hangul_accuracy:.4f}"
     assert report.non_hangul_accuracy >= NON_HANGUL_FLOOR, f"non-hangul accuracy {report.non_hangul_accuracy:.4f}"
+
+
+def test_full_data_cv_reproduces_the_recorded_run() -> None:
+    _require_inputs()
+    recorded_path = REPO_ROOT / "artifacts" / "cv_oof.csv"
+    if not recorded_path.is_file():
+        pytest.skip(f"recorded OOF run not available at {recorded_path}")
+    train = read_csv_checked(TRAIN_PATH, (*RECORD_COLUMNS, "target_vessel_id"))
+    catalog = read_csv_checked(CATALOG_PATH, CATALOG_COLUMNS)
+    run = cross_validate_run(train, catalog, MatchConfig())
+    clean = run.oof[run.oof["scenario"] == "clean"].set_index("sample_id")
+    recorded = pd.read_csv(recorded_path).set_index("sample_id")
+    assert set(clean.index) == set(recorded.index)
+    assert (clean["pred_vessel_id"] == recorded.loc[clean.index, "pred_vessel_id"]).all()
+    assert run.report.weighted_score == pytest.approx(0.9875, abs=1e-4)
 
 
 def _logged_peak_rss(caplog: pytest.LogCaptureFixture) -> list[str]:

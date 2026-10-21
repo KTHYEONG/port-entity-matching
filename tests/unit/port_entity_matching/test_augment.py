@@ -106,3 +106,25 @@ def test_short_names_do_not_consume_rng_and_only_raw_syllables_are_deleted() -> 
 def test_invalid_min_syllables_rejected() -> None:
     with pytest.raises(ValueError, match="augment_min_syllables"):
         degraded_copies([_record("S0", "한진부산")], _config(augment_min_syllables=0))
+
+
+def test_short_names_leave_the_generator_untouched() -> None:
+    import numpy as np
+
+    from port_entity_matching.augment import drop_hangul_syllable
+
+    generator = np.random.default_rng(0)
+    assert drop_hangul_syllable("대한", generator, 3) == "대한"
+    fresh = np.random.default_rng(0)
+    assert int(generator.integers(1000)) == int(fresh.integers(1000))
+
+
+def test_dropped_syllable_is_a_single_hangul_character() -> None:
+    import numpy as np
+
+    from port_entity_matching.augment import drop_hangul_syllable
+
+    name = "글로비스 스피릿"
+    result = drop_hangul_syllable(name, np.random.default_rng(0), 3)
+    assert len(result) == len(name) - 1
+    assert result != name
