@@ -9,7 +9,9 @@ import pandas as pd
 import pytest
 
 from port_entity_matching.config import MatchConfig
-from port_entity_matching.evaluation.cli import _cast_value, main, parse_overrides
+from port_entity_matching.evaluation.cli import (
+    _cast_value, _parse_scenarios, _stress_entry, _write_json, _write_oof, main, parse_overrides,
+)
 from port_entity_matching.evaluation.perturb import PERTURBATIONS
 from port_entity_matching.evaluation.stats import OOF_COLUMNS
 
@@ -261,3 +263,86 @@ def test_writing_inside_a_data_directory_is_refused(tiny_dataset: tuple[Path, Pa
         "--out-dir", str(tmp_path / "data" / "eval"),
     ])
     assert exit_code == 1
+
+
+@pytest.mark.parametrize("raw", ["nan", "inf", "-inf", "1e999"])
+def test_nonfinite_overrides_are_rejected(raw: str) -> None:
+    with pytest.raises(ValueError, match="tonnage_window"):
+        parse_overrides([f"tonnage_window={raw}"])
+
+
+@pytest.mark.parametrize("text", ["", ",", "all,bogus", "all,kor_tonnage_missing"])
+def test_invalid_scenario_lists_are_rejected(text: str) -> None:
+    with pytest.raises(ValueError, match="Scenarios"):
+        _parse_scenarios(text)
+
+
+def test_duplicate_scenarios_run_only_once() -> None:
+    assert _parse_scenarios("kor_tonnage_missing,kor_tonnage_missing") == ["kor_tonnage_missing"]
+
+
+@pytest.mark.parametrize("bad_id", [None, "T00001"])
+def test_invalid_training_ids_fail_before_cv(
+    tmp_path: Path, bad_id: str | None, capsys: pytest.CaptureFixture[str],
+) -> None:
+    train_path, catalog_path = _write_fixture(tmp_path)
+    train = pd.read_csv(train_path)
+    train.loc[0, "sample_id"] = bad_id
+    train.to_csv(train_path, index=False)
+    assert main([
+        "cv", "--train", str(train_path), "--catalog", str(catalog_path),
+        "--out-dir", str(tmp_path / "out"),
+    ]) == 1
+    assert "sample_id" in capsys.readouterr().err
+    assert not (tmp_path / "out").exists()
+
+
+def _stress_frame() -> pd.DataFrame:
+    return pd.DataFrame([
+        {"scenario": "clean", "sample_id": "A", "correct": 0, "target_retrieved": 1},
+        {"scenario": "clean", "sample_id": "B", "correct": 1, "target_retrieved": 1},
+        {"scenario": "clean", "sample_id": "C", "correct": 1, "target_retrieved": 1},
+        {"scenario": "test", "sample_id": "C", "correct": 0, "target_retrieved": 0},
+        {"scenario": "test", "sample_id": "B", "correct": 1, "target_retrieved": 1},
+    ])
+
+
+def test_stress_accuracy_joins_only_affected_ids() -> None:
+    report = _stress_entry(_stress_frame(), "test")
+    assert report == {
+        "affected_rows": 2, "acc_clean": 1.0, "acc_perturbed": 0.5,
+        "delta": -0.5, "recall_perturbed": 0.5,
+    }
+
+
+def test_stress_rejects_unmatched_and_duplicate_ids() -> None:
+    frame = _stress_frame()
+    frame.loc[3, "sample_id"] = "missing"
+    with pytest.raises(ValueError, match="matching clean"):
+        _stress_entry(frame, "test")
+    duplicated = pd.concat([_stress_frame(), _stress_frame().iloc[[0]]])
+    with pytest.raises(ValueError, match="one-to-one"):
+        _stress_entry(duplicated, "test")
+
+
+@pytest.mark.parametrize("kind", ["csv", "json"])
+def test_output_file_symlinks_cannot_bypass_data_guard(tmp_path: Path, kind: str) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    protected = data_dir / f"protected.{kind}"
+    protected.write_text("unchanged", encoding="utf-8")
+    output = tmp_path / f"output.{kind}"
+    output.symlink_to(protected)
+    if kind == "csv":
+        with pytest.raises(ValueError, match="data directory"):
+            _write_oof(output, pd.DataFrame({"value": [1]}))
+    else:
+        with pytest.raises(ValueError, match="data directory"):
+            _write_json(output, {"value": 1})
+    assert protected.read_text(encoding="utf-8") == "unchanged"
+
+
+def test_argument_errors_exit_two() -> None:
+    with pytest.raises(SystemExit) as error:
+        main(["cv"])
+    assert error.value.code == 2

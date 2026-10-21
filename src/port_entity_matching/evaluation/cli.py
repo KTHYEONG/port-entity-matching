@@ -183,6 +183,8 @@ def _run_compare(args: argparse.Namespace) -> int:
 def _load_data(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Read the training rows and the catalog, logging only row counts."""
     train = read_csv_checked(args.train, (*RECORD_COLUMNS, "target_vessel_id"))
+    if train["sample_id"].isna().any() or train["sample_id"].duplicated().any():
+        raise ValueError("Train sample_id values must be non-missing and unique")
     catalog = read_csv_checked(args.catalog, CATALOG_COLUMNS)
     logger.info("[DATA] loaded train_rows=%d catalog_rows=%d", len(train), len(catalog))
     return train, catalog
@@ -204,7 +206,10 @@ def _cast_value(key: str, raw: str, default: object) -> object:
             raise ValueError(f"Invalid integer value for '{key}': '{raw}'") from error
     if isinstance(default, float):
         try:
-            return float(raw)
+            value = float(raw)
+            if not math.isfinite(value):
+                raise ValueError("value must be finite")
+            return value
         except ValueError as error:
             raise ValueError(f"Invalid float value for '{key}': '{raw}'") from error
     raise ValueError(f"Unsupported config field type for '{key}'")
@@ -218,12 +223,14 @@ def _overrides(args: argparse.Namespace) -> list[str]:
 def _parse_scenarios(text: str) -> list[str]:
     """Split a --scenarios value into scenario names; ValueError on an unknown name."""
     names = [part.strip() for part in str(text).split(",") if part.strip()]
-    if not names or "all" in names:
+    if names == ["all"]:
         return list(PERTURBATIONS)
+    if not names or "all" in names:
+        raise ValueError("Scenarios must be a non-empty comma list or 'all' alone")
     unknown = [name for name in names if name not in PERTURBATIONS]
     if unknown:
         raise ValueError(f"Unknown scenario '{unknown[0]}'. Valid scenarios: {', '.join(PERTURBATIONS)}")
-    return names
+    return list(dict.fromkeys(names))
 
 
 def _clean_rows(oof: pd.DataFrame) -> pd.DataFrame:
@@ -278,12 +285,11 @@ def _stress_entry(oof: pd.DataFrame, scenario: str) -> dict[str, Any]:
             "delta": None,
         }
     clean = oof[oof["scenario"].astype(str) == "clean"][["sample_id", "correct"]]
-    merged = perturbed.merge(clean, on="sample_id", how="left", suffixes=("", "_clean"))
-    matched = merged["correct_clean"].notna().to_numpy()
+    merged = perturbed.merge(clean, on="sample_id", how="left", suffixes=("", "_clean"), validate="one_to_one")
+    if merged["correct_clean"].isna().any():
+        raise ValueError("Perturbed sample_id values must have matching clean rows")
     acc_perturbed = float(perturbed["correct"].astype(bool).to_numpy().mean())
-    acc_clean = (
-        float(merged.loc[matched, "correct_clean"].astype(bool).to_numpy().mean()) if bool(matched.any()) else math.nan
-    )
+    acc_clean = float(merged["correct_clean"].astype(bool).to_numpy().mean())
     recall = float(perturbed["target_retrieved"].astype(bool).to_numpy().mean())
     return {
         "affected_rows": affected,
@@ -323,12 +329,12 @@ def _guard_data_path(path: Path) -> Path:
 
 def _write_oof(path: Path, frame: pd.DataFrame) -> None:
     """Write an out-of-fold frame as CSV."""
-    frame.to_csv(path, index=False, encoding="utf-8")
+    frame.to_csv(_guard_data_path(path), index=False, encoding="utf-8")
 
 
 def _write_json(path: Path, payload: Any) -> None:
     """Write a JSON payload with sorted keys; NaN values are rejected."""
-    destination = Path(path)
+    destination = _guard_data_path(Path(path))
     if destination.parent != Path(""):
         destination.parent.mkdir(parents=True, exist_ok=True)
     text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False)
