@@ -17,5 +17,9 @@
 - **Coherent In-Place Updates:** Update existing architecture documents coherently rather than accumulating disconnected append-only notes.
 - **Contract & Code Reconciliation:** Treat discrepancies between code contracts and architecture documentation as issues to investigate and resolve; never silently assume either side is automatically correct.
 
+## 3.5 Competition Documentation
+- **Single source:** `docs/architecture/competition.md` holds the full competition rules, schedule, and constraints. `AGENTS.md` §2.5 carries only the enforceable summary; update both together, and re-check the official page when in doubt.
+- **Finals material:** Record findings in `docs/architecture/` as stable summaries, not session logs, organized by the finals rubric: data characteristics and preprocessing rationale, model design and improvement history (what changed, measured effect), error analysis and generalization to unseen vessel names/notations, and field operation/advancement ideas.
+
 ## 4. Repository Language Conventions
 - **All Documentation & In-line Comments:** Written in concise Technical English for toolchain compatibility, token efficiency, and deterministic agent reasoning.

@@ -1,20 +1,21 @@
-# Performance & Optimization Directives (Physical Invariants)
+# Performance & Resource Directives
 
-> **Performance is an architectural invariant, not an afterthought. Never fake speed by silently truncating date ranges, universe constituents, or numerical precision. Correctness strictly precedes speed. Maximize hardware throughput within four physical boundaries.**
+> **Correctness first, then speed. The binding constraint is the evaluation server budget (`AGENTS.md` §2.5): 30 min inference, 26 GB RAM, L4 GPU 22.4 GiB, 6 vCPU, no internet. Never gain speed by silently dropping catalog entries, rows, or precision.**
 
-## 1. Bounded Resource Scaling & Memory Discipline
-- **Bounded Resource Scaling:** Memory consumption must remain safely bounded within available host physical RAM. Select data structures and processing patterns whose memory footprint scales predictably with workload size; prevent unconstrained accumulation of intermediate state.
-- **Eliminate Unnecessary Duplication:** Eliminate redundant in-memory data copies, intermediate full-collection materializations, and unneeded conversions. Prefer views, zero-copy operations, or memory-efficient formats when handling substantial datasets.
-- **Deterministic Resource Reclamation:** Heavy memory buffers, file descriptors, network connections, and worker pools must be deterministically released or closed when exiting their operational scope.
+## 1. Budget Discipline
+- **Rehearse the budget:** Time the full `script.py` flow (load, preprocess, retrieve, rerank, save) on data sized like the real run, with a safety margin well under 30 minutes. Shorter inference time is also a tie-breaker.
+- **Package size:** Keep model files and the ZIP small; ZIP size is the second tie-breaker. Prefer compact artifacts over bundling unused checkpoints.
+- **Offline-safe:** Everything needed at inference is in the ZIP; no downloads at runtime.
 
-## 2. Algorithmic Locality & Hot Path Efficiency
-- **Hot Path Algorithmic Efficiency:** In computationally intensive loops or hot iteration paths, eliminate nested linear scans and repetitive collection filtering ($O(N^2)$ pitfalls). Use pre-indexed structures, hashing, grouping, or cursor positioning where lookup frequency is high.
-- **I/O Locality & Pushdown:** Prohibit repetitive text parsing or deserialization in hot computational paths. Leverage efficient binary or columnar storage with column pruning and predicate pushdown for substantial data I/O.
+## 2. Memory
+- Keep peak memory comfortably below 26 GB (RAM) and 22 GiB (VRAM). Avoid unnecessary copies and full intermediate materializations; use batches.
+- Release large buffers, file handles, and worker pools when done.
 
-## 3. Separation of Invariant Features and Dynamic State
-- **One-Pass Invariant Materialization:** Where compute scale warrants and working memory budgets permit, compute state-independent features and indicators once upstream across the historical timeline. For massive datasets exceeding comfortable in-memory working sets, process in bounded chronological chunks.
-- **Minimal Hot Paths:** Confine inner sequential iteration strictly to state-dependent transitions. Never recompute static or historical invariants inside simulation loops or across optimization folds.
+## 3. Algorithmic Efficiency
+- Avoid per-row linear scans over the whole catalog. Precompute catalog-side indexes or features once, outside the per-row path (catalog features are row-independent and allowed).
+- Avoid repeated parsing or deserialization inside hot loops; prefer vectorized/batched operations.
+- Precompute only things that depend on the catalog or training data. Do not precompute anything across test rows.
 
-## 4. Hardware Saturation & Observable Throughput
-- **Balanced Parallelism:** When verified compute bottlenecks exist on parallelizable workloads, saturate available CPU cores while ensuring compute granularity heavily amortizes inter-process communication (IPC) overhead. Avoid unnecessary multiprocessing setup for lightweight operations.
-- **Continuous Progress Telemetry:** Long-running workloads must emit deterministic progress heartbeats. A silent pipeline is indistinguishable from a deadlocked system.
+## 4. Parallelism & Telemetry
+- Use multiprocessing or GPU only where profiling shows a bottleneck and work units are large enough to amortize overhead; results must stay deterministic regardless of worker count.
+- Long jobs (training, indexing, full inference) emit periodic progress lines.
