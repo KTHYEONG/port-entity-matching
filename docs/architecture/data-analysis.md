@@ -49,6 +49,7 @@ Stable summary of data findings and the decisions they drive, organized by the f
 | Rule-based jamo phonetic key + tonnage window (no learning) | 0.968 | — | — | 0.986 when tonnage is exact, 0.923 when perturbed |
 | Latin full-catalog Damerau cdist + tonnage bonus (no learning) | — | 0.9987 | — | residual errors are mostly renames |
 | Matcher v1 Part 3: LightGBM lambdarank over 39 pair features, 5-fold vessel-disjoint CV | 0.9798 | 0.9993 | 0.9857 | retrieval recall 1.000 in both buckets |
+| Matcher v2 Part 3: 46 pair features, ±10% Korean tonnage window, degraded-copy augmentation, 5-seed bag | 0.9824 | 0.9995 | 0.9875 | see §2.6 for the reconciliation with the prototype numbers |
 
 Caveat: the Korean rules were written after inspecting train names, so 0.968 is optimistic. Learned components must be measured in vessel-disjoint folds.
 
@@ -230,12 +231,51 @@ Held-out Korean rows are degraded and the model is trained on the other folds. A
 - E roughly halves to quarters the error rate under every tonnage or syllable distortion, including the four distortions it was never trained on. The augmentation teaches the ranker to trust the name when tonnage disagrees, not to memorize one perturbation.
 - Vowel swaps (ㅓ↔ㅗ, ㅐ↔ㅔ, ㅡ↔ㅜ, ㅣ↔ㅟ) were already harmless because the sound-class key merges those vowels.
 - Remaining weakness: with tonnage missing, Korean recall is 0.887. Name-only retrieval misses about 11% of targets, which caps accuracy near 0.86.
-- Harness note: E18 and E20 score clean and degraded copies in one fit per fold, so seed-bag z-scores are computed over the combined block. This is an affine change per seed and leaves rankings within a single model unchanged.
+- Harness note: E18 and E20 score clean and degraded copies in one fit per fold, so seed-bag z-scores are computed over the combined block. This is an affine change per seed and leaves rankings within a single model unchanged; production replaces those block constants with per-member training constants (§2.6).
+
+### 2.6 Matcher v2 Part 3: degraded-copy augmentation, seed ensemble, artifacts
+
+**Training-time augmentation.** Every Hangul training row produces three degraded copies: tonnage ×1.08, tonnage missing, and one Hangul syllable deleted (only when the name has at least three syllables). The copies inherit the target and every other field, and their `sample_id` carries a `#aug0/1/2` suffix. The RNG is seeded per call from `augment_seed`, so the copies are deterministic; the attribute maps stay fitted on the clean rows, and recall is measured on the clean rows only. Validation rows are never augmented. Full-training augmentation retrieval keeps the target for 99.3% (tonnage up), 88.8% (tonnage missing) and 100% (syllable deleted) of the copies. Copies with unretrieved targets are excluded from ranker training.
+
+**Seed ensemble.** Five lambdarank members are fitted, member *k* with `seed = config.seed + k`. Each member's scores are standardized with constants fitted on that member's own training-pair scores (mean and population std), never on the scored batch: the prototype z-scored each seed over the whole validation block, which is row-dependent and therefore illegal at inference. E21 observed identical aggregate clean/stress accuracy with the two normalization schemes on the cached prototype setup. This is not a guarantee of identical ensemble rankings: changing member scales changes their relative weights.
+
+**Artifacts.** Bundle version 0.2.0 stores one model file per member (`model_0.txt` … `model_4.txt`) and a manifest `ensemble` section with the file list, means and stds. Manifests without that section (v1 bundles) are rejected, so old artifacts cannot be loaded silently.
+
+**Measured production CV** (vessel-disjoint 5-fold, `train.csv`): weighted score **0.9875** (Korean 0.9824 = 21 errors, non-Korean 0.9995), `recall_hangul` 1.0000, `recall_latin` 1.0000.
+
+**Prototype comparison (partial diagnosis).** The E18/E19 harness numbers use earlier candidate/feature caches, including the pinyin X→S rule dropped in §2.5. Scratch runs E21/E26/E27 produced the following aggregate results; they do not fully isolate the production CV gap:
+
+| Configuration (5-member bag, augmented training) | Korean errors | Score |
+|---|---|---|
+| Prototype E18 variant E as logged (stale caches, pinyin rule, seeds 42/7/123/1/2) | 13 | 0.9922 |
+| Same harness, caches rebuilt from the current code | 15 | 0.9910 |
+| Same harness, production seed set (42…46) | 16 | 0.9904 |
+| Same harness, production training-pair order | 18 | 0.9893 |
+| Production CV (per-fold augmentation draw) | 21 | 0.9875 |
+
+- E21 changed only the seed set on the prototype caches and observed 13 → 16 Korean errors with training-fitted normalization. E26 rebuilt caches with current retrieval/features; the change cannot be attributed solely to removal of the pinyin rule.
+- E26/E27 candidates equal production exactly: a row-by-row check of positions and source bits over all 12,222 rows found 0 differences. `tonnage_window` only affects Latin token retrieval, and E26/E27 built the Latin cache at the production default (0.06). The 1,160 differing rows in E30 came from running Latin rows at 0.10, a configuration neither E26/E27 nor production uses.
+- E27 compared fold-ordered production diagnostics to input-ordered harness results without joining by `sample_id`, so its 50 differing flags were invalid. Joined by `sample_id`, production (21 Korean errors) and E27 (18) differ on 18 rows from 7 vessels, all with top-1/top-2 margins of 0.015–0.50. These are near-tie swaps, not a systematic gap.
+- The only remaining production/harness difference is the augmentation RNG draw: per fold in production, once globally in the harness.
+
+**Seed-noise study (E31)** — production setting (exact production candidates and features, production augmentation order, training-fitted normalization) vs Matcher v1, with four disjoint 5-member seed sets:
+
+| Seed set | v1 Korean errors | v2 Korean errors | v2 score | Δ v2 − v1 [95% CI] |
+|---|---|---|---|---|
+| 42–46 | 23 | 18 | 0.9893 | +0.0030 [−0.0048, +0.0107] |
+| 1042–1046 | 23 | 16 | 0.9904 | +0.0042 [−0.0039, +0.0128] |
+| 2042–2046 | 23 | 19 | 0.9887 | +0.0024 [−0.0054, +0.0100] |
+| 3042–3046 | 23 | 16 | 0.9904 | +0.0041 [−0.0040, +0.0128] |
+
+- v2 beats v1 under every seed set: 16–19 vs 23 Korean errors, mean score 0.9897 vs 0.9863. No single vessel-bootstrap CI excludes zero, but the sign is consistent across all four seed sets.
+- The v2 clean result moves by ±1.5 errors with the seed set alone. One 3–4-row vessel flipping moves the count by 3–4. The production CV (21 errors, 0.9875) sits one vessel below this range, which fits seed and augmentation-draw variation; no implementation defect was found.
+- The spec's expected band of 0.991–0.992 was optimistic. It came from the best of five variants (E18 E, 13 errors) on stale caches that still included the pinyin rule. The selection-adjusted expectation for v2 is a clean CV of about 0.989–0.990.
+- The case for v2 rests on two things: (a) a consistent but modest clean gain of about 6 Korean errors; (b) much higher robustness to degraded tonnage and names (§2.5, E18/E20). Clean CV alone does not carry it.
 
 ### Decisions
 - **No LLMs or large neural models.** CPU rules plus a learned transliteration cost and a GBDT ranker already reach the target. This keeps inference time and ZIP size small, which are the tie-breakers, and avoids synthetic-label compliance questions.
 - **Call-sign memory: adopted as a deterministic override.** It is a lookup table fitted on `train.csv` (allowed training artifact, row-independent). The hash is a stable vessel identity: 1:1 in train and invariant to renames and script. It has no effect if test is vessel-disjoint and is exact otherwise. Vessel-disjoint CV cannot learn its weight, so it is applied as a rule after ranking rather than as a ranker feature. Its effect is measured by an on/off LB probe.
-- **Matcher v2 candidates (evidence in §2.5; not yet implemented):**
+- **Matcher v2 candidates (evidence in §2.5; implemented in §2.6):**
   - adopt key v2 rules and features, without the pinyin rule;
   - adopt key v2 retrieval with a ±10% Korean tonnage window and degraded-copy training augmentation (variant E);
   - adopt the 5-seed LightGBM lambdarank bag.

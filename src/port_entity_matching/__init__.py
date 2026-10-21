@@ -1,6 +1,7 @@
 """Port entity matching package."""
 
 from port_entity_matching.artifacts import ArtifactBundle
+from port_entity_matching.augment import degraded_copies
 from port_entity_matching.candidates import (
     SRC_FALLBACK,
     SRC_MEMORY,
@@ -16,7 +17,14 @@ from port_entity_matching.features import FEATURE_NAMES, build_features
 from port_entity_matching.maps import AttributeMaps
 from port_entity_matching.memory import CallSignMemory
 from port_entity_matching.pipeline import Matcher, Prediction, run_submission
-from port_entity_matching.ranker import score_pairs, select_top1, train_ranker
+from port_entity_matching.ranker import (
+    RankerEnsemble,
+    score_ensemble,
+    score_pairs,
+    select_top1,
+    train_ensemble,
+    train_ranker,
+)
 from port_entity_matching.version import __version__
 
 __all__ = [
@@ -34,13 +42,17 @@ __all__ = [
     "MatchConfig",
     "Matcher",
     "Prediction",
+    "RankerEnsemble",
     "__version__",
     "build_features",
     "config_from_dict",
     "config_to_dict",
+    "degraded_copies",
     "generate_candidates",
     "run_submission",
+    "score_ensemble",
     "score_pairs",
     "select_top1",
+    "train_ensemble",
     "train_ranker",
 ]

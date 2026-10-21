@@ -14,7 +14,7 @@ from port_entity_matching.config import MatchConfig
 from port_entity_matching.features import FEATURE_NAMES
 from port_entity_matching.maps import AttributeMaps
 from port_entity_matching.memory import CallSignMemory
-from port_entity_matching.ranker import score_pairs, train_ranker
+from port_entity_matching.ranker import score_ensemble, train_ensemble
 
 
 def _index() -> CatalogIndex:
@@ -56,24 +56,44 @@ def _bundle(config: MatchConfig | None = None) -> ArtifactBundle:
     features[2, 0] = 1.0
     features[3, 0] = 0.0
     labels = np.array([1, 0, 1, 0], dtype=np.int64)
-    booster = train_ranker(features, labels, [2, 2], settings)
-    return ArtifactBundle(booster=booster, maps=maps, memory=memory, config=settings)
+    ranker = train_ensemble(features, labels, [2, 2], settings)
+    return ArtifactBundle(ranker=ranker, maps=maps, memory=memory, config=settings)
+
+
+def _features() -> np.ndarray:
+    features = np.zeros((4, len(FEATURE_NAMES)), dtype=np.float32)
+    features[0, 0] = 1.0
+    features[2, 0] = 1.0
+    return features
 
 
 def test_round_trip(tmp_path) -> None:
-    bundle = _bundle()
+    bundle = _bundle(MatchConfig(lgbm_num_rounds=10, lgbm_min_data_in_leaf=1, num_threads=1, ensemble_size=2))
     index = _index()
     bundle.save(tmp_path)
-    for name in ("model.txt", "maps.json", "memory.json", "manifest.json"):
+    for name in ("model_0.txt", "model_1.txt", "maps.json", "memory.json", "manifest.json"):
         assert (tmp_path / name).is_file()
 
     restored = ArtifactBundle.load(tmp_path, index)
     assert restored.config == bundle.config
-    features = np.zeros((4, len(FEATURE_NAMES)), dtype=np.float32)
-    assert np.array_equal(score_pairs(restored.booster, features, restored.config), score_pairs(bundle.booster, features, bundle.config))
+    features = _features()
+    assert np.array_equal(
+        score_ensemble(restored.ranker, features, restored.config),
+        score_ensemble(bundle.ranker, features, bundle.config),
+    )
     assert restored.memory.lookup("CS_A") == bundle.memory.lookup("CS_A")
     assert restored.memory.lookup("CS_MISSING") is None
     assert restored.maps.type_logprob("컨테이너선", "Container") == bundle.maps.type_logprob("컨테이너선", "Container")
+
+
+def test_manifest_records_every_member(tmp_path) -> None:
+    bundle = _bundle(MatchConfig(lgbm_num_rounds=10, lgbm_min_data_in_leaf=1, num_threads=1, ensemble_size=3))
+    bundle.save(tmp_path)
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    section = manifest["ensemble"]
+    assert section["files"] == ["model_0.txt", "model_1.txt", "model_2.txt"]
+    assert section["means"] == list(bundle.ranker.means)
+    assert section["stds"] == list(bundle.ranker.stds)
 
 
 @pytest.mark.parametrize("feature_count", [39, len(FEATURE_NAMES) - 1])
@@ -91,8 +111,47 @@ def test_feature_drift_rejected(tmp_path, feature_count: int) -> None:
 def test_missing_file_rejected(tmp_path) -> None:
     bundle = _bundle()
     bundle.save(tmp_path)
-    (tmp_path / "model.txt").unlink()
-    with pytest.raises(FileNotFoundError, match=r"model\.txt"):
+    (tmp_path / "maps.json").unlink()
+    with pytest.raises(FileNotFoundError, match=r"maps\.json"):
+        ArtifactBundle.load(tmp_path, _index())
+
+
+def test_missing_member_file_rejected(tmp_path) -> None:
+    bundle = _bundle(MatchConfig(lgbm_num_rounds=10, lgbm_min_data_in_leaf=1, num_threads=1, ensemble_size=2))
+    bundle.save(tmp_path)
+    (tmp_path / "model_1.txt").unlink()
+    with pytest.raises(FileNotFoundError, match=r"model_1\.txt"):
+        ArtifactBundle.load(tmp_path, _index())
+
+
+def test_manifest_without_ensemble_rejected(tmp_path) -> None:
+    bundle = _bundle()
+    bundle.save(tmp_path)
+    path = tmp_path / "manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    del manifest["ensemble"]
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="ensemble section"):
+        ArtifactBundle.load(tmp_path, _index())
+
+
+@pytest.mark.parametrize(
+    ("files", "means", "stds"),
+    [
+        ([], [], []),
+        (["model_0.txt"], [], []),
+        (["model_0.txt", "model_1.txt"], [1.0], [1.0]),
+        ("model_0.txt", [1.0], [1.0]),
+    ],
+)
+def test_malformed_ensemble_section_rejected(tmp_path, files, means, stds) -> None:
+    bundle = _bundle()
+    bundle.save(tmp_path)
+    path = tmp_path / "manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    manifest["ensemble"] = {"files": files, "means": means, "stds": stds}
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="ensemble section"):
         ArtifactBundle.load(tmp_path, _index())
 
 
@@ -128,8 +187,23 @@ def test_malformed_feature_names_rejected(tmp_path, feature_names) -> None:
 
 def test_booster_feature_drift_rejected_even_with_valid_manifest(tmp_path) -> None:
     _bundle().save(tmp_path)
-    path = tmp_path / "model.txt"
+    path = tmp_path / "model_0.txt"
     model = path.read_text(encoding="utf-8")
     path.write_text(model.replace("feature_names=is_hangul ", "feature_names=renamed "), encoding="utf-8")
     with pytest.raises(ValueError, match="Booster feature names"):
+        ArtifactBundle.load(tmp_path, _index())
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("means", None), ("means", "invalid"), ("means", float("nan")),
+     ("stds", 0.0), ("stds", -1.0), ("stds", float("inf"))],
+)
+def test_invalid_manifest_normalization_rejected(tmp_path, key, value) -> None:
+    _bundle().save(tmp_path)
+    path = tmp_path / "manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    manifest["ensemble"][key][0] = value
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match=r"numeric|finite|positive"):
         ArtifactBundle.load(tmp_path, _index())

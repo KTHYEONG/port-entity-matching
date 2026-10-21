@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
+from dataclasses import dataclass, replace
 from numbers import Integral
 
 import lightgbm as lgb
@@ -13,7 +15,14 @@ from port_entity_matching.candidates import CandidateSet
 from port_entity_matching.config import MatchConfig
 from port_entity_matching.features import FEATURE_NAMES
 
-__all__ = ["score_pairs", "select_top1", "train_ranker"]
+__all__ = [
+    "RankerEnsemble",
+    "score_ensemble",
+    "score_pairs",
+    "select_top1",
+    "train_ensemble",
+    "train_ranker",
+]
 
 
 def train_ranker(
@@ -91,3 +100,67 @@ def select_top1(scores: NDArray[np.float64], candidate_sets: Sequence[CandidateS
         positions = candidate_set.positions[tied]
         selected.append(int(positions[int(np.argmin(positions))]))
     return selected
+
+
+@dataclass(frozen=True)
+class RankerEnsemble:
+    """Seed-bagged lambdarank boosters with per-member score normalization constants."""
+
+    boosters: tuple[lgb.Booster, ...]
+    means: tuple[float, ...]
+    stds: tuple[float, ...]
+
+    def __post_init__(self) -> None:
+        """Reject incomplete members or invalid affine normalization constants."""
+        if not self.boosters:
+            raise ValueError("ensemble must contain at least one member")
+        if len(self.boosters) != len(self.means) or len(self.boosters) != len(self.stds):
+            raise ValueError("ensemble members and constants must have equal lengths")
+        if not all(math.isfinite(mean) for mean in self.means):
+            raise ValueError("ensemble means must be finite")
+        if not all(math.isfinite(std) and std > 0 for std in self.stds):
+            raise ValueError("ensemble stds must be finite and positive")
+
+
+def train_ensemble(
+    features: NDArray[np.float32],
+    labels: NDArray[np.int64],
+    group_sizes: Sequence[int],
+    config: MatchConfig,
+) -> RankerEnsemble:
+    """Fit config.ensemble_size lambdarank members; same validation errors as train_ranker."""
+    if config.ensemble_size < 1:
+        raise ValueError("ensemble_size must be at least 1")
+    boosters: list[lgb.Booster] = []
+    means: list[float] = []
+    stds: list[float] = []
+    for member in range(config.ensemble_size):
+        member_config = replace(config, seed=config.seed + member)
+        booster = train_ranker(features, labels, group_sizes, member_config)
+        scores = score_pairs(booster, features, member_config)
+        means.append(float(np.mean(scores)))
+        stds.append(_finite_std(scores))
+        boosters.append(booster)
+    return RankerEnsemble(boosters=tuple(boosters), means=tuple(means), stds=tuple(stds))
+
+
+def score_ensemble(
+    ensemble: RankerEnsemble,
+    features: NDArray[np.float32],
+    config: MatchConfig,
+) -> NDArray[np.float64]:
+    """Mean of per-member normalized scores, one float64 per feature row."""
+    matrix = np.asarray(features, dtype=np.float32)
+    if matrix.shape[0] == 0:
+        return np.empty(0, dtype=np.float64)
+    total = np.zeros(matrix.shape[0], dtype=np.float64)
+    for booster, mean, std in zip(ensemble.boosters, ensemble.means, ensemble.stds, strict=True):
+        total += (score_pairs(booster, matrix, config) - mean) / std
+    return total / len(ensemble.boosters)
+
+
+def _finite_std(scores: NDArray[np.float64]) -> float:
+    value = float(np.std(scores))
+    if not math.isfinite(value) or value <= 0.0:
+        return 1.0
+    return value

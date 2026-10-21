@@ -21,7 +21,7 @@ from port_entity_matching.candidates import generate_candidates
 from port_entity_matching.catalog import CatalogIndex
 from port_entity_matching.features import build_features
 from port_entity_matching.normalize import is_hangul_name
-from port_entity_matching.ranker import score_pairs, select_top1
+from port_entity_matching.ranker import score_ensemble, select_top1
 from port_entity_matching.records import (
     CATALOG_COLUMNS,
     RECORD_COLUMNS,
@@ -130,7 +130,7 @@ class Matcher:
         config = self.bundle.config
         candidate_sets = generate_candidates(records, self.index, self.bundle.memory, config)
         features = build_features(records, candidate_sets, self.index, self.bundle.maps, config)
-        scores = score_pairs(self.bundle.booster, features, config)
+        scores = score_ensemble(self.bundle.ranker, features, config)
         tops = select_top1(scores, candidate_sets)
         ranked: list[_Ranked] = []
         offset = 0

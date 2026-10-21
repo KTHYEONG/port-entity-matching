@@ -154,7 +154,7 @@ def test_script_without_test_file_fails_clearly(tmp_path: Path) -> None:
     assert "data/test.csv" in result.stderr
 
 
-@pytest.mark.parametrize("name", ["model.txt", "maps.json", "memory.json", "manifest.json"])
+@pytest.mark.parametrize("name", ["model_0.txt", "maps.json", "memory.json", "manifest.json"])
 def test_build_submit_requires_every_artifact(tmp_path: Path, name: str) -> None:
     sys.path.insert(0, str(REPO_ROOT / "tools"))
     from build_submit import REQUIRED_ARTIFACTS, build_submit  # noqa: PLC0415
@@ -188,7 +188,7 @@ def test_build_submit_zip_layout(tmp_path: Path) -> None:
         assert "script.py" in names
         assert "requirements.txt" in names
         assert "model/port_entity_matching/pipeline.py" in names
-        assert "model/artifacts/model.txt" in names
+        assert "model/artifacts/model_0.txt" in names
         assert not any("__pycache__" in name or name.endswith(".pyc") for name in names)
         assert all(not name.startswith("model/port_entity_matching/../") for name in names)
 
@@ -213,7 +213,7 @@ def test_zip_build_is_byte_identical_and_smoke_runs(tmp_path: Path, capsys: pyte
 def test_zip_cannot_overwrite_or_embed_model_artifacts(tmp_path: Path) -> None:
     root = _package(tmp_path)
     model_dir = root / "model" / "artifacts"
-    model_file = model_dir / "model.txt"
+    model_file = model_dir / "model_0.txt"
     original = model_file.read_bytes()
     for output in (model_file, model_dir / "submit.zip"):
         with pytest.raises(ValueError, match="outside"):

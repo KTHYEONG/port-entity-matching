@@ -37,6 +37,11 @@ class MatchConfig:
     lgbm_num_rounds: int = 400
     lgbm_min_data_in_leaf: int = 20
     lgbm_feature_fraction: float = 0.9
+    augment: bool = True
+    augment_tonnage_factor: float = 1.08
+    augment_min_syllables: int = 3
+    augment_seed: int = 0
+    ensemble_size: int = 5
 
 
 def config_to_dict(config: MatchConfig) -> dict[str, int | float]:

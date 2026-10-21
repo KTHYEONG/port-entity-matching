@@ -1,6 +1,6 @@
 [project]
 name = "port-entity-matching"
-version = "0.1.0"
+version = "0.2.0"
 description = "Port entity matching and resolution pipeline"
 requires-python = ">=3.11"
 dependencies = [

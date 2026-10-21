@@ -20,7 +20,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_DIR = REPO_ROOT / "src" / "port_entity_matching"
 SCRIPT_DIR = REPO_ROOT / "submission"
 
-REQUIRED_ARTIFACTS: tuple[str, ...] = ("model.txt", "maps.json", "memory.json", "manifest.json")
+REQUIRED_ARTIFACTS: tuple[str, ...] = ("model_0.txt", "maps.json", "memory.json", "manifest.json")
 EXCLUDED_SUFFIXES: tuple[str, ...] = (".pyc",)
 EXCLUDED_DIRS: tuple[str, ...] = ("__pycache__",)
 FIXED_TIMESTAMP: tuple[int, int, int, int, int, int] = (1980, 1, 1, 0, 0, 0)

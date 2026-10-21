@@ -11,7 +11,9 @@ import pytest
 
 from port_entity_matching.catalog import CatalogIndex
 from port_entity_matching.config import MatchConfig
+from port_entity_matching.features import FEATURE_NAMES
 from port_entity_matching.maps import AttributeMaps
+from port_entity_matching.ranker import score_ensemble
 from port_entity_matching.train import (
     DIAGNOSTIC_COLUMNS,
     build_training_data,
@@ -119,7 +121,7 @@ def test_unretrieved_rows_excluded_and_counted() -> None:
     unknown["target_vessel_id"] = "V_UNKNOWN"
     train = pd.concat([train, unknown], ignore_index=True)
     maps = AttributeMaps.fit(train, index)
-    data = build_training_data(train, index, maps, _config())
+    data = build_training_data(train, index, maps, MatchConfig(augment=False, num_threads=1))
     assert len(data.group_sizes) == len(_ROWS)
     assert data.recall_hangul < 1.0
 
@@ -170,7 +172,7 @@ def test_cli_fit_writes_bundle(tmp_path) -> None:
     _catalog_frame().to_csv(catalog_path, index=False)
     exit_code = main(["--train", str(train_path), "--catalog", str(catalog_path), "--out", str(model_dir)])
     assert exit_code == 0
-    for name in ("model.txt", "maps.json", "memory.json", "manifest.json"):
+    for name in ("model_0.txt", "maps.json", "memory.json", "manifest.json"):
         assert (model_dir / name).is_file()
 
 
@@ -243,7 +245,7 @@ def test_raw_catalog_ids_are_preserved_in_labels() -> None:
     catalog["vessel_id"] = " " + catalog["vessel_id"] + " "
     train["target_vessel_id"] = " " + train["target_vessel_id"] + " "
     index = CatalogIndex.build(catalog)
-    data = build_training_data(train, index, AttributeMaps.fit(train, index), _config())
+    data = build_training_data(train, index, AttributeMaps.fit(train, index), MatchConfig(augment=False, num_threads=1))
     assert len(data.group_sizes) == len(train)
     report = cross_validate(train, catalog, _config())
     assert report.recall_hangul == 1.0
@@ -265,3 +267,75 @@ def test_cv_counts_unretrieved_targets_as_errors_and_ignores_call_signs(tmp_path
     assert report.recall_hangul < 1.0
     train["call_sign"] = "CONTRADICTORY"
     assert cross_validate(train, _catalog_frame(), _config()) == report
+
+
+def _mixed_frame() -> pd.DataFrame:
+    rows = [
+        ("M0", "글로비스 스피릿", "V00", 5000),
+        ("M1", "카시마 마루", "V11", 8000),
+        ("M2", "CALIDA", "V04", 61332),
+        ("M3", "MARSGRACHT", "V09", 3000),
+    ]
+    return pd.DataFrame(
+        [
+            {
+                "sample_id": sample_id,
+                "vessel_name": name,
+                "call_sign": f"CS_{sample_id}",
+                "gross_tonnage": tonnage,
+                "international_gross_tonnage": tonnage,
+                "flag_name": "파나마",
+                "vessel_type": "Tanker",
+                "arrival_year": 2020,
+                "target_vessel_id": target,
+            }
+            for sample_id, name, target, tonnage in rows
+        ]
+    )
+
+
+def test_augmentation_adds_copies_only_to_training() -> None:
+    index = CatalogIndex.build(_catalog_frame())
+    train = _mixed_frame()
+    maps = AttributeMaps.fit(train, index)
+    plain = build_training_data(train, index, maps, MatchConfig(augment=False, num_threads=1))
+    augmented = build_training_data(train, index, maps, MatchConfig(augment=True, num_threads=1))
+    assert len(augmented.group_sizes) == len(plain.group_sizes) + 6
+    assert augmented.recall_hangul == plain.recall_hangul
+    assert augmented.recall_latin == plain.recall_latin
+
+
+def test_maps_are_unaffected_by_augmentation(tmp_path) -> None:
+    train = _mixed_frame()
+    catalog = _catalog_frame()
+    with_augmentation = fit_bundle(train, catalog, MatchConfig(augment=True, num_threads=1))
+    without_augmentation = fit_bundle(train, catalog, MatchConfig(augment=False, num_threads=1))
+    with_augmentation.maps.to_json(tmp_path / "with.json")
+    without_augmentation.maps.to_json(tmp_path / "without.json")
+    assert (tmp_path / "with.json").read_text(encoding="utf-8") == (
+        tmp_path / "without.json"
+    ).read_text(encoding="utf-8")
+
+
+def test_fit_bundle_is_deterministic() -> None:
+    train = _mixed_frame()
+    catalog = _catalog_frame()
+    config = MatchConfig(lgbm_num_rounds=10, lgbm_min_data_in_leaf=1, num_threads=1, ensemble_size=2)
+    first = fit_bundle(train, catalog, config)
+    second = fit_bundle(train, catalog, config)
+    from port_entity_matching.candidates import generate_candidates
+    from port_entity_matching.features import build_features
+    from port_entity_matching.pipeline import Matcher
+    from port_entity_matching.records import records_from_frame
+
+    queries = train.copy()
+    queries["call_sign"] = None
+    records = records_from_frame(queries)
+    index = CatalogIndex.build(catalog)
+    sets = generate_candidates(records, index, None, config)
+    features = build_features(records, sets, index, first.maps, config)
+    assert np.array_equal(
+        score_ensemble(first.ranker, features, config),
+        score_ensemble(second.ranker, features, config),
+    )
+    assert Matcher(index, first).predict_topk(records) == Matcher(index, second).predict_topk(records)

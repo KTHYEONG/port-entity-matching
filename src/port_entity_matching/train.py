@@ -15,6 +15,7 @@ from numpy.typing import NDArray
 from sklearn.model_selection import GroupKFold
 
 from port_entity_matching.artifacts import ArtifactBundle
+from port_entity_matching.augment import degraded_copies
 from port_entity_matching.candidates import generate_candidates
 from port_entity_matching.catalog import CatalogIndex
 from port_entity_matching.config import MatchConfig
@@ -22,7 +23,7 @@ from port_entity_matching.features import build_features
 from port_entity_matching.maps import AttributeMaps
 from port_entity_matching.memory import CallSignMemory
 from port_entity_matching.normalize import is_hangul_name
-from port_entity_matching.ranker import score_pairs, train_ranker
+from port_entity_matching.ranker import score_ensemble, train_ensemble
 from port_entity_matching.records import (
     CATALOG_COLUMNS,
     RECORD_COLUMNS,
@@ -108,6 +109,12 @@ def build_training_data(
     """Build the candidate matrix, features and labels; rows whose target is not retrieved are excluded."""
     records = records_from_frame(train)
     targets = [str(value) for value in train["target_vessel_id"].tolist()]
+    original_count = len(records)
+    if config.augment:
+        copies, sources = degraded_copies(records, config)
+        copy_targets = [targets[index] for index in sources]
+        records = [*records, *copies]
+        targets = [*targets, *copy_targets]
     candidate_sets = generate_candidates(records, index, None, config)
     features = build_features(records, candidate_sets, index, maps, config)
 
@@ -121,10 +128,12 @@ def build_training_data(
 
     for position, (record, target) in enumerate(zip(records, targets, strict=True)):
         hangul = is_hangul_name(record.vessel_name)
-        if hangul:
-            total_hangul += 1
-        else:
-            total_latin += 1
+        original = position < original_count
+        if original:
+            if hangul:
+                total_hangul += 1
+            else:
+                total_latin += 1
         catalog_position = index.id_to_pos.get(target)
         if catalog_position is None:
             continue
@@ -136,6 +145,8 @@ def build_training_data(
         labels[start + int(local[0])] = 1
         keep[start:end] = True
         group_sizes.append(end - start)
+        if not original:
+            continue
         if hangul:
             retrieved_hangul += 1
         else:
@@ -156,15 +167,17 @@ def fit_bundle(train: pd.DataFrame, catalog: pd.DataFrame, config: MatchConfig) 
     maps = AttributeMaps.fit(train, index)
     memory = CallSignMemory.fit(train, index)
     training = build_training_data(train, index, maps, config)
-    booster = train_ranker(training.features, training.labels, training.group_sizes, config)
+    ranker = train_ensemble(training.features, training.labels, training.group_sizes, config)
     logger.info(
-        "[ALGO] fitted rows=%d groups=%d recall_hangul=%.4f recall_latin=%.4f",
+        "[ALGO] fitted rows=%d pairs=%d groups=%d members=%d recall_hangul=%.4f recall_latin=%.4f",
         len(train),
+        int(training.features.shape[0]),
         len(training.group_sizes),
+        len(ranker.boosters),
         training.recall_hangul,
         training.recall_latin,
     )
-    return ArtifactBundle(booster=booster, maps=maps, memory=memory, config=config)
+    return ArtifactBundle(ranker=ranker, maps=maps, memory=memory, config=config)
 
 
 def cross_validate(
@@ -193,12 +206,14 @@ def cross_validate(
         fold_valid = train.iloc[valid_index]
         maps = AttributeMaps.fit(fold_train, index)
         training = build_training_data(fold_train, index, maps, config)
-        booster = train_ranker(training.features, training.labels, training.group_sizes, config)
+        ranker = train_ensemble(training.features, training.labels, training.group_sizes, config)
         logger.info(
-            "[ALGO] fold=%d train_rows=%d groups=%d recall_hangul=%.4f recall_latin=%.4f",
+            "[ALGO] fold=%d train_rows=%d pairs=%d groups=%d members=%d recall_hangul=%.4f recall_latin=%.4f",
             fold_number,
             len(fold_train),
+            int(training.features.shape[0]),
             len(training.group_sizes),
+            len(ranker.boosters),
             training.recall_hangul,
             training.recall_latin,
         )
@@ -207,7 +222,7 @@ def cross_validate(
         fold_targets = [str(value) for value in fold_valid["target_vessel_id"].tolist()]
         candidate_sets = generate_candidates(records, index, None, config)
         features = build_features(records, candidate_sets, index, maps, config)
-        scores = score_pairs(booster, features, config)
+        scores = score_ensemble(ranker, features, config)
 
         sizes = [len(candidate_set.positions) for candidate_set in candidate_sets]
         offsets = np.cumsum([0, *sizes])

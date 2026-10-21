@@ -43,3 +43,23 @@ def test_hangul_tonnage_window_default_and_round_trip() -> None:
 
 def test_latin_tonnage_window_is_untouched_by_hangul_window() -> None:
     assert MatchConfig().tonnage_window == 0.06
+
+
+def test_training_ensemble_defaults() -> None:
+    config = MatchConfig()
+    assert config.augment is True
+    assert config.augment_tonnage_factor == 1.08
+    assert config.augment_min_syllables == 3
+    assert config.augment_seed == 0
+    assert config.ensemble_size == 5
+
+
+def test_augmentation_and_ensemble_fields_round_trip() -> None:
+    restored = config_from_dict(config_to_dict(MatchConfig()))
+    assert restored == MatchConfig()
+    assert isinstance(restored.augment, bool)
+
+
+def test_json_boolean_stays_a_boolean() -> None:
+    assert config_from_dict({"augment": False}).augment is False
+    assert config_from_dict({"augment": True}).augment is True
