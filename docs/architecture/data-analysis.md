@@ -83,9 +83,168 @@ The inference path (`src/port_entity_matching/pipeline.py`) binds a `CatalogInde
 
 `submission/script.py` is a thin wrapper around `run_submission`: it reads `data/test.csv` and `data/vessel_catalog.csv` relative to the working directory and writes `output/submission.csv` with exactly `sample_id,target_vessel_id` in input order. `tools/build_submit.py` assembles the archive without a top-level folder (`script.py`, `requirements.txt`, `model/port_entity_matching/*.py`, `model/artifacts/*`), with sorted entries and a fixed timestamp so repeated builds are byte-identical; `requirements.txt` stays empty because every runtime package is preinstalled on the evaluation server. The built ZIP is 0.4 MB with 20 entries, and the logged peak RSS stays far below the 26 GB server limit.
 
+### 2.4 Evidence Review: Ablations, Sensitivity and Stress Tests
+Every design choice was re-tested under the same vessel-disjoint 5-fold CV (call-sign memory off) with a cached-feature harness (`scratch/exp/harness.py`; scripts `scratch/exp/e*.py`, logs `scratch/exp/*.log`). The harness reproduces the official CV exactly (0.9857, 24 Korean + 8 non-Korean errors); an earlier `artifacts/cv_oof.csv` with 33 errors came from an older code version and was replaced. Deltas carry a 95% vessel-cluster bootstrap CI.
+
+**Measurement noise.**
+- Vessel bootstrap 95% CI: Korean 0.966–0.991, score 0.976–0.994. 382 Korean vessels make one vessel worth ~0.25 pp of Korean accuracy.
+- Re-drawing the vessel folds (3 seeds) gives 0.9863–0.9875.
+- Changing only the LightGBM seed moves Korean errors 23–29 (mean 25.2 ± 2.1 over 5 seeds).
+- Consequence: differences below ~4 Korean errors are not interpretable from a single run.
+
+**What carries the signal (information-type ablation, all redundant copies removed):**
+
+| Removed information | Korean acc | Score | Δ score [95% CI] |
+|---|---|---|---|
+| none (full model) | 0.9798 | 0.9857 | — |
+| Hangul phonetic similarity (kor_* + primary rank/gap) | 0.8262 | 0.8782 | −0.108 [−0.135, −0.080] |
+| all tonnage information | 0.9076 | 0.9351 | −0.051 [−0.071, −0.032] |
+| type/flag maps, digits, rare token, source flags, Latin sims (each alone) | 0.976–0.984 | 0.983–0.989 | within ±0.003, CIs include 0 |
+
+Single-group ablations understate importance because the row-context features (`primary_rank`, `primary_gap`) duplicate the name similarity. Removing digit features appeared to help (+0.003), but every flipped row had no digits on either side, so the change is model variance, not a digit effect.
+
+**Is a learned ranker needed?** (same candidates, same folds)
+
+| Scorer | Korean acc | Score |
+|---|---|---|
+| Hand formula (prototype weights) | 0.9740 | 0.9814 |
+| Logistic regression | 0.9731 | 0.9809 |
+| LightGBM binary | 0.9790 | 0.9852 |
+| LightGBM lambdarank | 0.9798 | 0.9857 |
+
+LightGBM vs hand formula: 9 vessels fixed, 6 broken; Δ +0.004 [−0.005, +0.014]. The learned ranker is at least as good but its advantage is not statistically established on this data. Its practical value is combining NaN-aware signals without hand-tuned weights.
+
+**Hangul rules** (Korean rows rebuilt with one rule removed or replaced):
+
+| Variant | Korean errors | Δ score [95% CI] |
+|---|---|---|
+| Full rules | 24 | — |
+| Plain Revised Romanization instead of sound classes | 63 | −0.023 [−0.038, −0.010] |
+| No NG→N rewrite | 35 | −0.006 [−0.016, +0.002] |
+| No letter-acronym decoding (touches 55/382 vessels) | 34 | −0.006 [−0.015, +0.001] |
+| No 제N→NO N (8 vessels) | 27 | −0.002 |
+| No N호 rule / no trailing-호 variant | 23 / 23 | +0.001 (noise) |
+| ㅎ/H kept as `H` instead of dropped | 20 | +0.002 [−0.001, +0.007] |
+
+The shared sound-class key space is the only design choice with a CI excluding zero.
+
+**Candidate budget.**
+- Korean: the target lies inside the ±6% tonnage window for 99.24% of rows (100% at ±10%). Inside the window, ranking by phonetic score puts it in the top 10 for 98.9% of rows. The name source rescues the 9 out-of-window rows.
+- Latin: the name source alone gives recall@30 99.92%; exact tonnage (7 rows) and rare tokens (2 rows) rescue the rest.
+- End-to-end, mean Korean candidates 35 / 65 / 124 / 233 / 452 all score 0.984–0.988 with recall ≥ 0.9966. Over 5 seeds, the tiny budget (35 Korean / 10 Latin candidates) scores 0.9861 vs 0.9850 for the default. The budget is not a limiting factor above ~35 candidates.
+
+**Hyper-parameters** (5 seeds each):
+
+| Setting | Korean errors | Mean score |
+|---|---|---|
+| Default (31 leaves) | 25.2 ± 2.1 | 0.9850 |
+| 15 leaves | 22.4 ± 0.5 | 0.9867 |
+| feature_fraction 1.0 | 24.8 ± 1.8 | 0.9852 |
+| 5-seed averaged ensemble | 23 | 0.9863 |
+
+Other settings: 200, 400 and 800 rounds are identical; 100 rounds is worse. Per-script models (+0.0006) do not differ from the shared model.
+
+**Stress tests** (model trained on clean folds; held-out rows deliberately degraded):
+
+| Perturbation | Recall | Accuracy |
+|---|---|---|
+| Korean tonnage ×1.08 | 0.845 | 0.980 → 0.801 |
+| Korean tonnage ×1.12 | 0.838 | → 0.677 |
+| Korean tonnage missing | 0.828 | → 0.682 |
+| Korean name: one syllable deleted | 0.997 | → 0.794 |
+| Korean spaces removed | 1.000 | → 0.971 |
+| Korean flag + type missing | 1.000 | → 0.970 |
+| Latin: one extra typo | 0.9998 | 0.9993 → 0.9915 |
+| Latin tonnage missing | 0.9992 | → 0.9981 |
+
+Korean accuracy depends on tonnage reaching the window and on the phonetic key being nearly intact. In train these hold (tonnage 100% within ±10%, never missing), so CV reflects the expected test distribution, but there is little margin outside it.
+
+**Call-sign memory.**
+- 0 conflicts in 12,222 rows; the call sign is stable across all 6 renames and script switches.
+- Temporal holdout: memory fitted on earlier rows predicts the latest row of each multi-row vessel correctly for 2,678/2,678 rows. The ranker alone scores 0.977 (Korean) on the same rows.
+- Expected score with memory: 0.9857 at 0% vessel overlap with test, 0.9900 at 30%, 0.9928 at 50%. It cannot lower the score unless a test call sign maps to a different vessel, which train never shows.
+
+### 2.5 Second Review: Headroom, Feature Engineering, Model Families, Robustness
+Same harness and CV as §2.4. Every comparison uses 5-seed averaged ensembles (z-scored LightGBM scores) so that seed noise (§2.4) does not decide the verdict. Baseline for this section: current production features with a 5-seed bag, 23 Korean / 7 non-Korean errors, score 0.9863.
+
+**Headroom (where the remaining errors can be fixed).**
+- Oracle over the ranked candidates: the Korean target is in the top 2 for 99.58% of rows and in the top 5 for 100%. Retrieval is not the bottleneck on clean data.
+- Of the 23 Korean errors: 15 have a name signal that prefers the wrong vessel, 4 are worse on both name and tonnage, 2 are ranker mistakes (the correct vessel wins on the raw signals), 1 is indistinguishable (Shandong Fu Hui vs Fu Yi, same tonnage) and 1 is a name-vs-tonnage trade-off.
+- Consequence: the lever is the name signal (features), not the model family or the candidate budget.
+- Slice audit: no accuracy drift by build year, vessel type or flag. Errors are per vessel (15 of 19 error vessels have all their rows wrong). The 214 catalog rows without a gross tonnage are never train targets.
+
+**Feature engineering (Korean name signal).**
+A second phonetic key (key v2) adds three Korean-loanword rules to the shared sound-class key:
+- non-rhotic R: R after a vowel and before a consonant or word end is silent (Marsgracht → 마스그라치);
+- onset H: H before a vowel is kept on both sides, while coda H is dropped;
+- Y as the vowel I when not followed by a vowel.
+
+It contributes 7 features: consonant- and vowel-key similarity, Jaro-Winkler, partial ratio, Indel similarity, and the in-row rank/gap of the v2 primary score.
+
+| Variant (5-seed bag) | Korean errors | Score | Δ vs baseline [95% CI] | Vessels fixed / broken |
+|---|---|---|---|---|
+| Baseline (39 features) | 23 | 0.9863 | — | — |
+| + key v2 similarities only | 21 | 0.9875 | +0.0012 [−0.0057, +0.0075] | 5 / 2 |
+| + key v2, all 7 features | 14 | 0.9916 | **+0.0053 [+0.0011, +0.0109]** | 8 / 1 |
+| + same 7 metrics on the old key (no new rules) | 27 | 0.9840 | −0.0023 [−0.0074, +0.0001] | — |
+| + token alignment (mean/min/cover/count diff) | 24 | 0.9857 | −0.0006 [−0.0066, +0.0039] | 3 / 1 |
+| + fold-fitted Hangul→Latin token lexicon | 23 | 0.9863 | +0.0001 [−0.0062, +0.0050] | 6 / 2 |
+
+- The gain comes from the rules, not from adding distance metrics: the same metrics on the old key are neutral to negative.
+- Per-rule ablation:
+  - Name-only rank-1 over the full catalog rises from 0.630 (old key) to 0.682 (264/382 vessels). The largest single contributor is Y-as-vowel, then onset H, then non-rhotic R.
+  - End to end, dropping onset H removes the whole gain (23 errors) and dropping non-rhotic R leaves 19 errors.
+  - A pinyin X→S rule is neutral and is dropped.
+- Without tonnage (name only), Korean accuracy rises from 0.681 to 0.735, so the rules help most where tonnage cannot rescue the name.
+- Final check, without the pinyin rule: +0.0047 [+0.0006, +0.0101], 15 Korean errors.
+
+**Model families and ensembles** (all with key v2 features; error overlap = Jaccard of error-row sets):
+
+| Ranker | Korean errors | Score |
+|---|---|---|
+| LightGBM lambdarank, 5 seeds | 14 | 0.9916 |
+| CatBoost YetiRank (1 seed) | 13 | 0.9922 |
+| CatBoost PairLogit (1 seed) | 15 | 0.9910 |
+| LightGBM binary, 5 seeds | 19 | 0.9887 |
+| sklearn HistGradientBoosting | 25 | 0.9851 |
+| LightGBM rank_xendcg, 5 seeds | 41 | 0.9756 |
+
+- The strong rankers make the same mistakes (Jaccard 0.74–0.86; lambdarank and YetiRank share 17 of 20 error rows).
+- Fixed equal-weight blends (lambdarank + YetiRank, + binary, + PairLogit, all six) give Δ between −0.0024 and 0.0000 vs the lambdarank bag.
+- This matches the headroom analysis: the residual errors are name-signal failures that no ranker can resolve. CatBoost's one-error lead is within seed noise and would add a second runtime library.
+- Tree size: with key v2, 15 vs 31 leaves is Δ +0.0001. The earlier 15-leaf gain (§2.4) does not survive the better features.
+- Seed averaging still pays: single seeds give 19/19/15/15/16 Korean errors (16.8 ± 1.8), while the 5-seed bag gives 15.
+
+**Robustness to degraded inputs** (the §2.4 weakness).
+Held-out Korean rows are degraded and the model is trained on the other folds. Augmentation adds degraded copies of training-fold Korean rows only: tonnage ×1.08, tonnage missing, one syllable deleted. The fold maps are refitted per fold, and the vessels stay disjoint from validation.
+
+| Variant | Clean Korean errors (score) | Tonnage ×1.08 | Tonnage missing | Syllable deleted | *Unseen:* tonnage ×0.90 | *Unseen:* tonnage ×1.12 | *Unseen:* vowel swapped | *Unseen:* syllable inserted |
+|---|---|---|---|---|---|---|---|---|
+| A: old-key retrieval, ±6% window | 14 (0.9916) | 0.819 | 0.735 | 0.788 | 0.697 | 0.731 | 0.980 | 0.961 |
+| B: key v2 retrieval, ±6% | 16 (0.9904) | 0.861 | 0.779 | 0.788 | — | — | — | — |
+| C: key v2 retrieval, ±10% | 17 (0.9898) | 0.926 | 0.783 | 0.796 | 0.744 | 0.781 | 0.981 | 0.964 |
+| D: key v2 retrieval, ±6% + augmentation | 16 (0.9904) | 0.890 | 0.855 | 0.917 | — | — | — | — |
+| **E: key v2 retrieval, ±10% + augmentation** | **13 (0.9922)** | **0.977** | **0.856** | **0.921** | **0.835** | **0.882** | 0.979 | **0.982** |
+
+- E is clean-neutral vs A: Δ +0.0006 [−0.0078, +0.0084].
+- E roughly halves to quarters the error rate under every tonnage or syllable distortion, including the four distortions it was never trained on. The augmentation teaches the ranker to trust the name when tonnage disagrees, not to memorize one perturbation.
+- Vowel swaps (ㅓ↔ㅗ, ㅐ↔ㅔ, ㅡ↔ㅜ, ㅣ↔ㅟ) were already harmless because the sound-class key merges those vowels.
+- Remaining weakness: with tonnage missing, Korean recall is 0.887. Name-only retrieval misses about 11% of targets, which caps accuracy near 0.86.
+- Harness note: E18 and E20 score clean and degraded copies in one fit per fold, so seed-bag z-scores are computed over the combined block. This is an affine change per seed and leaves rankings within a single model unchanged.
+
 ### Decisions
 - **No LLMs or large neural models.** CPU rules plus a learned transliteration cost and a GBDT ranker already reach the target. This keeps inference time and ZIP size small, which are the tie-breakers, and avoids synthetic-label compliance questions.
 - **Call-sign memory: adopted as a deterministic override.** It is a lookup table fitted on `train.csv` (allowed training artifact, row-independent). The hash is a stable vessel identity: 1:1 in train and invariant to renames and script. It has no effect if test is vessel-disjoint and is exact otherwise. Vessel-disjoint CV cannot learn its weight, so it is applied as a rule after ranking rather than as a ranker feature. Its effect is measured by an on/off LB probe.
+- **Matcher v2 candidates (evidence in §2.5; not yet implemented):**
+  - adopt key v2 rules and features, without the pinyin rule;
+  - adopt key v2 retrieval with a ±10% Korean tonnage window and degraded-copy training augmentation (variant E);
+  - adopt the 5-seed LightGBM lambdarank bag.
+- **Rejected after measurement:**
+  - 15 leaves (no gain once key v2 is in);
+  - model-family blends (CatBoost, HistGradientBoosting, binary objective);
+  - the rank_xendcg objective;
+  - token-alignment features;
+  - the fold-fitted token lexicon.
 
 ## 3. Error Analysis (rubric: result interpretation & generalization)
 Residual Korean errors of the rule prototype:
@@ -110,4 +269,5 @@ Error margins are informative for the field workflow: 6 of the 24 Korean errors 
 
 ## 4. Field Applicability
 - Operator workflow: top-k candidate recommendation with score margin; low-margin rows go to a human review queue in the field (not in the competition output).
+- Degraded-input robustness (§2.5) matters more in the field than in CV: manual entry produces missing or misreported tonnage and dropped syllables, which train rarely shows. Variant E keeps clean accuracy while holding 0.84–0.98 Korean accuracy under such errors.
 - Call-sign memory mirrors field practice: once a record is confirmed, its call sign resolves future records instantly, including after renames.
