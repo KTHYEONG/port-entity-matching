@@ -240,3 +240,6 @@ docs/specs/*
 !docs/specs/.gitkeep
 tmp/
 .serena/
+
+# Presentation notes and preserved experiment evidence (local only)
+docs/presentation/

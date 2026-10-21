@@ -19,8 +19,8 @@
 
 ## 3. Levels
 - `INFO`: one line per phase or milestone. `DEBUG`: fine-grained diagnostics, per-candidate scores, trial traces.
-- Keep high-volume diagnostics (per-row candidates, hyperparameter trials) in files under `scratch/` or `artifacts/`, not the main log.
+- Keep high-volume diagnostics (per-row candidates, hyperparameter trials) in files under `artifacts/eval/` (persistent run outputs) or `scratch/` (temporary), not the main log.
 
 ## 4. Lifecycle
-- Persistent logs go in the configured project log path; temporary diagnostics go under `scratch/`.
+- Persistent logs and evaluation run outputs go to `artifacts/eval/`; temporary diagnostics go under `scratch/`.
 - Do not delete logs or evidence needed for an open investigation. Routine cleanup of temporary files via project scripts is fine.

@@ -1,6 +1,6 @@
 # Data Analysis & Design Rationale
 
-Stable summary of data findings and the decisions they drive, organized by the finals rubric. Numbers come from `train.csv` (12,222 rows) and `vessel_catalog.csv` (78,595 rows); reproduction scripts live under `scratch/` (`eda*.py`, `proto_*.py`, `eval_baseline.py`).
+Stable summary of data findings and the decisions they drive, organized by the finals rubric. Numbers come from `train.csv` (12,222 rows) and `vessel_catalog.csv` (78,595 rows). The EDA numbers were produced by one-off exploratory scripts, which have been retired; the figures of the current model are reproducible with `tools/evaluate.py`.
 
 ## 1. Data Understanding (rubric: data understanding & preprocessing)
 
@@ -54,7 +54,7 @@ Stable summary of data findings and the decisions they drive, organized by the f
 Caveat: the Korean rules were written after inspecting train names, so 0.968 is optimistic. Learned components must be measured in vessel-disjoint folds.
 
 ### 2.1 Retrieval Stage (Matcher v1 Part 2)
-Candidate generation (name similarity, tonnage, rare-token, call-sign memory) was measured separately from ranking, on 400 sampled train rows per script bucket (`scratch/eval_candidates.py`). These are in-sample diagnostics: memory was fitted on all train labels, including the sampled rows, so total recall includes a memorization oracle and is not held-out retrieval performance.
+Candidate generation (name similarity, tonnage, rare-token, call-sign memory) was measured separately from ranking, on 400 sampled train rows per script bucket (a one-off script, since retired). These are in-sample diagnostics: memory was fitted on all train labels, including the sampled rows, so total recall includes a memorization oracle and is not held-out retrieval performance. Held-out retrieval recall of the current model is reported by `tools/evaluate.py cv` in the `recall` field of `summary.json`.
 
 | Bucket | Recall@400 | Name source | Tonnage source | Rare-token source | Mean candidates |
 |---|---|---|---|---|---|
@@ -85,7 +85,12 @@ The inference path (`src/port_entity_matching/pipeline.py`) binds a `CatalogInde
 `submission/script.py` is a thin wrapper around `run_submission`: it reads `data/test.csv` and `data/vessel_catalog.csv` relative to the working directory and writes `output/submission.csv` with exactly `sample_id,target_vessel_id` in input order. `tools/build_submit.py` assembles the archive without a top-level folder (`script.py`, `requirements.txt`, `model/port_entity_matching/*.py`, `model/artifacts/*`), with sorted entries and a fixed timestamp so repeated builds are byte-identical; `requirements.txt` stays empty because every runtime package is preinstalled on the evaluation server. The built ZIP is 0.4 MB with 20 entries, and the logged peak RSS stays far below the 26 GB server limit.
 
 ### 2.4 Evidence Review: Ablations, Sensitivity and Stress Tests
-Every design choice was re-tested under the same vessel-disjoint 5-fold CV (call-sign memory off) with a cached-feature harness (`scratch/exp/harness.py`; scripts `scratch/exp/e*.py`, logs `scratch/exp/*.log`). The harness reproduces the official CV exactly (0.9857, 24 Korean + 8 non-Korean errors); an earlier `artifacts/cv_oof.csv` with 33 errors came from an older code version and was replaced. Deltas carry a 95% vessel-cluster bootstrap CI.
+Every design choice was re-tested under the same vessel-disjoint 5-fold CV (call-sign memory off) with a cached-feature harness in which experiments E0–E31 ran. That harness has been retired; its results are recorded here, and the scripts and logs are kept outside version control. The current model's CV, CIs, stress tests and paired comparisons are reproduced with:
+- `tools/evaluate.py cv --out-dir artifacts/eval/<run>`
+- `tools/evaluate.py stress --out-dir ...`
+- `tools/evaluate.py compare A/oof.csv B/oof.csv`
+
+The harness reproduces the official CV exactly (0.9857, 24 Korean + 8 non-Korean errors); an earlier `artifacts/cv_oof.csv` with 33 errors came from an older code version and was replaced. Deltas carry a 95% vessel-cluster bootstrap CI.
 
 **Measurement noise.**
 - Vessel bootstrap 95% CI: Korean 0.966–0.991, score 0.976–0.994. 382 Korean vessels make one vessel worth ~0.25 pp of Korean accuracy.
@@ -271,6 +276,7 @@ Held-out Korean rows are degraded and the model is trained on the other folds. A
 - The v2 clean result moves by ±1.5 errors with the seed set alone. One 3–4-row vessel flipping moves the count by 3–4. The production CV (21 errors, 0.9875) sits one vessel below this range, which fits seed and augmentation-draw variation; no implementation defect was found.
 - The spec's expected band of 0.991–0.992 was optimistic. It came from the best of five variants (E18 E, 13 errors) on stale caches that still included the pinyin rule. The selection-adjusted expectation for v2 is a clean CV of about 0.989–0.990.
 - The case for v2 rests on two things: (a) a consistent but modest clean gain of about 6 Korean errors; (b) much higher robustness to degraded tonnage and names (§2.5, E18/E20). Clean CV alone does not carry it.
+- The study is reproduced by rerunning `tools/evaluate.py cv --set seed=<base>` for each seed base and comparing the resulting out-of-fold files.
 
 ### Decisions
 - **No LLMs or large neural models.** CPU rules plus a learned transliteration cost and a GBDT ranker already reach the target. This keeps inference time and ZIP size small, which are the tie-breakers, and avoids synthetic-label compliance questions.

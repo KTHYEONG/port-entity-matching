@@ -6,10 +6,10 @@
 - **Deterministic & Pure Canonicalization:** Entity normalization, alias expansion, and attribute parsing must be deterministic.
 - **Explainable Linkages (dev/analysis path):** Analysis tooling outputs match score, margin, and matched-attribute evidence for error analysis and the finals presentation. The submitted `script.py` emits only the required CSV.
 - **Ambiguity:** The submission always emits a deterministic top-1 `vessel_id` per row (see §2.5); ambiguous or low-margin cases are surfaced in diagnostics, never skipped or silently randomized.
-- **Workspace Hygiene:** Exploratory experiments, scratch data probes, and temporary artifacts remain strictly isolated under `scratch/` and `artifacts/`. Never commit raw proprietary entity catalogs, unmasked PII, or large binary caches.
+- **Workspace Hygiene:** `scratch/` holds ephemeral one-off probes only and is purged after the task; reusable analysis lives in `src/port_entity_matching/evaluation/` and `tools/`; generated outputs go to `artifacts/` (ignored). Never commit raw proprietary entity catalogs, unmasked PII, or large binary caches.
 
 ## 2. Autonomy & Execution Contract
-- **Bias Toward Action & Diagnostic Autonomy:** For data queries, exploratory scratch diagnostics, and empirical root-cause isolation, execute immediately without asking for permission. When investigating matching anomalies or edge-case entities, proactively run scratch experiments under `scratch/` to discover ground truth. Never modify production pipeline code or commit in response to open-ended diagnostic queries.
+- **Bias Toward Action & Diagnostic Autonomy:** For data queries, exploratory scratch diagnostics, and empirical root-cause isolation, execute immediately without asking for permission. When investigating matching anomalies or edge-case entities, proactively run one-off probes under `scratch/` to discover ground truth, and take routine measurements with `tools/evaluate.py`. Never modify production pipeline code or commit in response to open-ended diagnostic queries.
 - **Skills as On-Demand Tools:** Skills (`probe`, `spec`, `implement`, `check`, `refactor`, `commit`) are modular, independent utilities—NOT a mandatory sequential conveyor belt. When explicitly invoked via slash commands (`/probe`, `/spec`, etc.), execute only that targeted skill and halt for user review. Specs live under `docs/specs/` (gitignored).
 
 ## 2.5 Competition Hard Rules (DACON "AI Technology Competition for Solving Port Challenges")

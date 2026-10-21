@@ -16,4 +16,4 @@
 - **Thin entry point:** `script.py` stays small and delegates to importable, tested modules in `model/` (or the packaged library), so the same code is exercised by tests and by the evaluation server.
 - **Pinned dependencies:** `requirements.txt` lists only what inference needs, with versions that install within 10 minutes on Python 3.11 / CUDA 12.8.
 - **Reproducibility:** Fix seeds; avoid reading ambient environment, wall-clock, or machine-dependent state in prediction logic.
-- Experimental code (notebooks, exploratory scripts) lives under `scratch/` and is not imported by the submission path.
+- Exploratory one-off scripts live under `scratch/` (ephemeral, never imported, never cited as evidence); evaluation code in `src/port_entity_matching/evaluation/` is not imported by the submission path.

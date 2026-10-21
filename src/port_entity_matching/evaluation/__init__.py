@@ -3,6 +3,7 @@
 This subpackage is development-only; it is never part of the shipped submission.
 """
 
+from port_entity_matching.evaluation.cli import main, parse_overrides
 from port_entity_matching.evaluation.perturb import PERTURBATIONS, perturb_record
 from port_entity_matching.evaluation.stats import (
     OOF_COLUMNS,
@@ -19,7 +20,9 @@ __all__ = [
     "PairedDifference",
     "bucket_scores",
     "load_oof",
+    "main",
     "paired_difference",
+    "parse_overrides",
     "perturb_record",
     "vessel_bootstrap_ci",
 ]

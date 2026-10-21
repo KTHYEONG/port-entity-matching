@@ -210,6 +210,21 @@ def test_zip_build_is_byte_identical_and_smoke_runs(tmp_path: Path, capsys: pyte
     assert "smoke_ok" in capsys.readouterr().out
 
 
+def test_zip_excludes_the_evaluation_subpackage(tmp_path: Path) -> None:
+    sys.path.insert(0, str(REPO_ROOT / "tools"))
+    from build_submit import REQUIRED_ARTIFACTS, build_submit  # noqa: PLC0415
+
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    for artifact in REQUIRED_ARTIFACTS:
+        (model_dir / artifact).write_text("{}", encoding="utf-8")
+
+    zip_path = build_submit(model_dir, tmp_path / "submit.zip")
+    with zipfile.ZipFile(zip_path) as archive:
+        names = archive.namelist()
+    assert not any("evaluation" in name for name in names)
+
+
 def test_zip_cannot_overwrite_or_embed_model_artifacts(tmp_path: Path) -> None:
     root = _package(tmp_path)
     model_dir = root / "model" / "artifacts"
