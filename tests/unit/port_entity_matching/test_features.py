@@ -5,12 +5,15 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pytest
+from rapidfuzz import fuzz
+from rapidfuzz.distance import Indel, JaroWinkler, Levenshtein
 
 from port_entity_matching.candidates import SRC_NAME, SRC_TOKEN, CandidateSet
 from port_entity_matching.catalog import CatalogIndex
 from port_entity_matching.config import MatchConfig
 from port_entity_matching.features import FEATURE_NAMES, build_features
 from port_entity_matching.maps import AttributeMaps
+from port_entity_matching.normalize import hangul_phonetic_key_v2, hangul_variants
 from port_entity_matching.records import QueryRecord
 
 
@@ -90,6 +93,73 @@ def _candidate_set(positions: list[int], sources: int = SRC_NAME) -> CandidateSe
 
 def _column(name: str) -> int:
     return FEATURE_NAMES.index(name)
+
+
+_PREVIOUS_FEATURE_NAMES: tuple[str, ...] = (
+    "is_hangul",
+    "lat_dl_sim",
+    "lat_lev_sim",
+    "lat_jw_sim",
+    "lat_token_set",
+    "lat_partial",
+    "lat_prefix",
+    "lat_exact",
+    "rare_token_overlap",
+    "kor_cons_sim",
+    "kor_vow_sim",
+    "kor_cons_jw",
+    "kor_len_ratio",
+    "kor_acronym_hit",
+    "digits_equal",
+    "digits_xor",
+    "logratio_igt",
+    "exact_igt",
+    "band_igt",
+    "near_igt",
+    "logratio_gt",
+    "exact_gt",
+    "band_gt",
+    "near_gt",
+    "min_abs_logratio",
+    "any_exact",
+    "query_tonnage_missing",
+    "catalog_gt_missing",
+    "log_same_gt_count",
+    "type_logprob",
+    "flag_logprob",
+    "type_logprior",
+    "primary_rank",
+    "primary_gap",
+    "n_exact_in_row",
+    "log_n_candidates",
+    "src_name",
+    "src_tonnage",
+    "src_token",
+)
+
+_KEY_V2_NAMES: tuple[str, ...] = (
+    "kor2_cons_sim",
+    "kor2_vow_sim",
+    "kor2_vow_jw",
+    "kor2_vow_partial",
+    "kor2_vow_indel",
+    "kor2_primary_gap",
+    "kor2_primary_rank",
+)
+
+_KEY_V2_SIMILARITY_NAMES: tuple[str, ...] = _KEY_V2_NAMES[:5]
+
+
+def _korean_index() -> CatalogIndex:
+    return CatalogIndex.build(
+        pd.DataFrame(
+            [
+                {"vessel_id": "H0", "vessel_name": "HEUNG A", "gross_tonnage": 100, "vessel_type": "Tanker", "flag_name": "Panama"},
+                {"vessel_id": "H1", "vessel_name": "OTHER SHIP", "gross_tonnage": 200, "vessel_type": "Tanker", "flag_name": "Panama"},
+                {"vessel_id": "H2", "vessel_name": "HEUNG A", "gross_tonnage": 300, "vessel_type": "Tanker", "flag_name": "Panama"},
+            ]
+        )
+    )
 
 
 def _build(
@@ -275,3 +345,98 @@ def test_log_tonnage_ratio_remains_finite_at_float_extremes(query: float, catalo
     matrix = _build([_record("Alpha", igt=query)], [_candidate_set([0])], index)
     assert np.isfinite(matrix[0, _column("logratio_igt")])
     assert matrix[0, _column("logratio_igt")] == pytest.approx(np.log(query) - np.log(catalog), rel=1e-6)
+
+
+def test_feature_width_grows_to_forty_six() -> None:
+    matrix = _build([_record("GRAND ACE 11", igt=100)], [_candidate_set([0, 1, 2])])
+    assert matrix.shape[1] == len(FEATURE_NAMES) == 46
+    assert FEATURE_NAMES[: len(_PREVIOUS_FEATURE_NAMES)] == _PREVIOUS_FEATURE_NAMES
+    assert FEATURE_NAMES[len(_PREVIOUS_FEATURE_NAMES):] == _KEY_V2_NAMES
+
+
+def test_latin_rows_have_nan_key_v2_columns() -> None:
+    matrix = _build([_record("GRAND ACE 11", igt=100)], [_candidate_set([0, 1])])
+    for name in _KEY_V2_NAMES:
+        assert np.all(np.isnan(matrix[:, _column(name)]))
+
+
+def test_key_v2_exact_phonetic_match_scores_one() -> None:
+    matrix = _build([_record("흥아", igt=100)], [_candidate_set([0, 1])], _korean_index())
+    assert matrix[0, _column("kor2_cons_sim")] == pytest.approx(1.0)
+    assert matrix[0, _column("kor2_primary_rank")] == 1.0
+    assert matrix[0, _column("kor2_primary_gap")] == pytest.approx(0.0)
+    assert matrix[1, _column("kor2_primary_gap")] > 0.0
+
+
+def test_key_v2_rank_ties_use_catalog_position() -> None:
+    matrix = _build([_record("흥아", igt=100)], [_candidate_set([2, 0])], _korean_index())
+    assert matrix[:, _column("kor2_primary_rank")].tolist() == [2.0, 1.0]
+
+
+def test_key_v2_gap_is_non_negative_with_zero_at_best() -> None:
+    matrix = _build([_record("흥아", igt=100)], [_candidate_set([0, 1, 2])], _korean_index())
+    gaps = matrix[:, _column("kor2_primary_gap")]
+    assert np.all(gaps >= 0.0)
+    assert float(np.min(gaps)) == pytest.approx(0.0)
+
+
+def test_key_v2_similarities_are_bounded() -> None:
+    matrix = _build([_record("흥아", igt=100)], [_candidate_set([0, 1, 2])], _korean_index())
+    for name in _KEY_V2_SIMILARITY_NAMES:
+        values = matrix[:, _column(name)]
+        assert np.all(np.isfinite(values))
+        assert np.all(values >= 0.0)
+        assert np.all(values <= 1.0)
+
+
+def test_key_v2_columns_keep_row_independence() -> None:
+    index = _korean_index()
+    records = [
+        _record("흥아", igt=100),
+        _record("GRAND ACE 11", igt=100),
+        _record("글로비스 스피릿", igt=5000),
+    ]
+    sets = [_candidate_set([0, 1]), _candidate_set([1, 2]), _candidate_set([0, 1, 2])]
+    together = _build(records, sets, index)
+    for offset, (record, candidate_set) in enumerate(zip(records, sets, strict=True)):
+        alone = _build([record], [candidate_set], index)
+        start = sum(len(item.positions) for item in sets[:offset])
+        np.testing.assert_array_equal(together[start : start + len(candidate_set.positions)], alone)
+
+
+@pytest.mark.parametrize("query", ["흥아호", "으", "흥아 KMTC 12"])
+def test_key_v2_similarities_match_scalar_scorers(query: str) -> None:
+    index = CatalogIndex.build(pd.DataFrame({
+        "vessel_id": ["A", "B", "C", "D"],
+        "vessel_name": ["HEUNG A", "HEUNG A HO", "###", "AEIOU"],
+        "gross_tonnage": [100] * 4,
+    }))
+    positions = [3, 2, 0, 1]
+    matrix = _build([_record(query)], [_candidate_set(positions)], index)
+    variants = hangul_variants(query)
+    scorers = (
+        ("kor2_cons_sim", False, Levenshtein.normalized_similarity, 1.0),
+        ("kor2_vow_sim", True, Levenshtein.normalized_similarity, 1.0),
+        ("kor2_vow_jw", True, JaroWinkler.normalized_similarity, 1.0),
+        ("kor2_vow_partial", True, fuzz.partial_ratio, 100.0),
+        ("kor2_vow_indel", True, Indel.normalized_similarity, 1.0),
+    )
+    for name, with_vowels, scorer, scale in scorers:
+        choices = index.key2_vow if with_vowels else index.key2_cons
+        expected = [
+            max(scorer(hangul_phonetic_key_v2(variant, with_vowels), choices[p]) for variant in variants) / scale
+            for p in positions
+        ]
+        np.testing.assert_allclose(matrix[:, _column(name)], expected, rtol=1e-6, atol=1e-7)
+
+
+def test_key_v2_context_does_not_replace_v1_context() -> None:
+    index = CatalogIndex.build(pd.DataFrame({
+        "vessel_id": ["A", "B"], "vessel_name": ["EUNG A", "HEUNG A"], "gross_tonnage": [100, 100],
+    }))
+    matrix = _build([_record("흥아")], [_candidate_set([0, 1])], index)
+    np.testing.assert_array_equal(matrix[:, _column("primary_rank")], [1, 2])
+    np.testing.assert_array_equal(matrix[:, _column("primary_gap")], [0, 0])
+    np.testing.assert_array_equal(matrix[:, _column("kor2_primary_rank")], [2, 1])
+    assert matrix[0, _column("kor2_primary_gap")] > 0
+    assert matrix[1, _column("kor2_primary_gap")] == 0

@@ -13,7 +13,7 @@ from typing import Any, cast
 import numpy as np
 from numpy.typing import NDArray
 from rapidfuzz import fuzz, process
-from rapidfuzz.distance import DamerauLevenshtein, JaroWinkler, Levenshtein
+from rapidfuzz.distance import DamerauLevenshtein, Indel, JaroWinkler, Levenshtein
 
 from port_entity_matching.candidates import SRC_NAME, SRC_TOKEN, SRC_TONNAGE, CandidateSet
 from port_entity_matching.catalog import CatalogIndex
@@ -24,6 +24,7 @@ from port_entity_matching.normalize import (
     decode_letter_acronym,
     digit_tokens,
     hangul_phonetic_key,
+    hangul_phonetic_key_v2,
     hangul_variants,
     is_hangul_name,
     latin_tokens,
@@ -73,6 +74,13 @@ FEATURE_NAMES: tuple[str, ...] = (
     "src_name",
     "src_tonnage",
     "src_token",
+    "kor2_cons_sim",
+    "kor2_vow_sim",
+    "kor2_vow_jw",
+    "kor2_vow_partial",
+    "kor2_vow_indel",
+    "kor2_primary_gap",
+    "kor2_primary_rank",
 )
 
 _LATIN_NAMES: tuple[str, ...] = (
@@ -90,6 +98,15 @@ _HANGUL_NAMES: tuple[str, ...] = (
     "kor_cons_jw",
     "kor_len_ratio",
     "kor_acronym_hit",
+)
+_HANGUL_V2_NAMES: tuple[str, ...] = (
+    "kor2_cons_sim",
+    "kor2_vow_sim",
+    "kor2_vow_jw",
+    "kor2_vow_partial",
+    "kor2_vow_indel",
+    "kor2_primary_gap",
+    "kor2_primary_rank",
 )
 
 Scorer = Callable[[str, str], float]
@@ -131,6 +148,7 @@ def _record_features(
 
     _latin_columns(record, positions, index, columns, hangul)
     _hangul_columns(record, positions, index, columns, hangul)
+    _hangul_v2_columns(record, positions, index, columns, hangul)
     columns["rare_token_overlap"] = _rare_token_overlap(record, positions, index, config, hangul)
     _digit_columns(record, positions, index, columns)
     _tonnage_columns(record, positions, index, columns, config)
@@ -211,6 +229,42 @@ def _hangul_columns(
         )
     else:
         columns["kor_acronym_hit"] = np.full(len(positions), np.nan)
+
+
+def _hangul_v2_columns(
+    record: QueryRecord,
+    positions: NDArray[np.int64],
+    index: CatalogIndex,
+    columns: dict[str, NDArray[np.float64]],
+    hangul: bool,
+) -> None:
+    if not hangul:
+        for name in _HANGUL_V2_NAMES:
+            columns[name] = np.full(len(positions), np.nan)
+        return
+    variants = hangul_variants(record.vessel_name)
+    candidate_cons = [index.key2_cons[position] for position in positions]
+    candidate_vow = [index.key2_vow[position] for position in positions]
+    cons_keys = [hangul_phonetic_key_v2(variant, False) for variant in variants]
+    vowel_keys = [hangul_phonetic_key_v2(variant, True) for variant in variants]
+    cons_matrix = np.vstack([_cdist(key, candidate_cons, Levenshtein.normalized_similarity) for key in cons_keys])
+    vowel_lev = np.vstack([_cdist(key, candidate_vow, Levenshtein.normalized_similarity) for key in vowel_keys])
+    vowel_jw = np.vstack([_cdist(key, candidate_vow, JaroWinkler.normalized_similarity) for key in vowel_keys])
+    vowel_partial = np.vstack([_cdist(key, candidate_vow, fuzz.partial_ratio) for key in vowel_keys]) / 100.0
+    vowel_indel = np.vstack([_cdist(key, candidate_vow, Indel.normalized_similarity) for key in vowel_keys])
+
+    columns["kor2_cons_sim"] = cons_matrix.max(axis=0)
+    columns["kor2_vow_sim"] = vowel_lev.max(axis=0)
+    columns["kor2_vow_jw"] = vowel_jw.max(axis=0)
+    columns["kor2_vow_partial"] = vowel_partial.max(axis=0)
+    columns["kor2_vow_indel"] = vowel_indel.max(axis=0)
+
+    primary = (columns["kor2_cons_sim"] + columns["kor2_vow_sim"]) / 2.0
+    columns["kor2_primary_gap"] = primary.max() - primary
+    order = np.lexsort((positions, -primary))
+    rank = np.empty(len(positions), dtype=np.float64)
+    rank[order] = np.arange(1, len(positions) + 1)
+    columns["kor2_primary_rank"] = rank
 
 
 def _rare_token_overlap(

@@ -76,12 +76,13 @@ def test_round_trip(tmp_path) -> None:
     assert restored.maps.type_logprob("컨테이너선", "Container") == bundle.maps.type_logprob("컨테이너선", "Container")
 
 
-def test_feature_drift_rejected(tmp_path) -> None:
+@pytest.mark.parametrize("feature_count", [39, len(FEATURE_NAMES) - 1])
+def test_feature_drift_rejected(tmp_path, feature_count: int) -> None:
     bundle = _bundle()
     bundle.save(tmp_path)
     manifest_path = tmp_path / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["feature_names"] = list(FEATURE_NAMES[:-1])
+    manifest["feature_names"] = list(FEATURE_NAMES[:feature_count])
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(ValueError, match="feature names"):
         ArtifactBundle.load(tmp_path, _index())
