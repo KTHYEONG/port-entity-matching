@@ -12,11 +12,11 @@ from collections.abc import Callable
 
 import numpy as np
 
-from port_entity_matching.augment import drop_hangul_syllable
+from port_entity_matching.augment import char_edits, drop_hangul_syllable, drop_token, reverse_tokens
 from port_entity_matching.normalize import is_hangul_name
 from port_entity_matching.records import QueryRecord
 
-__all__ = ["PERTURBATIONS", "perturb_record"]
+__all__ = ["PERTURBATIONS", "UNSEEN_PERTURBATIONS", "perturb_record"]
 
 PERTURBATIONS: tuple[str, ...] = (
     "kor_tonnage_x1.08",
@@ -30,6 +30,25 @@ PERTURBATIONS: tuple[str, ...] = (
     "kor_flag_type_missing",
     "lat_extra_typo",
     "lat_tonnage_missing",
+    "kor_tokens_reversed",
+    "kor_token_dropped",
+    "kor_tokens_rotated",
+    "kor_tonnage_noise_10_20",
+    "lat_tokens_reversed",
+    "lat_token_dropped",
+    "lat_tokens_rotated",
+    "lat_heavy_typo",
+    "lat_tonnage_noise_10_20",
+)
+
+UNSEEN_PERTURBATIONS: tuple[str, ...] = (
+    "kor_tokens_rotated",
+    "lat_tokens_rotated",
+    "lat_heavy_typo",
+    "kor_vowel_swapped",
+    "kor_syllable_inserted",
+    "kor_spaces_removed",
+    "kor_flag_type_missing",
 )
 
 _SYLLABLE_BASE = 0xAC00
@@ -175,6 +194,67 @@ def _latin_missing_tonnage(record: QueryRecord, rng: np.random.Generator) -> Que
     return dataclasses.replace(record, gross_tonnage=None, international_gross_tonnage=None)
 
 
+def _tokens_reversed(hangul: bool) -> Handler:
+    """Build a handler that reverses the whitespace tokens of the matching script."""
+
+    def handler(record: QueryRecord, rng: np.random.Generator) -> QueryRecord | None:
+        if _is_hangul(record) != hangul:
+            return None
+        if len(record.vessel_name.split()) < 2:
+            return None
+        return dataclasses.replace(record, vessel_name=reverse_tokens(record.vessel_name))
+
+    return handler
+
+
+def _token_dropped(hangul: bool) -> Handler:
+    """Build a handler that drops one whitespace token of the matching script."""
+
+    def handler(record: QueryRecord, rng: np.random.Generator) -> QueryRecord | None:
+        if _is_hangul(record) != hangul:
+            return None
+        if len(record.vessel_name.split()) < 2:
+            return None
+        return dataclasses.replace(record, vessel_name=drop_token(record.vessel_name, rng))
+
+    return handler
+
+
+def _tokens_rotated(hangul: bool) -> Handler:
+    """Build a handler that moves the first whitespace token to the end of the matching script."""
+
+    def handler(record: QueryRecord, rng: np.random.Generator) -> QueryRecord | None:
+        if _is_hangul(record) != hangul:
+            return None
+        tokens = record.vessel_name.split()
+        if len(tokens) < 3:
+            return None
+        return dataclasses.replace(record, vessel_name=" ".join([*tokens[1:], tokens[0]]))
+
+    return handler
+
+
+def _tonnage_noise(hangul: bool) -> Handler:
+    """Build a handler that scales both tonnage fields by a random factor in [0.80, 0.90] or [1.10, 1.20]."""
+
+    def handler(record: QueryRecord, rng: np.random.Generator) -> QueryRecord | None:
+        if _is_hangul(record) != hangul:
+            return None
+        if record.gross_tonnage is None and record.international_gross_tonnage is None:
+            return None
+        sign = 1.0 if int(rng.integers(2)) == 0 else -1.0
+        magnitude = float(rng.uniform(0.10, 0.20))
+        return _scaled_tonnage(record, 1.0 + sign * magnitude)
+
+    return handler
+
+
+def _latin_heavy_typo(record: QueryRecord, rng: np.random.Generator) -> QueryRecord | None:
+    if _is_hangul(record):
+        return None
+    return dataclasses.replace(record, vessel_name=char_edits(record.vessel_name, rng, 3))
+
+
 def _medial(char: str) -> str:
     code = ord(char) - _SYLLABLE_BASE
     return _JUNGSEONG[(code % 588) // 28]
@@ -201,4 +281,13 @@ _SCENARIOS: dict[str, Handler] = {
     "kor_flag_type_missing": _missing_flag_and_type,
     "lat_extra_typo": _latin_typo,
     "lat_tonnage_missing": _latin_missing_tonnage,
+    "kor_tokens_reversed": _tokens_reversed(True),
+    "kor_token_dropped": _token_dropped(True),
+    "kor_tokens_rotated": _tokens_rotated(True),
+    "kor_tonnage_noise_10_20": _tonnage_noise(True),
+    "lat_tokens_reversed": _tokens_reversed(False),
+    "lat_token_dropped": _token_dropped(False),
+    "lat_tokens_rotated": _tokens_rotated(False),
+    "lat_heavy_typo": _latin_heavy_typo,
+    "lat_tonnage_noise_10_20": _tonnage_noise(False),
 }

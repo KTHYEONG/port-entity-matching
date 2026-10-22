@@ -346,3 +346,72 @@ def test_argument_errors_exit_two() -> None:
     with pytest.raises(SystemExit) as error:
         main(["cv"])
     assert error.value.code == 2
+
+
+def test_stress_writes_the_suite_summary(tiny_dataset: tuple[Path, Path], tmp_path: Path) -> None:
+    train_path, catalog_path = tiny_dataset
+    out_dir = tmp_path / "stress_suite"
+    assert main([
+        "stress",
+        "--train", str(train_path),
+        "--catalog", str(catalog_path),
+        "--out-dir", str(out_dir),
+        "--scenarios", "kor_tonnage_missing,lat_tonnage_missing",
+        "--set", "ensemble_size=1",
+    ]) == 0
+    suite = json.loads((out_dir / "suite.json").read_text(encoding="utf-8"))
+    assert set(suite) == {"all", "seen", "unseen"}
+    for entry in suite.values():
+        assert set(entry) == {"kor", "lat", "score", "n_kor", "n_lat"}
+        assert 0.0 <= entry["score"] <= 1.0
+        assert entry["n_kor"] >= 1
+        assert entry["n_lat"] >= 1
+
+
+def test_stress_serializes_a_missing_bucket_as_null(tiny_dataset: tuple[Path, Path], tmp_path: Path) -> None:
+    train_path, catalog_path = tiny_dataset
+    train = pd.read_csv(train_path)
+    latin_path = tmp_path / "latin.csv"
+    train.iloc[1::2].to_csv(latin_path, index=False)
+    out_dir = tmp_path / "latin_stress"
+    assert main([
+        "stress", "--train", str(latin_path), "--catalog", str(catalog_path),
+        "--out-dir", str(out_dir), "--scenarios", "lat_tonnage_missing",
+        "--set", "ensemble_size=1", "--set", "cv_splits=2",
+    ]) == 0
+    suite = json.loads((out_dir / "suite.json").read_text(encoding="utf-8"))
+    for entry in suite.values():
+        assert entry["kor"] is None
+        assert entry["score"] is None
+        assert entry["n_kor"] == 0
+        assert entry["lat"] is not None
+
+
+def test_compare_accepts_a_scenario(tiny_dataset: tuple[Path, Path], tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    train_path, catalog_path = tiny_dataset
+    out_dir = tmp_path / "stress_compare"
+    assert main([
+        "stress",
+        "--train", str(train_path),
+        "--catalog", str(catalog_path),
+        "--out-dir", str(out_dir),
+        "--scenarios", "kor_tonnage_missing,lat_tonnage_missing",
+        "--set", "ensemble_size=1",
+    ]) == 0
+    long_path = out_dir / "oof_long.csv"
+    first = tmp_path / "first.csv"
+    second = tmp_path / "second.csv"
+    long_frame = pd.read_csv(long_path)
+    long_frame.sample(frac=1.0, random_state=5).to_csv(first, index=False)
+    long_frame.to_csv(second, index=False)
+
+    exit_code = main([
+        "compare", str(first), str(second), "--scenario", "lat_tonnage_missing",
+    ])
+    assert exit_code == 0
+    assert "+0.0000" in capsys.readouterr().out
+
+    exit_code = main([
+        "compare", str(first), str(second), "--scenario", "bogus",
+    ])
+    assert exit_code == 1

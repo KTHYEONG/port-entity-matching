@@ -13,6 +13,7 @@ from port_entity_matching.evaluation.stats import (
     bucket_scores,
     load_oof,
     paired_difference,
+    suite_scores,
     vessel_bootstrap_ci,
 )
 from port_entity_matching.train import DIAGNOSTIC_COLUMNS
@@ -253,3 +254,129 @@ def test_percentile_is_not_clamped_to_point() -> None:
     difference = paired_difference(frame.assign(correct=0), frame, n_boot=1)
     assert difference.ci_low == pytest.approx(accuracy)
     assert difference.ci_high == pytest.approx(accuracy)
+
+
+def _long_frame(rows: list[tuple[str, bool, bool]]) -> pd.DataFrame:
+    """Build a long OOF frame with one 'correct' flag per (scenario, sample_id, is_hangul) triple."""
+    return pd.DataFrame(
+        [
+            {
+                "scenario": scenario,
+                "sample_id": f"{scenario}-{index}",
+                "is_hangul": int(hangul),
+                "target_vessel_id": f"V{index}",
+                "pred_vessel_id": f"V{index}",
+                "correct": int(correct),
+                "top1_score": 1.0,
+                "top2_vessel_id": "",
+                "top2_score": 0.0,
+                "margin": 1.0,
+                "target_retrieved": 1,
+                "n_candidates": 3,
+            }
+            for index, (scenario, hangul, correct) in enumerate(rows)
+        ],
+        columns=["scenario", *DIAGNOSTIC_COLUMNS],
+    )
+
+
+def test_load_oof_filters_by_scenario(tmp_path: Path) -> None:
+    frame = _long_frame([
+        ("clean", True, True),
+        ("lat_tokens_reversed", False, False),
+        ("lat_tokens_reversed", False, True),
+    ])
+    path = tmp_path / "oof_long.csv"
+    frame.to_csv(path, index=False)
+    loaded = load_oof(path, "lat_tokens_reversed")
+    assert len(loaded) == 2
+    assert set(loaded["scenario"]) == {"lat_tokens_reversed"}
+    with pytest.raises(ValueError, match="bogus"):
+        load_oof(path, "bogus")
+
+
+def test_load_oof_rejects_a_scenario_absent_from_the_file(tmp_path: Path) -> None:
+    path = tmp_path / "oof.csv"
+    _mixed_frame().to_csv(path, index=False)
+    with pytest.raises(ValueError, match="scenario"):
+        load_oof(path, "lat_tokens_reversed")
+
+
+def test_suite_scores_arithmetic() -> None:
+    frame = _long_frame([
+        ("clean", True, True),
+        ("clean", False, True),
+        ("kor_tokens_reversed", True, True),
+        ("kor_tokens_reversed", True, False),
+        ("lat_heavy_typo", False, False),
+        ("lat_heavy_typo", False, False),
+    ])
+    suite = suite_scores(frame, ["kor_tokens_reversed", "lat_heavy_typo"])
+    assert set(suite) == {"all", "seen", "unseen"}
+    every = suite["all"]
+    assert every["kor"] == pytest.approx(0.75)
+    assert every["lat"] == pytest.approx(0.5)
+    assert every["score"] == pytest.approx(0.675)
+    assert every["n_kor"] == 2
+    assert every["n_lat"] == 2
+    unseen = suite["unseen"]
+    assert unseen["lat"] == pytest.approx(0.5)
+    assert unseen["n_lat"] == 2
+    assert unseen["n_kor"] == 1
+
+
+def test_suite_scores_skip_scenarios_without_rows() -> None:
+    frame = _long_frame([
+        ("clean", True, True),
+        ("clean", False, True),
+        ("kor_tokens_reversed", True, True),
+    ])
+    suite = suite_scores(frame, ["kor_tokens_reversed", "lat_heavy_typo"])
+    assert suite["all"]["n_kor"] == 2
+    assert suite["all"]["n_lat"] == 1
+    assert suite["unseen"]["n_lat"] == 1
+
+
+def test_suite_scores_reject_an_unknown_scenario_prefix() -> None:
+    frame = _long_frame([("clean", True, True)])
+    with pytest.raises(ValueError, match="bucket"):
+        suite_scores(frame, ["bogus_scenario"])
+
+
+def test_suite_scores_count_each_family_once() -> None:
+    frame = _long_frame([
+        ("clean", True, True), ("clean", False, True),
+        ("kor_tokens_reversed", True, False),
+    ])
+    expected = suite_scores(frame, ["kor_tokens_reversed"])
+    assert suite_scores(frame, ["kor_tokens_reversed"] * 2) == expected
+    assert expected["all"]["n_kor"] == 2
+    assert expected["all"]["kor"] == 0.5
+
+
+def test_suite_scores_do_not_weight_families_by_row_count() -> None:
+    frame = _long_frame([
+        ("clean", True, True), ("clean", False, True),
+        ("lat_heavy_typo", False, False),
+    ])
+    extra = pd.concat([frame.iloc[[-1]]] * 20).assign(sample_id=[f"extra-{i}" for i in range(20)])
+    repeated = pd.concat([frame, extra])
+    assert suite_scores(repeated, ["lat_heavy_typo"]) == suite_scores(frame, ["lat_heavy_typo"])
+    assert suite_scores(repeated, ["lat_heavy_typo"])["all"]["lat"] == 0.5
+
+
+def test_suite_scores_treat_a_frame_without_a_scenario_column_as_clean() -> None:
+    frame = _mixed_frame().assign(scenario="clean")
+    suite = suite_scores(frame.drop(columns=["scenario"]), ["kor_tokens_reversed"])
+    assert suite["all"]["n_kor"] == 1
+    assert suite["all"]["n_lat"] == 1
+
+
+def test_paired_difference_falls_back_to_accuracy_for_one_script() -> None:
+    hangul_base = _frame([("K0", True, "V0", "V0", True), ("K1", True, "V1", "V1", False)])
+    hangul_improved = _frame([("K0", True, "V0", "V0", True), ("K1", True, "V1", "V1", True)])
+    difference = paired_difference(hangul_base, hangul_improved)
+    assert difference.delta == pytest.approx(0.5)
+    latin_base = _frame([("L0", False, "V0", "V0", False), ("L1", False, "V1", "V1", False)])
+    latin_improved = _frame([("L0", False, "V0", "V0", True), ("L1", False, "V1", "V1", False)])
+    assert paired_difference(latin_base, latin_improved).delta == pytest.approx(0.5)

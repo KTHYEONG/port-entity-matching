@@ -278,6 +278,67 @@ Held-out Korean rows are degraded and the model is trained on the other folds. A
 - The case for v2 rests on two things: (a) a consistent but modest clean gain of about 6 Korean errors; (b) much higher robustness to degraded tonnage and names (§2.5, E18/E20). Clean CV alone does not carry it.
 - The study is reproduced by rerunning `tools/evaluate.py cv --set seed=<base>` for each seed base and comparing the resulting out-of-fold files.
 
+### 2.7 Leaderboard Gap (2026-10-22)
+
+**The gap.** The v2 submission scores **0.8805** on the leaderboard, while vessel-disjoint CV reports **0.9875** (Korean 0.9824, non-Korean 0.9995). Two diagnostic submissions isolate the buckets:
+
+| Diagnostic submission | LB score | Derived bucket |
+|---|---|---|
+| Latin (non-Korean) records only | 0.27393 | L = 0.913 |
+| Korean records only (L known) | — | K = 0.867 |
+| Memory off (call-sign override disabled) | 0.8805 | identical to the default submission |
+
+The memory-off submission has the same reported LB score as the default one. This is consistent with disjoint test vessels, but an unchanged score alone proves neither byte-identical predictions nor zero call-sign hits: an override can agree with the ranker or changes can cancel in the aggregate.
+
+**Ruled out.** Four shift hypotheses were measured and rejected:
+
+| Hypothesis | Probe | Result |
+|---|---|---|
+| Serving path skew (train/serve mismatch) | fold-1 bundle through save/load + `Matcher` vs CV out-of-fold predictions | 0 differing predictions |
+| Population shift (unseen / small vessels) | production model (memory off) on synthetic Latin records of catalog vessels unseen in train | 0.998 accuracy |
+| Latin tonnage noise ±10–20% | CV stress scenario | 0.9965 |
+| 2–4 character typos in Latin names | synthetic Latin records with 2–4 edits | 0.957 |
+
+None of them reproduces a 0.87 Korean / 0.91 Latin accuracy pair.
+
+**Token-level notation changes.** A fold-1 honest probe (train on fold 1's training rows, score fold 1's validation rows with token-level notation changes) shows the collapse:
+
+| Distortion | Korean accuracy | Latin accuracy | Latin recall |
+|---|---|---|---|
+| tokens reversed | 0.47 | 0.42 | 0.73–0.78 |
+| one token dropped | 0.69 | 0.49 | 0.73–0.78 |
+| adjacent tokens swapped | 0.49 | 0.44 | 0.73–0.78 |
+
+Token-level notation changes are absent from the training data: the per-vessel name noise is fixed (each vessel keeps one spelling per script), and 99.8% of the Latin vessels differ from their catalog name by at most two character edits. Cross-validation therefore cannot see token-level changes, and the clean CV score is blind to them.
+
+**Decision.** Model selection stops relying on clean CV alone. The perturbation stress suite (§2.4, extended in this part) is the selection signal: `tools/evaluate.py stress` writes `stress.json` (per scenario) and `suite.json` (the seen / unseen / all suite scores), and a candidate is judged on the suite score rather than on the clean score alone.
+
+**Token-level suite results (v2 baseline).** The nine new scenarios on the v2 model (`artifacts/eval/v2_suite`):
+
+| Scenario | Affected rows | Perturbed accuracy | Perturbed recall |
+|---|---|---|---|
+| `kor_tokens_reversed` | 879 | 0.3925 | 0.8089 |
+| `kor_token_dropped` | 879 | 0.6257 | 0.9772 |
+| `kor_tokens_rotated` | 38 | 0.2895 | 0.8947 |
+| `kor_tonnage_noise_10_20` | 1191 | 0.8102 | 0.8967 |
+| `lat_tokens_reversed` | 8956 | 0.4864 | 0.7736 |
+| `lat_token_dropped` | 8957 | 0.5224 | 0.7465 |
+| `lat_tokens_rotated` | 1052 | 0.5162 | 0.6749 |
+| `lat_heavy_typo` | 10965 | 0.9425 | 0.9815 |
+| `lat_tonnage_noise_10_20` | 10238 | 0.9966 | 0.9991 |
+
+The token-level scenarios confirm the fold-1 probe's qualitative weakness, not its exact aggregate values: Latin reversal/drop accuracy is 0.49–0.52, while Korean reversal is 0.3925, below the anticipated 0.45–0.60 band (fold 1 itself is 0.4726). Both retrieval and ranking fail: Latin token scenarios miss the target in 22–33% of rows, but their accuracy remains well below recall; Korean token-drop recall is 0.9772 despite accuracy of 0.6257. Ranking improvements can help already-retrieved targets, while retrieval improvements are needed to raise the recall ceiling. These stress results do not establish the cause or prevalence of distortions in the private test data.
+
+The v2 baseline suite scores are:
+
+| Suite group | kor | lat | score | n_kor | n_lat |
+|---|---|---|---|---|---|
+| all | 0.8201 | 0.8071 | 0.8162 | 14 | 8 |
+| seen | 0.8079 | 0.8330 | 0.8154 | 9 | 6 |
+| unseen | 0.8654 | 0.8194 | 0.8516 | 6 | 3 |
+
+Each scenario is one distortion family of equal importance, so the group score is the unweighted mean of the per-scenario accuracies plus the clean item — never a row-count weighted average. These are the reference that the following parts have to beat.
+
 ### Decisions
 - **No LLMs or large neural models.** CPU rules plus a learned transliteration cost and a GBDT ranker already reach the target. This keeps inference time and ZIP size small, which are the tie-breakers, and avoids synthetic-label compliance questions.
 - **Call-sign memory: adopted as a deterministic override.** It is a lookup table fitted on `train.csv` (allowed training artifact, row-independent). The hash is a stable vessel identity: 1:1 in train and invariant to renames and script. It has no effect if test is vessel-disjoint and is exact otherwise. Vessel-disjoint CV cannot learn its weight, so it is applied as a rule after ranking rather than as a ranker feature. Its effect is measured by an on/off LB probe.

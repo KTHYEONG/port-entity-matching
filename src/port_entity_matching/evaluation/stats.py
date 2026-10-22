@@ -7,6 +7,7 @@ two runs.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,6 +15,7 @@ import numpy as np
 import pandas as pd
 from numpy.typing import NDArray
 
+from port_entity_matching.evaluation.perturb import UNSEEN_PERTURBATIONS
 from port_entity_matching.train import DIAGNOSTIC_COLUMNS
 
 __all__ = [
@@ -22,6 +24,7 @@ __all__ = [
     "bucket_scores",
     "load_oof",
     "paired_difference",
+    "suite_scores",
     "vessel_bootstrap_ci",
 ]
 
@@ -29,6 +32,8 @@ OOF_COLUMNS: tuple[str, ...] = DIAGNOSTIC_COLUMNS
 
 _STRING_COLUMNS: tuple[str, ...] = ("sample_id", "target_vessel_id", "pred_vessel_id", "top2_vessel_id")
 _BOOLEAN_COLUMNS: tuple[str, ...] = ("correct", "is_hangul")
+
+_SUITE_GROUPS: tuple[str, ...] = ("all", "seen", "unseen")
 
 
 @dataclass(frozen=True)
@@ -44,21 +49,25 @@ class PairedDifference:
     rows_broken: int
 
 
-def load_oof(path: str | Path) -> pd.DataFrame:
-    """Read an OOF CSV (clean rows); ValueError on missing columns or duplicate sample_id."""
+def load_oof(path: str | Path, scenario: str = "clean") -> pd.DataFrame:
+    """Read an OOF CSV, keeping the rows of one scenario when a scenario column exists; ValueError on missing columns, duplicate sample_id, or no rows for the scenario."""
     frame = pd.read_csv(path, converters=dict.fromkeys(_STRING_COLUMNS, str))
-    if "scenario" in frame.columns:
-        frame = frame[frame["scenario"].astype(str) == "clean"]
     missing = [column for column in OOF_COLUMNS if column not in frame.columns]
     if missing:
         raise ValueError(f"OOF CSV is missing required columns: {', '.join(missing)}")
     frame = frame.copy()
+    if "scenario" in frame.columns:
+        frame = frame[frame["scenario"].astype(str) == scenario]
+    elif scenario != "clean":
+        raise ValueError(f"OOF CSV has no scenario column, so scenario '{scenario}' cannot be selected")
     for column in _STRING_COLUMNS:
         frame[column] = frame[column].astype(str)
     for column in _BOOLEAN_COLUMNS:
         frame[column] = frame[column].map(_to_bool)
     if frame["sample_id"].duplicated().any():
         raise ValueError("OOF CSV contains duplicate sample_id values")
+    if len(frame) == 0:
+        raise ValueError(f"OOF CSV contains no rows for scenario '{scenario}'")
     return frame.reset_index(drop=True)
 
 
@@ -70,6 +79,75 @@ def bucket_scores(oof: pd.DataFrame) -> dict[str, float]:
     lat = float(correct[~hangul].mean()) if (~hangul).any() else math.nan
     score = 0.7 * kor + 0.3 * lat if not (math.isnan(kor) or math.isnan(lat)) else math.nan
     return {"kor": kor, "lat": lat, "score": score}
+
+
+def suite_scores(oof_long: pd.DataFrame, scenarios: Sequence[str]) -> dict[str, dict[str, float | int]]:
+    """Mean perturbed accuracy per bucket over clean plus the given scenarios, split into 'seen', 'unseen' and 'all' groups."""
+    if "scenario" in oof_long.columns:
+        scenario_values = oof_long["scenario"].astype(str).to_numpy()
+    else:
+        scenario_values = np.full(len(oof_long), "clean", dtype=object)
+    correct = oof_long["correct"].astype(bool).to_numpy()
+    hangul = oof_long["is_hangul"].astype(bool).to_numpy()
+
+    kor_items: dict[str, float] = {}
+    lat_items: dict[str, float] = {}
+    clean_rows = scenario_values == "clean"
+    if bool(clean_rows.any()):
+        clean_hangul = clean_rows & hangul
+        clean_latin = clean_rows & ~hangul
+        if bool(clean_hangul.any()):
+            kor_items["clean"] = float(correct[clean_hangul].mean())
+        if bool(clean_latin.any()):
+            lat_items["clean"] = float(correct[clean_latin].mean())
+
+    selected: list[str] = []
+    for name in dict.fromkeys(scenarios):
+        bucket = _scenario_bucket(name)
+        rows = scenario_values == name
+        if not bool(rows.any()):
+            continue
+        selected.append(name)
+        if bucket == "kor":
+            kor_items[name] = float(correct[rows].mean())
+        else:
+            lat_items[name] = float(correct[rows].mean())
+
+    groups: dict[str, list[str]] = {
+        "all": selected,
+        "seen": [name for name in selected if name not in UNSEEN_PERTURBATIONS],
+        "unseen": [name for name in selected if name in UNSEEN_PERTURBATIONS],
+    }
+    return {group: _suite_group_scores(groups[group], kor_items, lat_items) for group in _SUITE_GROUPS}
+
+
+def _scenario_bucket(name: str) -> str:
+    """Return the bucket of a scenario name from its prefix; ValueError on an unknown prefix."""
+    if name.startswith("kor_"):
+        return "kor"
+    if name.startswith("lat_"):
+        return "lat"
+    raise ValueError(f"Unknown scenario bucket for '{name}': expected a 'kor_' or 'lat_' prefix")
+
+
+def _suite_group_scores(
+    names: Sequence[str],
+    kor_items: dict[str, float],
+    lat_items: dict[str, float],
+) -> dict[str, float | int]:
+    """Average the per-scenario items of one suite group, including the clean item."""
+    kor_values = [kor_items[key] for key in ("clean", *names) if key in kor_items]
+    lat_values = [lat_items[key] for key in ("clean", *names) if key in lat_items]
+    kor = float(np.mean(kor_values)) if kor_values else math.nan
+    lat = float(np.mean(lat_values)) if lat_values else math.nan
+    score = 0.7 * kor + 0.3 * lat if not (math.isnan(kor) or math.isnan(lat)) else math.nan
+    return {
+        "kor": kor,
+        "lat": lat,
+        "score": score,
+        "n_kor": len(kor_values),
+        "n_lat": len(lat_values),
+    }
 
 
 def vessel_bootstrap_ci(oof: pd.DataFrame, n_boot: int = 2000, seed: int = 0) -> dict[str, tuple[float, float]]:
@@ -108,7 +186,12 @@ def vessel_bootstrap_ci(oof: pd.DataFrame, n_boot: int = 2000, seed: int = 0) ->
 
 
 def paired_difference(a: pd.DataFrame, b: pd.DataFrame, n_boot: int = 2000, seed: int = 0) -> PairedDifference:
-    """Compare two OOF frames joined on sample_id; ValueError when their sample_id sets or targets differ."""
+    """Compare two OOF frames joined on sample_id; ValueError when their sample_id sets or targets differ.
+
+    The score is the bucket-weighted competition metric when both scripts are present.
+    A single-script selection (one perturbation scenario) falls back to the plain
+    mean accuracy, because the weighted score is undefined without the other bucket.
+    """
     if n_boot < 1:
         raise ValueError("n_boot must be positive")
     left = _aligned(a, b)
@@ -127,17 +210,18 @@ def paired_difference(a: pd.DataFrame, b: pd.DataFrame, n_boot: int = 2000, seed
     lat_b = _counts(codes, (correct_b & ~hangul).astype(float), n_vessels)
     kor_total = _counts(codes, hangul.astype(float), n_vessels)
     lat_total = _counts(codes, (~hangul).astype(float), n_vessels)
+    weighted = bool(hangul.any()) and bool((~hangul).any())
 
     rng = np.random.default_rng(seed)
     draws: list[float] = []
     for _ in range(n_boot):
         weights = _counts(rng.integers(0, n_vessels, n_vessels), None, n_vessels)
-        score_a = 0.7 * _ratio(weights, kor_a, kor_total) + 0.3 * _ratio(weights, lat_a, lat_total)
-        score_b = 0.7 * _ratio(weights, kor_b, kor_total) + 0.3 * _ratio(weights, lat_b, lat_total)
+        score_a = _draw_score(weights, kor_a, kor_total, lat_a, lat_total, weighted, hangul)
+        score_b = _draw_score(weights, kor_b, kor_total, lat_b, lat_total, weighted, hangul)
         draws.append(score_b - score_a)
 
-    score_a = bucket_scores(left)["score"]
-    score_b = bucket_scores(right)["score"]
+    score_a = _point_score(left, correct_a)
+    score_b = _point_score(right, correct_b)
     delta = score_b - score_a
     rows_fixed = int(np.count_nonzero(~correct_a & correct_b))
     rows_broken = int(np.count_nonzero(correct_a & ~correct_b))
@@ -155,6 +239,31 @@ def paired_difference(a: pd.DataFrame, b: pd.DataFrame, n_boot: int = 2000, seed
         rows_fixed=rows_fixed,
         rows_broken=rows_broken,
     )
+
+
+def _draw_score(
+    weights: NDArray[np.float64],
+    kor_correct: NDArray[np.float64],
+    kor_total: NDArray[np.float64],
+    lat_correct: NDArray[np.float64],
+    lat_total: NDArray[np.float64],
+    weighted: bool,
+    hangul: NDArray[np.bool_],
+) -> float:
+    """Return the bootstrap score of one draw: the weighted metric, or the single present bucket."""
+    if weighted:
+        return 0.7 * _ratio(weights, kor_correct, kor_total) + 0.3 * _ratio(weights, lat_correct, lat_total)
+    if bool(hangul.any()):
+        return _ratio(weights, kor_correct, kor_total)
+    return _ratio(weights, lat_correct, lat_total)
+
+
+def _point_score(frame: pd.DataFrame, correct: NDArray[np.bool_]) -> float:
+    """Return the point score of a frame: the weighted metric, or the plain mean accuracy for one script."""
+    score = bucket_scores(frame)["score"]
+    if not math.isnan(score):
+        return score
+    return float(correct.mean())
 
 
 def _to_bool(value: object) -> bool:

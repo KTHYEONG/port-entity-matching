@@ -28,6 +28,7 @@ from port_entity_matching.evaluation.stats import (
     bucket_scores,
     load_oof,
     paired_difference,
+    suite_scores,
     vessel_bootstrap_ci,
 )
 from port_entity_matching.records import CATALOG_COLUMNS, RECORD_COLUMNS, read_csv_checked
@@ -109,6 +110,7 @@ def _build_parser() -> argparse.ArgumentParser:
     compare = subparsers.add_parser("compare", help="compare two out-of-fold CSV runs")
     compare.add_argument("a", type=Path, help="baseline OOF CSV")
     compare.add_argument("b", type=Path, help="candidate OOF CSV")
+    compare.add_argument("--scenario", default="clean", help="scenario name to compare (default: clean)")
     compare.add_argument("--json", dest="json_path", type=Path, default=None, help="optional JSON report path")
     return parser
 
@@ -149,16 +151,28 @@ def _run_stress(args: argparse.Namespace) -> int:
     _write_oof(out_dir / "oof_long.csv", run.oof)
     report = {name: _stress_entry(run.oof, name) for name in scenarios}
     _write_json(out_dir / "stress.json", report)
+    suite = suite_scores(run.oof, scenarios)
+    _write_json(
+        out_dir / "suite.json",
+        {group: {key: _number(value) if isinstance(value, float) else value for key, value in entry.items()}
+         for group, entry in suite.items()},
+    )
+    logger.info(
+        "[EVAL] suite all_score=%s seen_score=%s unseen_score=%s",
+        _format(suite["all"]["score"]),
+        _format(suite["seen"]["score"]),
+        _format(suite["unseen"]["score"]),
+    )
     logger.info("[EVAL] stress scenarios=%d elapsed_seconds=%.1f", len(scenarios), time.perf_counter() - started)
     logger.info("[SYS] stress artifacts written out_dir=%s", out_dir)
-    sys.stdout.write(f"out_dir={out_dir} files=oof_long.csv,stress.json\n")
+    sys.stdout.write(f"out_dir={out_dir} files=oof_long.csv,stress.json,suite.json\n")
     return 0
 
 
 def _run_compare(args: argparse.Namespace) -> int:
     """Compare two out-of-fold runs and report the paired score difference."""
-    left = load_oof(args.a)
-    right = load_oof(args.b)
+    left = load_oof(args.a, args.scenario)
+    right = load_oof(args.b, args.scenario)
     difference = paired_difference(left, right)
     payload: dict[str, Any] = {
         "delta": _number(difference.delta),

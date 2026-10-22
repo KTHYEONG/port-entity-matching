@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
-from port_entity_matching.augment import degraded_copies
+from port_entity_matching.augment import (
+    char_edits,
+    degraded_copies,
+    drop_token,
+    reverse_tokens,
+)
 from port_entity_matching.config import MatchConfig
 from port_entity_matching.records import QueryRecord
 
@@ -128,3 +134,143 @@ def test_dropped_syllable_is_a_single_hangul_character() -> None:
     result = drop_hangul_syllable(name, np.random.default_rng(0), 3)
     assert len(result) == len(name) - 1
     assert result != name
+
+
+def test_reverse_tokens_reverses_the_token_order() -> None:
+    assert reverse_tokens("GLOBAL STAR PIONEER") == "PIONEER STAR GLOBAL"
+
+
+def test_reverse_tokens_keeps_single_token_names_unchanged() -> None:
+    assert reverse_tokens("PIONEER") == "PIONEER"
+
+
+def test_reverse_tokens_keeps_the_characters_inside_a_token() -> None:
+    assert reverse_tokens("OCEAN  PIONEER") == "PIONEER OCEAN"
+
+
+def test_drop_token_keeps_the_remaining_tokens() -> None:
+    original = ["A", "B", "C"]
+    result = drop_token("A B C", np.random.default_rng(0)).split()
+    assert len(result) == 2
+    assert result == [token for token in original if token in result]
+    assert result in (["A", "B"], ["A", "C"], ["B", "C"])
+
+
+def test_drop_token_is_deterministic_for_the_same_seed() -> None:
+    first = drop_token("A B C", np.random.default_rng(11))
+    second = drop_token("A B C", np.random.default_rng(11))
+    assert first == second
+
+
+def test_drop_token_keeps_single_token_names_unchanged() -> None:
+    generator = np.random.default_rng(0)
+    assert drop_token("SOLO", generator) == "SOLO"
+    fresh = np.random.default_rng(0)
+    assert int(generator.integers(1000)) == int(fresh.integers(1000))
+
+
+def _damerau_distance(left: str, right: str) -> int:
+    """Return the optimal string alignment distance between two strings."""
+    rows, columns = len(left), len(right)
+    table = [[0] * (columns + 1) for _ in range(rows + 1)]
+    for row in range(rows + 1):
+        table[row][0] = row
+    for column in range(columns + 1):
+        table[0][column] = column
+    for row in range(1, rows + 1):
+        for column in range(1, columns + 1):
+            cost = 0 if left[row - 1] == right[column - 1] else 1
+            table[row][column] = min(
+                table[row - 1][column] + 1,
+                table[row][column - 1] + 1,
+                table[row - 1][column - 1] + cost,
+            )
+            if row > 1 and column > 1 and left[row - 1] == right[column - 2] and left[row - 2] == right[column - 1]:
+                table[row][column] = min(table[row][column], table[row - 2][column - 2] + 1)
+    return table[rows][columns]
+
+
+def test_char_edits_is_deterministic_and_bounded() -> None:
+    name = "OCEAN PIONEER"
+    first = char_edits(name, np.random.default_rng(7), 3)
+    second = char_edits(name, np.random.default_rng(7), 3)
+    assert first == second
+    assert 1 <= _damerau_distance(name, first) <= 3
+    assert first.count(" ") == name.count(" ")
+    assert len(first.split()) == len(name.split())
+
+
+def test_char_edits_rejects_a_negative_count() -> None:
+    with pytest.raises(ValueError, match="count"):
+        char_edits("OCEAN PIONEER", np.random.default_rng(0), -1)
+
+
+def test_char_edits_leaves_short_names_unchanged() -> None:
+    assert char_edits("AB 1", np.random.default_rng(0), 2) == "AB 1"
+
+
+@pytest.mark.parametrize(
+    ("seed", "expected"),
+    [(0, "ABdC"), (2, "ABCdd"), (3, "ABC"), (10, "ABCH")],
+)
+def test_char_edits_operation_contract(seed: int, expected: str) -> None:
+    assert char_edits("ABCd", np.random.default_rng(seed), 1) == expected
+
+
+def test_char_edits_stops_after_ascii_letters_drop_below_four() -> None:
+    rng = np.random.default_rng(3)
+    reference = np.random.default_rng(3)
+    assert char_edits("ABCd", rng, 10) == char_edits("ABCd", reference, 1) == "ABC"
+    assert rng.integers(1000) == reference.integers(1000)
+
+
+def test_char_edits_short_ascii_name_does_not_draw() -> None:
+    rng = np.random.default_rng(7)
+    assert char_edits("ABé한 1", rng, 3) == "ABé한 1"
+    assert rng.integers(1000) == np.random.default_rng(7).integers(1000)
+
+
+def test_drop_token_draws_exactly_one_index() -> None:
+    rng = np.random.default_rng(7)
+    reference = np.random.default_rng(7)
+    tokens = ["A-1", "B.2", "C_3"]
+    dropped = int(reference.integers(len(tokens)))
+    assert drop_token("  A-1\tB.2  C_3 ", rng) == " ".join(tokens[:dropped] + tokens[dropped + 1:])
+    assert rng.integers(1000) == reference.integers(1000)
+
+
+def test_char_edits_with_zero_count_draws_nothing() -> None:
+    generator = np.random.default_rng(0)
+    assert char_edits("OCEAN PIONEER", generator, 0) == "OCEAN PIONEER"
+    fresh = np.random.default_rng(0)
+    assert int(generator.integers(1000)) == int(fresh.integers(1000))
+
+
+def test_char_edits_keeps_the_token_structure_over_many_seeds() -> None:
+    name = "OCEAN PIONEER"
+    for seed in range(30):
+        result = char_edits(name, np.random.default_rng(seed), 3)
+        assert result.count(" ") == name.count(" ")
+        assert len(result.split()) == len(name.split())
+        assert 1 <= _damerau_distance(name, result) <= 3
+
+
+def test_degraded_copies_output_is_unchanged() -> None:
+    records = [
+        _record("S0", "한진부산", gross=1000.0, international=900.0),
+        _record("S1", "글로비스 스피릿"),
+        _record("S2", "CALIDA"),
+    ]
+    copies, sources = degraded_copies(records, _config())
+    assert sources == [0, 0, 0, 1, 1, 1]
+    assert [
+        (copy.sample_id, copy.vessel_name, copy.gross_tonnage, copy.international_gross_tonnage)
+        for copy in copies
+    ] == [
+        ("S0#aug0", "한진부산", 1080.0, 972.0000000000001),
+        ("S0#aug1", "한진부산", None, None),
+        ("S0#aug2", "한진부", 1000.0, 900.0),
+        ("S1#aug0", "글로비스 스피릿", 1080.0, None),
+        ("S1#aug1", "글로비스 스피릿", None, None),
+        ("S1#aug2", "글로비스 피릿", 1000.0, None),
+    ]

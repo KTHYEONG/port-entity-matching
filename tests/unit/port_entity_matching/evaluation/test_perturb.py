@@ -6,7 +6,7 @@ import dataclasses
 
 import pytest
 
-from port_entity_matching.evaluation.perturb import PERTURBATIONS, perturb_record
+from port_entity_matching.evaluation.perturb import PERTURBATIONS, UNSEEN_PERTURBATIONS, perturb_record
 from port_entity_matching.records import QueryRecord
 
 _MEDIALS = "ㅏㅐㅑㅒㅓㅔㅕㅖㅗㅘㅙㅚㅛㅜㅝㅞㅟㅠㅡㅢㅣ"
@@ -46,6 +46,15 @@ def test_scenario_list_is_fixed() -> None:
         "kor_flag_type_missing",
         "lat_extra_typo",
         "lat_tonnage_missing",
+        "kor_tokens_reversed",
+        "kor_token_dropped",
+        "kor_tokens_rotated",
+        "kor_tonnage_noise_10_20",
+        "lat_tokens_reversed",
+        "lat_token_dropped",
+        "lat_tokens_rotated",
+        "lat_heavy_typo",
+        "lat_tonnage_noise_10_20",
     )
 
 
@@ -193,3 +202,95 @@ def test_result_is_a_copy() -> None:
     assert perturbed is not None
     assert perturbed is not record
     assert dataclasses.replace(perturbed, gross_tonnage=record.gross_tonnage) == record
+
+
+def test_rotation_needs_three_tokens() -> None:
+    perturbed = perturb_record(_record("S0", "BLUE OCEAN STAR"), "lat_tokens_rotated")
+    assert perturbed is not None
+    assert perturbed.vessel_name == "OCEAN STAR BLUE"
+    assert perturb_record(_record("S0", "BLUE STAR"), "lat_tokens_rotated") is None
+
+
+def test_token_scenarios_respect_the_script() -> None:
+    assert perturb_record(_record("S0", "상하이 보이저"), "lat_tokens_reversed") is None
+    perturbed = perturb_record(_record("S0", "상하이 보이저"), "kor_tokens_reversed")
+    assert perturbed is not None
+    assert perturbed.vessel_name == "보이저 상하이"
+
+
+def test_single_token_names_are_skipped() -> None:
+    assert perturb_record(_record("S0", "신간"), "kor_token_dropped") is None
+    assert perturb_record(_record("S0", "신간"), "kor_tokens_reversed") is None
+
+
+def test_token_dropped_keeps_the_remaining_tokens() -> None:
+    perturbed = perturb_record(_record("S0", "상하이 보이저"), "kor_token_dropped")
+    assert perturbed is not None
+    assert perturbed.vessel_name.split() in (["상하이"], ["보이저"])
+
+
+def test_tonnage_noise_stays_inside_the_band() -> None:
+    ratios: list[float] = []
+    for index in range(50):
+        perturbed = perturb_record(_record(f"S{index}", "한진 부산", gross=1000.0), "kor_tonnage_noise_10_20")
+        assert perturbed is not None
+        assert perturbed.gross_tonnage is not None
+        ratios.append(perturbed.gross_tonnage / 1000.0)
+    assert all(0.80 <= ratio <= 0.90 or 1.10 <= ratio <= 1.20 for ratio in ratios)
+    assert any(ratio < 1.0 for ratio in ratios)
+    assert any(ratio > 1.0 for ratio in ratios)
+
+
+def test_tonnage_noise_needs_a_tonnage() -> None:
+    assert perturb_record(_record("S0", "한진부산", gross=None), "kor_tonnage_noise_10_20") is None
+
+
+def test_heavy_typo_is_deterministic_and_seed_dependent() -> None:
+    records = [_record(f"S{index}", "BLUE OCEAN STAR") for index in range(20)]
+    first = [perturb_record(record, "lat_heavy_typo", 0) for record in records]
+    second = [perturb_record(record, "lat_heavy_typo", 0) for record in records]
+    other = [perturb_record(record, "lat_heavy_typo", 1) for record in records]
+    assert first == second
+    assert first != other
+
+
+def test_existing_scenarios_are_unchanged() -> None:
+    golden = {
+        ("kor_tonnage_x1.08", "S0"): ("한진부산", 1080.0, 972.0000000000001),
+        ("kor_tonnage_x1.12", "S0"): ("한진부산", 1120.0, 1008.0000000000001),
+        ("kor_tonnage_x0.90", "S1"): ("글로비스 스피릿", 900.0, None),
+        ("kor_tonnage_missing", "S0"): ("한진부산", None, None),
+        ("kor_syllable_deleted", "S0"): ("한진부", 1000.0, 900.0),
+        ("kor_syllable_inserted", "S0"): ("한진진부산", 1000.0, 900.0),
+        ("kor_vowel_swapped", "S0"): ("한쥔부산", 1000.0, 900.0),
+        ("kor_spaces_removed", "S1"): ("글로비스스피릿", 1000.0, None),
+        ("kor_flag_type_missing", "S0"): ("한진부산", 1000.0, 900.0),
+        ("lat_extra_typo", "S2"): ("CALID", 1000.0, None),
+        ("lat_tonnage_missing", "S2"): ("CALIDA", None, None),
+    }
+    records = {
+        "S0": _record("S0", "한진부산", gross=1000.0, international=900.0),
+        "S1": _record("S1", "글로비스 스피릿"),
+        "S2": _record("S2", "CALIDA"),
+    }
+    for (scenario, sample_id), expected in golden.items():
+        perturbed = perturb_record(records[sample_id], scenario)
+        assert perturbed is not None, scenario
+        assert (
+            perturbed.vessel_name,
+            perturbed.gross_tonnage,
+            perturbed.international_gross_tonnage,
+        ) == expected, scenario
+
+
+def test_unseen_names_are_known_scenarios() -> None:
+    assert set(UNSEEN_PERTURBATIONS) <= set(PERTURBATIONS)
+    assert UNSEEN_PERTURBATIONS == (
+        "kor_tokens_rotated",
+        "lat_tokens_rotated",
+        "lat_heavy_typo",
+        "kor_vowel_swapped",
+        "kor_syllable_inserted",
+        "kor_spaces_removed",
+        "kor_flag_type_missing",
+    )
