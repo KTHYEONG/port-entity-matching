@@ -4,9 +4,11 @@ The copies mimic the distortions observed in the port-call records (inflated
 tonnage, missing tonnage, dropped Hangul syllable) so the ranker learns to
 cope with them. They are used for training only, never at inference time.
 
-The module also exposes the notation-distortion helpers (token reversal, token
-dropping and character edits). They are pure apart from the caller-supplied
-RNG and are shared by the training and evaluation paths.
+The module also produces the notation copies (token reversal, token dropping,
+character edits and tonnage noise) and exposes the notation-distortion helpers
+(token reversal, token dropping and character edits). The helpers are pure
+apart from the caller-supplied RNG and are shared by the training and
+evaluation paths.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ __all__ = [
     "degraded_copies",
     "drop_hangul_syllable",
     "drop_token",
+    "notation_copies",
     "reverse_tokens",
 ]
 
@@ -57,6 +60,94 @@ def degraded_copies(
         copies.append(_with_dropped_syllable(record, rng, config.augment_min_syllables))
         sources.extend([source_index, source_index, source_index])
     return copies, sources
+
+
+def notation_copies(
+    records: Sequence[QueryRecord],
+    config: MatchConfig,
+) -> tuple[list[QueryRecord], list[int]]:
+    """Return training-only notation/tonnage-noise copies and, per copy, the index of its source record."""
+    if not 0.0 <= config.augment_latin_rate <= 1.0:
+        raise ValueError("augment_latin_rate must be between 0 and 1")
+    if not 0.0 <= config.augment_tonnage_low <= config.augment_tonnage_high < 1.0:
+        raise ValueError("augment_tonnage_low and augment_tonnage_high must satisfy 0 <= low <= high < 1")
+    rng = np.random.default_rng(config.augment_seed + 1)
+    copies: list[QueryRecord] = []
+    sources: list[int] = []
+    for source_index, record in enumerate(records):
+        if is_hangul_name(record.vessel_name):
+            record_copies = _hangul_notation_copies(record, rng, config)
+        else:
+            latin_copy = _latin_notation_copy(record, rng, config)
+            record_copies = [] if latin_copy is None else [latin_copy]
+        copies.extend(record_copies)
+        sources.extend([source_index] * len(record_copies))
+    return copies, sources
+
+
+def _hangul_notation_copies(
+    record: QueryRecord,
+    rng: np.random.Generator,
+    config: MatchConfig,
+) -> list[QueryRecord]:
+    """Return the reversed, dropped-token and tonnage-noise copies of one Hangul record."""
+    copies: list[QueryRecord] = []
+    name = record.vessel_name
+    if len(name.split()) >= 2:
+        copies.append(
+            dataclasses.replace(
+                record,
+                sample_id=f"{record.sample_id}#aug3",
+                vessel_name=reverse_tokens(name),
+            )
+        )
+        copies.append(
+            dataclasses.replace(
+                record,
+                sample_id=f"{record.sample_id}#aug4",
+                vessel_name=drop_token(name, rng),
+            )
+        )
+    if record.gross_tonnage is not None or record.international_gross_tonnage is not None:
+        sign = -1.0 if rng.random() < 0.5 else 1.0
+        magnitude = float(rng.uniform(config.augment_tonnage_low, config.augment_tonnage_high))
+        factor = 1.0 + sign * magnitude
+        gross = None if record.gross_tonnage is None else record.gross_tonnage * factor
+        international = (
+            None
+            if record.international_gross_tonnage is None
+            else record.international_gross_tonnage * factor
+        )
+        copies.append(
+            dataclasses.replace(
+                record,
+                sample_id=f"{record.sample_id}#aug5",
+                gross_tonnage=gross,
+                international_gross_tonnage=international,
+            )
+        )
+    return copies
+
+
+def _latin_notation_copy(
+    record: QueryRecord,
+    rng: np.random.Generator,
+    config: MatchConfig,
+) -> QueryRecord | None:
+    """Return the notation copy of one non-Hangul record, or None when it is not drawn or unchanged."""
+    if rng.random() >= config.augment_latin_rate:
+        return None
+    name = record.vessel_name
+    family = int(rng.integers(3))
+    if family == 0 and len(name.split()) >= 2:
+        new_name = reverse_tokens(name)
+    elif family == 1 and len(name.split()) >= 2:
+        new_name = drop_token(name, rng)
+    else:
+        new_name = char_edits(name, rng, 1 + int(rng.integers(2)))
+    if new_name == name:
+        return None
+    return dataclasses.replace(record, sample_id=f"{record.sample_id}#aug6", vessel_name=new_name)
 
 
 def _with_inflated_tonnage(record: QueryRecord, factor: float) -> QueryRecord:

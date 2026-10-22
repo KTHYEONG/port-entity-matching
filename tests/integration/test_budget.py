@@ -11,6 +11,7 @@ import pandas as pd
 import pytest
 
 from port_entity_matching.config import MatchConfig
+from port_entity_matching.evaluation.stats import bucket_scores
 from port_entity_matching.pipeline import run_submission
 from port_entity_matching.records import CATALOG_COLUMNS, RECORD_COLUMNS, read_csv_checked
 from port_entity_matching.train import cross_validate, cross_validate_run
@@ -79,12 +80,14 @@ def test_full_data_cv_reproduces_the_recorded_run() -> None:
         pytest.skip(f"recorded OOF run not available at {recorded_path}")
     train = read_csv_checked(TRAIN_PATH, (*RECORD_COLUMNS, "target_vessel_id"))
     catalog = read_csv_checked(CATALOG_PATH, CATALOG_COLUMNS)
-    run = cross_validate_run(train, catalog, MatchConfig())
+    # Replay the recorded pre-notation run without replacing the production artifacts.
+    run = cross_validate_run(train, catalog, MatchConfig(augment_notation=False))
     clean = run.oof[run.oof["scenario"] == "clean"].set_index("sample_id")
     recorded = pd.read_csv(recorded_path).set_index("sample_id")
     assert set(clean.index) == set(recorded.index)
     assert (clean["pred_vessel_id"] == recorded.loc[clean.index, "pred_vessel_id"]).all()
-    assert run.report.weighted_score == pytest.approx(0.9875, abs=1e-4)
+    recorded_score = bucket_scores(recorded.reset_index())["score"]
+    assert run.report.weighted_score == pytest.approx(recorded_score, abs=1e-4)
 
 
 def _logged_peak_rss(caplog: pytest.LogCaptureFixture) -> list[str]:

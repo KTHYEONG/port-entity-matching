@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from rapidfuzz.distance import DamerauLevenshtein
 
 from port_entity_matching.augment import (
     char_edits,
     degraded_copies,
     drop_token,
+    notation_copies,
     reverse_tokens,
 )
 from port_entity_matching.config import MatchConfig
@@ -32,6 +34,11 @@ def _config(**overrides: float | int | bool) -> MatchConfig:
     defaults: dict[str, float | int | bool] = {"augment_tonnage_factor": 1.08, "augment_min_syllables": 3}
     defaults.update(overrides)
     return MatchConfig(**defaults)  # type: ignore[arg-type]
+
+
+def _latin_records(count: int) -> list[QueryRecord]:
+    """Latin records whose names keep every notation family distinguishable."""
+    return [_record(f"L{index:03d}", f"ALFA BETA {index:03d}") for index in range(count)]
 
 
 def test_three_copies_per_hangul_record_and_none_for_latin() -> None:
@@ -70,7 +77,7 @@ def test_deterministic_and_pure() -> None:
     records = [_record("S0", "한진부산"), _record("S1", "CALIDA")]
     first, first_sources = degraded_copies(records, _config())
     second, second_sources = degraded_copies(records, _config())
-    assert [copy.vessel_name for copy in first] == [copy.vessel_name for copy in second]
+    assert first == second
     assert first_sources == second_sources
     assert records[0].vessel_name == "한진부산"
     assert records[0].gross_tonnage == 1000.0
@@ -274,3 +281,147 @@ def test_degraded_copies_output_is_unchanged() -> None:
         ("S1#aug1", "글로비스 스피릿", None, None),
         ("S1#aug2", "글로비스 피릿", 1000.0, None),
     ]
+
+
+def test_hangul_notation_copies_cover_tokens_and_tonnage() -> None:
+    copies, sources = notation_copies([_record("S0", "상하이 보이저", gross=1000.0)], _config())
+    assert sources == [0, 0, 0]
+    assert [copy.sample_id for copy in copies] == ["S0#aug3", "S0#aug4", "S0#aug5"]
+    assert copies[0].vessel_name == "보이저 상하이"
+    assert len(copies[1].vessel_name.split()) == 1
+    ratio = copies[2].gross_tonnage / 1000.0
+    assert 0.75 <= ratio <= 0.95 or 1.05 <= ratio <= 1.25
+
+
+def test_single_token_hangul_gets_only_the_tonnage_copy() -> None:
+    copies, sources = notation_copies([_record("S0", "신간", gross=1000.0)], _config())
+    assert sources == [0]
+    assert [copy.sample_id for copy in copies] == ["S0#aug5"]
+    assert copies[0].vessel_name == "신간"
+
+
+def test_hangul_without_tonnage_has_no_tonnage_copy() -> None:
+    copies, _ = notation_copies([_record("S0", "상하이 보이저", gross=None)], _config())
+    assert [copy.sample_id for copy in copies] == ["S0#aug3", "S0#aug4"]
+
+
+def test_latin_rate_zero_gives_no_latin_copies() -> None:
+    copies, sources = notation_copies(_latin_records(10), _config(augment_latin_rate=0.0))
+    assert copies == []
+    assert sources == []
+
+
+def test_latin_rate_one_gives_one_copy_per_latin_record() -> None:
+    records = _latin_records(100)
+    copies, sources = notation_copies(records, _config(augment_latin_rate=1.0))
+    assert len(copies) == 100
+    assert sources == list(range(100))
+    assert all(copy.sample_id.endswith("#aug6") for copy in copies)
+    assert all(copy.vessel_name != record.vessel_name for copy, record in zip(copies, records, strict=True))
+
+
+def test_notation_copies_are_deterministic() -> None:
+    records = [*_latin_records(20), _record("S0", "상하이 보이저", gross=1000.0)]
+    first, first_sources = notation_copies(records, _config())
+    second, second_sources = notation_copies(records, _config())
+    assert first == second
+    assert first_sources == second_sources
+
+
+def test_notation_copies_change_with_the_seed() -> None:
+    records = [*_latin_records(20), _record("S0", "상하이 보이저", gross=1000.0)]
+    first, _ = notation_copies(records, _config(augment_seed=0))
+    second, _ = notation_copies(records, _config(augment_seed=1))
+    assert [copy.vessel_name for copy in first] != [copy.vessel_name for copy in second]
+
+
+def test_notation_copies_keep_the_other_fields() -> None:
+    copies, _ = notation_copies(
+        [_record("S0", "상하이 보이저", gross=1000.0, international=900.0)], _config()
+    )
+    for copy in copies:
+        assert copy.call_sign == "CS_A"
+        assert copy.flag_name == "파나마"
+        assert copy.vessel_type == "Tanker"
+        assert copy.arrival_year == 2020
+    assert copies[2].international_gross_tonnage == pytest.approx(
+        900.0 * (copies[2].gross_tonnage / 1000.0), rel=1e-9
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"augment_latin_rate": 1.5},
+        {"augment_latin_rate": -0.1},
+        {"augment_tonnage_low": 0.3, "augment_tonnage_high": 0.2},
+        {"augment_tonnage_low": -0.1},
+        {"augment_tonnage_high": 1.0},
+        {"augment_latin_rate": float("nan")},
+        {"augment_latin_rate": float("inf")},
+        {"augment_tonnage_low": float("nan")},
+        {"augment_tonnage_high": float("nan")},
+        {"augment_tonnage_high": float("inf")},
+    ],
+)
+def test_invalid_notation_parameters_rejected(overrides: dict[str, float]) -> None:
+    with pytest.raises(ValueError, match="augment_"):
+        notation_copies([_record("S0", "상하이 보이저")], _config(**overrides))
+
+
+def test_notation_copies_stay_outside_the_unseen_families() -> None:
+    records = [_record(f"L{index:03d}", f"ZETA OMEGA SIGMA {index:03d}") for index in range(600)]
+    copies, sources = notation_copies(records, _config(augment_latin_rate=1.0))
+    assert len(copies) >= 500
+    for copy, source_index in zip(copies, sources, strict=True):
+        source = records[source_index].vessel_name
+        tokens = source.split()
+        rotation = " ".join([*tokens[1:], tokens[0]])
+        assert copy.vessel_name != rotation
+        if len(copy.vessel_name.split()) == len(tokens) - 1:
+            continue
+        if copy.vessel_name == reverse_tokens(source):
+            continue
+        assert DamerauLevenshtein.distance(source, copy.vessel_name) <= 2
+
+
+def test_notation_rng_order_and_missing_tonnage() -> None:
+    records = [
+        _record("empty", "신간", gross=None),
+        _record("kor", "상하이 보이저", gross=None, international=900.0),
+        _record("lat", "OCEAN PIONEER"),
+    ]
+    config = _config(augment_latin_rate=1.0)
+    rng = np.random.default_rng(config.augment_seed + 1)
+    dropped = drop_token(records[1].vessel_name, rng)
+    sign = -1.0 if rng.random() < 0.5 else 1.0
+    factor = 1.0 + sign * rng.uniform(config.augment_tonnage_low, config.augment_tonnage_high)
+    assert rng.random() < config.augment_latin_rate
+    family = int(rng.integers(3))
+    name = records[2].vessel_name
+    if family == 0:
+        expected = reverse_tokens(name)
+    elif family == 1:
+        expected = drop_token(name, rng)
+    else:
+        expected = char_edits(name, rng, 1 + int(rng.integers(2)))
+    copies, sources = notation_copies(records, config)
+    assert sources == [1, 1, 1, 2]
+    assert copies[1].vessel_name == dropped
+    assert copies[2].gross_tonnage is None
+    assert copies[2].international_gross_tonnage == 900.0 * factor
+    assert copies[3].vessel_name == expected
+
+
+@pytest.mark.parametrize("seed", range(10))
+def test_single_token_latin_fallback_and_unchanged_skip(seed: int) -> None:
+    record = _record("lat", "PIONEER")
+    config = _config(augment_latin_rate=1.0, augment_seed=seed)
+    rng = np.random.default_rng(seed + 1)
+    rng.random()
+    rng.integers(3)
+    expected = char_edits(record.vessel_name, rng, 1 + int(rng.integers(2)))
+    copies, sources = notation_copies([record], config)
+    assert sources == ([] if expected == record.vessel_name else [0])
+    assert [copy.vessel_name for copy in copies] == ([] if expected == record.vessel_name else [expected])
+    assert notation_copies([_record("short", "AB")], config) == ([], [])

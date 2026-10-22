@@ -16,7 +16,7 @@ from numpy.typing import NDArray
 from sklearn.model_selection import GroupKFold
 
 from port_entity_matching.artifacts import ArtifactBundle
-from port_entity_matching.augment import degraded_copies
+from port_entity_matching.augment import degraded_copies, notation_copies
 from port_entity_matching.candidates import generate_candidates
 from port_entity_matching.catalog import CatalogIndex
 from port_entity_matching.config import MatchConfig
@@ -130,8 +130,13 @@ def build_training_data(
     if config.augment:
         copies, sources = degraded_copies(records, config)
         copy_targets = [targets[index] for index in sources]
-        records = [*records, *copies]
-        targets = [*targets, *copy_targets]
+        notation: list[QueryRecord] = []
+        notation_sources: list[int] = []
+        if config.augment_notation:
+            notation, notation_sources = notation_copies(records, config)
+        notation_targets = [targets[index] for index in notation_sources]
+        records = [*records, *copies, *notation]
+        targets = [*targets, *copy_targets, *notation_targets]
     candidate_sets = generate_candidates(records, index, None, config)
     features = build_features(records, candidate_sets, index, maps, config)
 

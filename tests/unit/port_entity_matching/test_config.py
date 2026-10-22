@@ -63,3 +63,25 @@ def test_augmentation_and_ensemble_fields_round_trip() -> None:
 def test_json_boolean_stays_a_boolean() -> None:
     assert config_from_dict({"augment": False}).augment is False
     assert config_from_dict({"augment": True}).augment is True
+
+
+def test_notation_augmentation_defaults_and_round_trip() -> None:
+    config = MatchConfig()
+    assert config.augment_notation is True
+    assert config.augment_latin_rate == 0.3
+    assert config.augment_tonnage_low == 0.05
+    assert config.augment_tonnage_high == 0.25
+    assert config_from_dict(config_to_dict(config)) == config
+
+
+def test_old_manifest_without_notation_fields_uses_defaults() -> None:
+    payload = {
+        key: value
+        for key, value in config_to_dict(MatchConfig()).items()
+        if key not in ("augment_notation", "augment_latin_rate", "augment_tonnage_low", "augment_tonnage_high")
+    }
+    config = config_from_dict(payload)
+    assert config.augment_notation is True
+    assert config.augment_latin_rate == 0.3
+    assert config.augment_tonnage_low == 0.05
+    assert config.augment_tonnage_high == 0.25

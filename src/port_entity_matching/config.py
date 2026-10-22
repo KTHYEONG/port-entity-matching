@@ -41,6 +41,10 @@ class MatchConfig:
     augment_tonnage_factor: float = 1.08
     augment_min_syllables: int = 3
     augment_seed: int = 0
+    augment_notation: bool = True
+    augment_latin_rate: float = 0.3
+    augment_tonnage_low: float = 0.05
+    augment_tonnage_high: float = 0.25
     ensemble_size: int = 5
 
 

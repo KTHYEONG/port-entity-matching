@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import subprocess
 import sys
 from pathlib import Path
@@ -11,11 +12,14 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from port_entity_matching.augment import degraded_copies, notation_copies
+from port_entity_matching.candidates import generate_candidates
 from port_entity_matching.catalog import CatalogIndex
 from port_entity_matching.config import MatchConfig
 from port_entity_matching.features import FEATURE_NAMES
 from port_entity_matching.maps import AttributeMaps
 from port_entity_matching.ranker import score_ensemble
+from port_entity_matching.records import records_from_frame
 from port_entity_matching.train import (
     DIAGNOSTIC_COLUMNS,
     build_training_data,
@@ -302,10 +306,91 @@ def test_augmentation_adds_copies_only_to_training() -> None:
     train = _mixed_frame()
     maps = AttributeMaps.fit(train, index)
     plain = build_training_data(train, index, maps, MatchConfig(augment=False, num_threads=1))
-    augmented = build_training_data(train, index, maps, MatchConfig(augment=True, num_threads=1))
+    augmented = build_training_data(
+        train, index, maps, MatchConfig(augment=True, augment_notation=False, num_threads=1)
+    )
     assert len(augmented.group_sizes) == len(plain.group_sizes) + 6
     assert augmented.recall_hangul == plain.recall_hangul
     assert augmented.recall_latin == plain.recall_latin
+
+
+def test_notation_augmentation_adds_more_groups() -> None:
+    index = CatalogIndex.build(_catalog_frame())
+    train = _mixed_frame()
+    maps = AttributeMaps.fit(train, index)
+    without = build_training_data(
+        train, index, maps, MatchConfig(augment=True, augment_notation=False, num_threads=1)
+    )
+    with_notation = build_training_data(
+        train, index, maps, MatchConfig(augment=True, augment_notation=True, num_threads=1)
+    )
+    assert len(with_notation.group_sizes) > len(without.group_sizes)
+    assert with_notation.recall_hangul == without.recall_hangul
+    assert with_notation.recall_latin == without.recall_latin
+
+
+def test_notation_ablation_is_exact() -> None:
+    index = CatalogIndex.build(_catalog_frame())
+    train = _train_frame()
+    maps = AttributeMaps.fit(train, index)
+    data = build_training_data(
+        train, index, maps, MatchConfig(augment=True, augment_notation=False, num_threads=1)
+    )
+    assert len(data.group_sizes) == 27
+    assert set(data.group_sizes) == {12}
+    assert hashlib.sha256(data.labels.tobytes()).hexdigest() == (
+        "f07a77955422d4a4c6bd8ef8b58216365c5071e1c44c276e35212039c0208c6b"
+    )
+    assert hashlib.sha256(data.features.tobytes()).hexdigest() == (
+        "ddd0d115d291d10791b7f08c7a66954b40a2a93e16c1e744ea079f136d1ab2b5"
+    )
+
+
+def test_notation_copies_keep_their_source_targets() -> None:
+    index = CatalogIndex.build(_catalog_frame())
+    train = _mixed_frame()
+    config = MatchConfig(augment=True, augment_notation=True, augment_latin_rate=1.0, num_threads=1)
+    maps = AttributeMaps.fit(train, index)
+    data = build_training_data(train, index, maps, config)
+
+    records = records_from_frame(train)
+    targets = [str(value) for value in train["target_vessel_id"].tolist()]
+    degraded, degraded_sources = degraded_copies(records, config)
+    notation, notation_sources = notation_copies(records, config)
+    all_records = [*records, *degraded, *notation]
+    all_targets = [
+        *targets,
+        *[targets[index] for index in degraded_sources],
+        *[targets[index] for index in notation_sources],
+    ]
+    candidate_sets = generate_candidates(all_records, index, None, config)
+
+    kept: list[int] = []
+    for position, target in enumerate(all_targets):
+        catalog_position = index.id_to_pos.get(target)
+        if catalog_position is None:
+            continue
+        if not bool((candidate_sets[position].positions == catalog_position).any()):
+            continue
+        kept.append(position)
+    assert len(kept) == len(data.group_sizes)
+
+    offsets = np.cumsum([0, *data.group_sizes])
+    group_of = {position: group for group, position in enumerate(kept)}
+    notation_positions = range(len(records) + len(degraded), len(all_records))
+    checked = 0
+    for position in notation_positions:
+        if position not in group_of:
+            continue
+        group = group_of[position]
+        start = int(offsets[group])
+        end = int(offsets[group + 1])
+        catalog_position = index.id_to_pos[all_targets[position]]
+        local = int(np.flatnonzero(candidate_sets[position].positions == catalog_position)[0])
+        assert int(data.labels[start + local]) == 1
+        assert int(np.count_nonzero(data.labels[start:end] == 1)) == 1
+        checked += 1
+    assert checked > 0
 
 
 def test_maps_are_unaffected_by_augmentation(tmp_path) -> None:
