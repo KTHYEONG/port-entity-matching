@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 from rapidfuzz import process
-from rapidfuzz.distance import DamerauLevenshtein, Levenshtein
+from rapidfuzz.distance import OSA, DamerauLevenshtein, Levenshtein
 
 from port_entity_matching.catalog import CatalogIndex
 from port_entity_matching.config import MatchConfig
@@ -82,6 +82,8 @@ def generate_candidates(
         raise ValueError("query_chunk and max_candidates must be positive")
     if min(config.name_top_k, config.hangul_key_top_k, config.hangul_window_keep, config.latin_exact_gt_cap) < 0:
         raise ValueError("Retrieval limits must be non-negative")
+    if config.latin_prefilter_k < 0:
+        raise ValueError("latin_prefilter_k must be non-negative")
     if config.hangul_tonnage_window < 0:
         raise ValueError("hangul_tonnage_window must be non-negative")
     if config.token_top_k < 0 or config.token_df_cap < 1:
@@ -188,6 +190,63 @@ def _top_k_desc(scores: NDArray[np.floating[Any]], k: int) -> NDArray[np.int64]:
     return selected
 
 
+def _dl_top_k_for_keys(
+    unique: list[str],
+    choices: Sequence[str],
+    config: MatchConfig,
+) -> dict[str, tuple[Positions, Scores]]:
+    """Top name_top_k DL hits per key, optionally via an OSA prefilter.
+
+    When latin_prefilter_k == 0 the full DL cdist is used (ablation switch).
+    Otherwise per key the top max(prefilter, name_top_k) OSA hits are rescored
+    with DL and the top name_top_k rescored hits are returned ordered by
+    (-DL score, catalog position). Returned scores are DL similarities.
+    """
+    if config.latin_prefilter_k == 0:
+        matrix = process.cdist(
+            unique,
+            choices,
+            scorer=DamerauLevenshtein.normalized_similarity,
+            workers=config.num_threads,
+            dtype=np.float32,
+        )
+        ranked: dict[str, tuple[Positions, Scores]] = {}
+        for row_number, key in enumerate(unique):
+            row = matrix[row_number]
+            order = _top_k_desc(row, config.name_top_k)
+            ranked[key] = (order.astype(np.int64), row[order].astype(np.float64))
+        return ranked
+    osa_matrix = process.cdist(
+        unique,
+        choices,
+        scorer=OSA.normalized_similarity,
+        workers=config.num_threads,
+        dtype=np.float32,
+    )
+    choice_list = list(choices)
+    pre_k = max(config.latin_prefilter_k, config.name_top_k)
+    ranked = {}
+    for row_number, key in enumerate(unique):
+        osa_row = osa_matrix[row_number]
+        preselected = _top_k_desc(osa_row, pre_k)
+        subset = [choice_list[int(position)] for position in preselected.tolist()]
+        dl_row = process.cdist(
+            [key],
+            subset,
+            scorer=DamerauLevenshtein.normalized_similarity,
+            workers=1,
+            dtype=np.float32,
+        )[0]
+        catalog_positions = preselected.astype(np.int64)
+        rank_order = np.lexsort((catalog_positions, -dl_row.astype(np.float64)))
+        if config.name_top_k < len(rank_order):
+            rank_order = rank_order[: config.name_top_k]
+        final_positions = catalog_positions[rank_order].astype(np.int64)
+        final_scores = dl_row[rank_order].astype(np.float64)
+        ranked[key] = (final_positions, final_scores)
+    return ranked
+
+
 def _latin_name_scores(
     prepared: Sequence[_Prepared],
     index: CatalogIndex,
@@ -197,20 +256,8 @@ def _latin_name_scores(
     if not keys:
         return {}
     unique = sorted(set(keys.values()))
-    matrix = process.cdist(
-        unique,
-        index.canonical,
-        scorer=DamerauLevenshtein.normalized_similarity,
-        workers=config.num_threads,
-        dtype=np.float32,
-    )
-    row_of = {key: row for row, key in enumerate(unique)}
-    scores: dict[int, tuple[Positions, Scores]] = {}
-    for position, key in keys.items():
-        row = matrix[row_of[key]]
-        order = _top_k_desc(row, config.name_top_k)
-        scores[position] = (order.astype(np.int64), row[order].astype(np.float64))
-    return scores
+    ranked = _dl_top_k_for_keys(unique, index.canonical, config)
+    return {position: ranked[key] for position, key in keys.items()}
 
 
 def _hangul_name_scores(
@@ -266,20 +313,8 @@ def _latin_sorted_scores(
     if not keys:
         return {}
     unique = sorted(set(keys.values()))
-    matrix = process.cdist(
-        unique,
-        index.sorted_canonical,
-        scorer=DamerauLevenshtein.normalized_similarity,
-        workers=config.num_threads,
-        dtype=np.float32,
-    )
-    row_of = {key: row for row, key in enumerate(unique)}
-    scores: dict[int, tuple[Positions, Scores]] = {}
-    for position, key in keys.items():
-        row = matrix[row_of[key]]
-        order = _top_k_desc(row, config.name_top_k)
-        scores[position] = (order.astype(np.int64), row[order].astype(np.float64))
-    return scores
+    ranked = _dl_top_k_for_keys(unique, index.sorted_canonical, config)
+    return {position: ranked[key] for position, key in keys.items()}
 
 
 def _hangul_sorted_scores(

@@ -14,6 +14,7 @@ evaluation paths.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import math
 import string
 from collections.abc import Sequence
@@ -30,6 +31,7 @@ __all__ = [
     "drop_hangul_syllable",
     "drop_token",
     "notation_copies",
+    "record_rng",
     "reverse_tokens",
 ]
 
@@ -38,6 +40,13 @@ _SYLLABLE_LAST = 0xD7A3
 
 _ASCII_UPPERCASE: str = string.ascii_uppercase
 _MIN_EDIT_LETTERS = 4
+
+
+def record_rng(record: QueryRecord, salt: int) -> np.random.Generator:
+    """Generator seeded from SHA-256 of (salt, sample_id, vessel_name); identical for equal inputs in any process."""
+    digest = hashlib.sha256(f"{salt}\x1f{record.sample_id}\x1f{record.vessel_name}".encode()).digest()
+    seed = int.from_bytes(digest[:8], "little")
+    return np.random.default_rng(seed)
 
 
 def degraded_copies(
@@ -49,7 +58,6 @@ def degraded_copies(
         raise ValueError("augment_tonnage_factor must be positive")
     if config.augment_min_syllables < 1:
         raise ValueError("augment_min_syllables must be at least 1")
-    rng = np.random.default_rng(config.augment_seed)
     copies: list[QueryRecord] = []
     sources: list[int] = []
     for source_index, record in enumerate(records):
@@ -57,7 +65,9 @@ def degraded_copies(
             continue
         copies.append(_with_inflated_tonnage(record, config.augment_tonnage_factor))
         copies.append(_without_tonnage(record))
-        copies.append(_with_dropped_syllable(record, rng, config.augment_min_syllables))
+        copies.append(
+            _with_dropped_syllable(record, record_rng(record, config.augment_seed), config.augment_min_syllables)
+        )
         sources.extend([source_index, source_index, source_index])
     return copies, sources
 
@@ -71,10 +81,10 @@ def notation_copies(
         raise ValueError("augment_latin_rate must be between 0 and 1")
     if not 0.0 <= config.augment_tonnage_low <= config.augment_tonnage_high < 1.0:
         raise ValueError("augment_tonnage_low and augment_tonnage_high must satisfy 0 <= low <= high < 1")
-    rng = np.random.default_rng(config.augment_seed + 1)
     copies: list[QueryRecord] = []
     sources: list[int] = []
     for source_index, record in enumerate(records):
+        rng = record_rng(record, config.augment_seed + 1)
         if is_hangul_name(record.vessel_name):
             record_copies = _hangul_notation_copies(record, rng, config)
         else:
@@ -114,9 +124,7 @@ def _hangul_notation_copies(
         factor = 1.0 + sign * magnitude
         gross = None if record.gross_tonnage is None else record.gross_tonnage * factor
         international = (
-            None
-            if record.international_gross_tonnage is None
-            else record.international_gross_tonnage * factor
+            None if record.international_gross_tonnage is None else record.international_gross_tonnage * factor
         )
         copies.append(
             dataclasses.replace(
@@ -152,9 +160,7 @@ def _latin_notation_copy(
 
 def _with_inflated_tonnage(record: QueryRecord, factor: float) -> QueryRecord:
     gross = None if record.gross_tonnage is None else record.gross_tonnage * factor
-    international = (
-        None if record.international_gross_tonnage is None else record.international_gross_tonnage * factor
-    )
+    international = None if record.international_gross_tonnage is None else record.international_gross_tonnage * factor
     return dataclasses.replace(
         record,
         sample_id=f"{record.sample_id}#aug0",
@@ -174,11 +180,7 @@ def _without_tonnage(record: QueryRecord) -> QueryRecord:
 
 def drop_hangul_syllable(name: str, rng: np.random.Generator, min_syllables: int) -> str:
     """Remove one randomly chosen Hangul syllable when the name has at least min_syllables; else return name unchanged."""
-    positions = [
-        position
-        for position, char in enumerate(name)
-        if _SYLLABLE_FIRST <= ord(char) <= _SYLLABLE_LAST
-    ]
+    positions = [position for position, char in enumerate(name) if _SYLLABLE_FIRST <= ord(char) <= _SYLLABLE_LAST]
     if positions and len(positions) >= min_syllables:
         target = positions[int(rng.integers(len(positions)))]
         return name[:target] + name[target + 1 :]

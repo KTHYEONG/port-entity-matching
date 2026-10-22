@@ -338,7 +338,7 @@ def test_notation_ablation_is_exact() -> None:
         "f07a77955422d4a4c6bd8ef8b58216365c5071e1c44c276e35212039c0208c6b"
     )
     assert hashlib.sha256(data.features.tobytes()).hexdigest() == (
-        "525c07cda3eddb645e442d1498b0ae9b21d6999fa3717341ebcef5d079fcb053"
+        "7e6f3f72b6ee3c5b73f19cf14536c46ae2687d9698e4653464fb9e1ce27e22c7"
     )
 
 

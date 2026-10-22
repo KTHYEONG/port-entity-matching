@@ -829,3 +829,98 @@ def test_candidate_sets_match_scalar_reference_path() -> None:
     for result, (positions, sources) in zip(actual, expected, strict=True):
         assert result.positions.tolist() == positions
         assert result.sources.tolist() == sources
+
+
+def test_prefilter_zero_matches_full_dl() -> None:
+    index = CatalogIndex.build(
+        _catalog_frame(
+            [
+                ("V0", "Stena Promise", 15000.0),
+                ("V1", "Stena Premium", 16000.0),
+                ("V2", "Hanjin Seattle", 17000.0),
+                ("V3", "Glovis Spirit", 64650.0),
+                ("V4", "BW Wren", 29768.0),
+            ]
+        )
+    )
+    records = [
+        _record("s1", "STENA PROMIISE"),
+        _record("s2", "PIONEER OCEAN GOLDEN"),
+        _record("s3", "HAFNIA WREN", gross_tonnage=29765.0),
+    ]
+    default = generate_candidates(records, index, None, MatchConfig())
+    exact = generate_candidates(records, index, None, MatchConfig(latin_prefilter_k=0))
+    for first, second in zip(default, exact, strict=True):
+        assert first.positions.tolist() == second.positions.tolist()
+        assert first.sources.tolist() == second.sources.tolist()
+    wide = generate_candidates(records, index, None, MatchConfig(latin_prefilter_k=1000))
+    for first, second in zip(wide, exact, strict=True):
+        assert first.positions.tolist() == second.positions.tolist()
+        assert first.sources.tolist() == second.sources.tolist()
+
+
+def test_prefilter_keeps_clear_winners() -> None:
+    from rapidfuzz.distance import DamerauLevenshtein
+
+    from port_entity_matching.normalize import canonical_latin
+
+    target = "GOLDEN OCEAN PIONEER"
+    entries = [("T", target, 1000.0)]
+    entries += [(f"D{i}", f"DISTRACTOR VESSEL {i:03d}", 2000.0 + i) for i in range(499)]
+    index = CatalogIndex.build(_catalog_frame(entries))
+    queries = [
+        "GOLDEN OCEAN PIONEER",  # exact
+        "GOLDEN OCEAN PIONER",  # 1 deletion
+        "GOLDEN OCEAN PIONERE",  # transposition
+        "GOLDEN OCEAN PIONEERR",  # 1 insertion
+        "GOLDNE OCEAN PIONEER",  # transposition
+    ]
+    records = [_record(f"q{i}", name) for i, name in enumerate(queries)]
+    results = generate_candidates(records, index, None, MatchConfig())
+    for record, result in zip(records, results, strict=True):
+        assert 0 in result.positions.tolist()
+        assert _sources_of(result, 0) & SRC_NAME
+        expected = DamerauLevenshtein.normalized_similarity(canonical_latin(record.vessel_name), index.canonical[0])
+        # Target is ranked first by the name source and its score equals the DL similarity.
+        from port_entity_matching.candidates import _latin_name_scores, _prepare
+
+        prepared = [_prepare(record)]
+        name_positions, name_scores = _latin_name_scores(prepared, index, MatchConfig())[0]
+        assert name_positions.tolist()[0] == 0
+        assert name_scores.tolist()[0] == pytest.approx(expected)
+
+
+def test_negative_prefilter_rejected() -> None:
+    index = CatalogIndex.build(_catalog_frame([("V0", "Alpha", 1000.0)]))
+    with pytest.raises(ValueError, match="latin_prefilter_k"):
+        generate_candidates([_record("s", "Alpha")], index, None, MatchConfig(latin_prefilter_k=-1))
+
+
+@pytest.mark.parametrize("prefilter_k", [0, 1, 200, 1000])
+@pytest.mark.parametrize("top_k", [0, 3, 30])
+def test_latin_sources_match_scalar_ranking_reference(prefilter_k: int, top_k: int) -> None:
+    from rapidfuzz.distance import OSA, DamerauLevenshtein
+
+    from port_entity_matching.candidates import _latin_name_scores, _latin_sorted_scores, _prepare
+
+    rng = np.random.default_rng(9)
+    names = ["CA", "ABC", "GOLDEN OCEAN", "OCEAN GOLDEN", "CA"]
+    names += ["".join(rng.choice(list("ABCDE"), size=6).tolist()) for _ in range(495)]
+    index = CatalogIndex.build(_catalog_frame([(f"V{i}", name, 1000.0 + i) for i, name in enumerate(names)]))
+    prepared = [_prepare(_record(f"q{i}", name)) for i, name in enumerate(["CA", "ACB", "OCEAN GOLDEN", "CA"])]
+    config = MatchConfig(latin_prefilter_k=prefilter_k, name_top_k=top_k)
+    for retrieve, choices, keys in (
+        (_latin_name_scores, index.canonical, [item.latin_key for item in prepared]),
+        (_latin_sorted_scores, index.sorted_canonical, [item.sorted_latin for item in prepared]),
+    ):
+        actual = retrieve(prepared, index, config)
+        for query_position, key in enumerate(keys):
+            pool = list(range(len(index)))
+            if prefilter_k:
+                osa = [np.float32(OSA.normalized_similarity(key, name)) for name in choices]
+                pool = sorted(pool, key=lambda p: (-osa[p], p))[: max(prefilter_k, top_k)]
+            dl = {p: float(np.float32(DamerauLevenshtein.normalized_similarity(key, choices[p]))) for p in pool}
+            expected = sorted(pool, key=lambda p: (-dl[p], p))[:top_k]
+            positions, scores = actual[query_position]
+            assert positions.tolist() == expected
+            np.testing.assert_array_equal(scores, [dl[p] for p in expected])

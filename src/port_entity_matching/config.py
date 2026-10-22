@@ -16,6 +16,7 @@ class MatchConfig:
     """Immutable tunables for retrieval, features, ranking and CV."""
 
     name_top_k: int = 30
+    latin_prefilter_k: int = 200
     hangul_key_top_k: int = 30
     tonnage_window: float = 0.06
     hangul_tonnage_window: float = 0.10
@@ -32,7 +33,7 @@ class MatchConfig:
     near_tol: float = 0.01
     query_chunk: int = 256
     batch_size: int = 512
-    num_threads: int = 4
+    num_threads: int = 6
     seed: int = 42
     cv_splits: int = 5
     lgbm_learning_rate: float = 0.05

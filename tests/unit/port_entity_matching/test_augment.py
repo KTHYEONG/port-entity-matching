@@ -104,16 +104,19 @@ def test_invalid_factor_rejected(factor: float) -> None:
 
 
 def test_short_names_do_not_consume_rng_and_only_raw_syllables_are_deleted() -> None:
-    import numpy as np
+    from port_entity_matching.augment import record_rng
 
     name = "A한-진 부산9"
     records = [_record("short", "대한"), _record("latin", "ALPHA"), _record("long", name)]
     copies, sources = degraded_copies(records, _config())
     positions = [i for i, char in enumerate(name) if "가" <= char <= "힣"]
-    deleted = positions[int(np.random.default_rng(0).integers(len(positions)))]
-    assert copies[-1].vessel_name == name[:deleted] + name[deleted + 1:]
+    deleted = positions[int(record_rng(records[2], 0).integers(len(positions)))]
+    assert copies[-1].vessel_name == name[:deleted] + name[deleted + 1 :]
     assert sources == [0, 0, 0, 2, 2, 2]
     assert copies == degraded_copies(records, _config())[0]
+    # Per-record RNG: the long record's copy is identical when run alone.
+    alone, _ = degraded_copies([records[2]], _config())
+    assert alone[-1].vessel_name == copies[-1].vessel_name
 
 
 def test_invalid_min_syllables_rejected() -> None:
@@ -242,7 +245,7 @@ def test_drop_token_draws_exactly_one_index() -> None:
     reference = np.random.default_rng(7)
     tokens = ["A-1", "B.2", "C_3"]
     dropped = int(reference.integers(len(tokens)))
-    assert drop_token("  A-1\tB.2  C_3 ", rng) == " ".join(tokens[:dropped] + tokens[dropped + 1:])
+    assert drop_token("  A-1\tB.2  C_3 ", rng) == " ".join(tokens[:dropped] + tokens[dropped + 1 :])
     assert rng.integers(1000) == reference.integers(1000)
 
 
@@ -271,15 +274,14 @@ def test_degraded_copies_output_is_unchanged() -> None:
     copies, sources = degraded_copies(records, _config())
     assert sources == [0, 0, 0, 1, 1, 1]
     assert [
-        (copy.sample_id, copy.vessel_name, copy.gross_tonnage, copy.international_gross_tonnage)
-        for copy in copies
+        (copy.sample_id, copy.vessel_name, copy.gross_tonnage, copy.international_gross_tonnage) for copy in copies
     ] == [
         ("S0#aug0", "한진부산", 1080.0, 972.0000000000001),
         ("S0#aug1", "한진부산", None, None),
-        ("S0#aug2", "한진부", 1000.0, 900.0),
+        ("S0#aug2", "한부산", 1000.0, 900.0),
         ("S1#aug0", "글로비스 스피릿", 1080.0, None),
         ("S1#aug1", "글로비스 스피릿", None, None),
-        ("S1#aug2", "글로비스 피릿", 1000.0, None),
+        ("S1#aug2", "글로비 스피릿", 1000.0, None),
     ]
 
 
@@ -336,17 +338,13 @@ def test_notation_copies_change_with_the_seed() -> None:
 
 
 def test_notation_copies_keep_the_other_fields() -> None:
-    copies, _ = notation_copies(
-        [_record("S0", "상하이 보이저", gross=1000.0, international=900.0)], _config()
-    )
+    copies, _ = notation_copies([_record("S0", "상하이 보이저", gross=1000.0, international=900.0)], _config())
     for copy in copies:
         assert copy.call_sign == "CS_A"
         assert copy.flag_name == "파나마"
         assert copy.vessel_type == "Tanker"
         assert copy.arrival_year == 2020
-    assert copies[2].international_gross_tonnage == pytest.approx(
-        900.0 * (copies[2].gross_tonnage / 1000.0), rel=1e-9
-    )
+    assert copies[2].international_gross_tonnage == pytest.approx(900.0 * (copies[2].gross_tonnage / 1000.0), rel=1e-9)
 
 
 @pytest.mark.parametrize(
@@ -386,25 +384,28 @@ def test_notation_copies_stay_outside_the_unseen_families() -> None:
 
 
 def test_notation_rng_order_and_missing_tonnage() -> None:
+    from port_entity_matching.augment import record_rng
+
     records = [
         _record("empty", "신간", gross=None),
         _record("kor", "상하이 보이저", gross=None, international=900.0),
         _record("lat", "OCEAN PIONEER"),
     ]
     config = _config(augment_latin_rate=1.0)
-    rng = np.random.default_rng(config.augment_seed + 1)
-    dropped = drop_token(records[1].vessel_name, rng)
-    sign = -1.0 if rng.random() < 0.5 else 1.0
-    factor = 1.0 + sign * rng.uniform(config.augment_tonnage_low, config.augment_tonnage_high)
-    assert rng.random() < config.augment_latin_rate
-    family = int(rng.integers(3))
+    kor_rng = record_rng(records[1], config.augment_seed + 1)
+    dropped = drop_token(records[1].vessel_name, kor_rng)
+    sign = -1.0 if kor_rng.random() < 0.5 else 1.0
+    factor = 1.0 + sign * kor_rng.uniform(config.augment_tonnage_low, config.augment_tonnage_high)
+    lat_rng = record_rng(records[2], config.augment_seed + 1)
+    assert lat_rng.random() < config.augment_latin_rate
+    family = int(lat_rng.integers(3))
     name = records[2].vessel_name
     if family == 0:
         expected = reverse_tokens(name)
     elif family == 1:
-        expected = drop_token(name, rng)
+        expected = drop_token(name, lat_rng)
     else:
-        expected = char_edits(name, rng, 1 + int(rng.integers(2)))
+        expected = char_edits(name, lat_rng, 1 + int(lat_rng.integers(2)))
     copies, sources = notation_copies(records, config)
     assert sources == [1, 1, 1, 2]
     assert copies[1].vessel_name == dropped
@@ -415,9 +416,11 @@ def test_notation_rng_order_and_missing_tonnage() -> None:
 
 @pytest.mark.parametrize("seed", range(10))
 def test_single_token_latin_fallback_and_unchanged_skip(seed: int) -> None:
+    from port_entity_matching.augment import record_rng
+
     record = _record("lat", "PIONEER")
     config = _config(augment_latin_rate=1.0, augment_seed=seed)
-    rng = np.random.default_rng(seed + 1)
+    rng = record_rng(record, seed + 1)
     rng.random()
     rng.integers(3)
     expected = char_edits(record.vessel_name, rng, 1 + int(rng.integers(2)))
@@ -425,3 +428,55 @@ def test_single_token_latin_fallback_and_unchanged_skip(seed: int) -> None:
     assert sources == ([] if expected == record.vessel_name else [0])
     assert [copy.vessel_name for copy in copies] == ([] if expected == record.vessel_name else [expected])
     assert notation_copies([_record("short", "AB")], config) == ([], [])
+
+
+def test_record_rng_is_stable_and_salted() -> None:
+    import dataclasses
+    import hashlib
+
+    from port_entity_matching.augment import record_rng
+
+    record = _record("S0", "한진부산")
+    first = record_rng(record, 0).random(5)
+    np.testing.assert_array_equal(record_rng(record, 0).random(5), first)
+    digest = hashlib.sha256("0\x1fS0\x1f한진부산".encode()).digest()
+    expected = np.random.default_rng(int.from_bytes(digest[:8], "little")).random(5)
+    np.testing.assert_array_equal(first, expected)
+    for other, salt in (
+        (record, 1),
+        (dataclasses.replace(record, sample_id="S1"), 0),
+        (dataclasses.replace(record, vessel_name="글로비스 스피릿"), 0),
+    ):
+        assert not np.array_equal(record_rng(other, salt).random(5), first)
+
+
+@pytest.mark.parametrize("latin_rate", [0.3, 1.0])
+def test_copies_are_independent_of_subset(latin_rate: float) -> None:
+    hangul_names = ["한진부산", "글로비스 스피릿", "상하이 보이저", "대한", "신간호", "마스그라치"]
+    records = [
+        _record(f"S{i:03d}", hangul_names[i % len(hangul_names)] if i % 3 else f"ALFA BETA {i:03d}") for i in range(100)
+    ]
+    config = _config(augment_latin_rate=latin_rate)
+    rng = np.random.default_rng(42)
+    order = rng.permutation(len(records)).tolist()
+    half = [records[position] for position in order[:50]]
+    half_ids = {record.sample_id for record in half}
+    for make_copies in (degraded_copies, notation_copies):
+        full, full_sources = make_copies(records, config)
+        selected, sources = make_copies(half, config)
+        expected = {
+            copy.sample_id: copy
+            for copy, source in zip(full, full_sources, strict=True)
+            if records[source].sample_id in half_ids
+        }
+        assert {copy.sample_id: copy for copy in selected} == expected
+        assert sources == sorted(sources)
+        for copy, source in zip(selected, sources, strict=True):
+            assert copy.sample_id.startswith(f"{half[source].sample_id}#aug")
+
+
+def test_degraded_copies_change_with_the_seed() -> None:
+    records = [_record("S0", "한진부산"), _record("S1", "글로비스 스피릿")]
+    first, _ = degraded_copies(records, _config(augment_seed=0))
+    second, _ = degraded_copies(records, _config(augment_seed=1))
+    assert [copy.vessel_name for copy in first] != [copy.vessel_name for copy in second]

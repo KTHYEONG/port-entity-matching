@@ -86,6 +86,19 @@ def test_round_trip(tmp_path) -> None:
     assert restored.maps.type_logprob("컨테이너선", "Container") == bundle.maps.type_logprob("컨테이너선", "Container")
 
 
+def test_old_manifest_keeps_stored_threads(tmp_path) -> None:
+    bundle = _bundle(MatchConfig(lgbm_num_rounds=2, num_threads=4, ensemble_size=1))
+    bundle.save(tmp_path)
+    path = tmp_path / "manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    del manifest["config"]["latin_prefilter_k"]
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    restored = ArtifactBundle.load(tmp_path, _index())
+    assert restored.config.num_threads == 4
+    assert restored.config.latin_prefilter_k == 200
+    assert MatchConfig().num_threads == 6
+
+
 def test_manifest_records_every_member(tmp_path) -> None:
     bundle = _bundle(MatchConfig(lgbm_num_rounds=10, lgbm_min_data_in_leaf=1, num_threads=1, ensemble_size=3))
     bundle.save(tmp_path)
