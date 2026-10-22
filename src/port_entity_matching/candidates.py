@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -33,6 +34,7 @@ __all__ = [
     "SRC_TOKEN_INDEX",
     "SRC_TONNAGE",
     "CandidateSet",
+    "_top_k_desc",
     "generate_candidates",
 ]
 
@@ -171,6 +173,21 @@ def _empty_ranking() -> tuple[Positions, Scores]:
     return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float64)
 
 
+def _top_k_desc(scores: NDArray[np.floating[Any]], k: int) -> NDArray[np.int64]:
+    """Indices of the k largest scores ordered by (-score, index); all indices when k >= len(scores)."""
+    n = int(scores.shape[0])
+    if k <= 0 or n == 0:
+        return np.empty(0, dtype=np.int64)
+    if k >= n:
+        return np.argsort(-scores, kind="stable").astype(np.int64)
+    threshold = float(np.partition(scores, n - k)[n - k])
+    mask = scores >= threshold
+    cand = np.flatnonzero(mask)
+    order = np.argsort(-scores[cand], kind="stable")[:k]
+    selected: NDArray[np.int64] = cand[order].astype(np.int64)
+    return selected
+
+
 def _latin_name_scores(
     prepared: Sequence[_Prepared],
     index: CatalogIndex,
@@ -191,7 +208,7 @@ def _latin_name_scores(
     scores: dict[int, tuple[Positions, Scores]] = {}
     for position, key in keys.items():
         row = matrix[row_of[key]]
-        order = np.argsort(-row, kind="stable")[: config.name_top_k]
+        order = _top_k_desc(row, config.name_top_k)
         scores[position] = (order.astype(np.int64), row[order].astype(np.float64))
     return scores
 
@@ -216,7 +233,7 @@ def _hangul_name_scores(
             dtype=np.float32,
         )
         for row_number, key in enumerate(keys):
-            order = np.argsort(-matrix[row_number], kind="stable")[: config.hangul_key_top_k].copy()
+            order = _top_k_desc(matrix[row_number], config.hangul_key_top_k).copy()
             key_scores[key] = (order.astype(np.int64), matrix[row_number, order].astype(np.float64))
         del matrix
 
@@ -260,7 +277,7 @@ def _latin_sorted_scores(
     scores: dict[int, tuple[Positions, Scores]] = {}
     for position, key in keys.items():
         row = matrix[row_of[key]]
-        order = np.argsort(-row, kind="stable")[: config.name_top_k]
+        order = _top_k_desc(row, config.name_top_k)
         scores[position] = (order.astype(np.int64), row[order].astype(np.float64))
     return scores
 
@@ -285,7 +302,7 @@ def _hangul_sorted_scores(
             dtype=np.float32,
         )
         for row_number, key in enumerate(keys):
-            order = np.argsort(-matrix[row_number], kind="stable")[: config.hangul_key_top_k].copy()
+            order = _top_k_desc(matrix[row_number], config.hangul_key_top_k).copy()
             key_scores[key] = (order.astype(np.int64), matrix[row_number, order].astype(np.float64))
         del matrix
     scores: dict[int, tuple[Positions, Scores]] = {}
@@ -394,27 +411,33 @@ def _hangul_tonnage(item: _Prepared, index: CatalogIndex, config: MatchConfig) -
     if len(window) == 0 or not item.cons_keys:
         return _union([window, exact]), exact
 
-    def score(position: int) -> float:
-        base = max(
-            0.5
-            * (
-                Levenshtein.normalized_similarity(cons_key, index.key2_cons[position])
-                + Levenshtein.normalized_similarity(vowel_key, index.key2_vow[position])
-            )
-            for cons_key, vowel_key in zip(item.cons_keys, item.vowel_keys, strict=True)
-        )
-        if any(item.sorted_cons):
-            sorted_sim = max(
-                Levenshtein.normalized_similarity(sorted_key, index.sorted_key2_cons[position])
-                for sorted_key in item.sorted_cons
-                if sorted_key
-            )
-        else:
-            sorted_sim = 0.0
-        return max(base, sorted_sim)
+    window_list = window.tolist()
+    window_cons = [index.key2_cons[position] for position in window_list]
+    window_vow = [index.key2_vow[position] for position in window_list]
+    window_sorted = [index.sorted_key2_cons[position] for position in window_list]
+    total = np.zeros(len(window_list), dtype=np.float64)
+    for cons_key, vowel_key in zip(item.cons_keys, item.vowel_keys, strict=True):
+        cons_sim = process.cdist(
+            [cons_key], window_cons, scorer=Levenshtein.normalized_similarity, workers=1, dtype=np.float64
+        )[0]
+        vow_sim = process.cdist(
+            [vowel_key], window_vow, scorer=Levenshtein.normalized_similarity, workers=1, dtype=np.float64
+        )[0]
+        total = np.maximum(total, 0.5 * (cons_sim + vow_sim))
+    sorted_keys = [key for key in item.sorted_cons if key]
+    if sorted_keys:
+        sorted_best = np.zeros(len(window_list), dtype=np.float64)
+        for sorted_key in sorted_keys:
+            sim = process.cdist(
+                [sorted_key], window_sorted, scorer=Levenshtein.normalized_similarity, workers=1, dtype=np.float64
+            )[0]
+            sorted_best = np.maximum(sorted_best, sim)
+        total = np.maximum(total, sorted_best)
 
-    selected = sorted(window.tolist(), key=lambda position: (-score(position), position))[: config.hangul_window_keep]
-    return _union([np.asarray(selected, dtype=np.int64), exact]), exact
+    selected = sorted(range(len(window_list)), key=lambda i: (-float(total[i]), int(window_list[i])))[
+        : config.hangul_window_keep
+    ]
+    return _union([np.asarray([window_list[i] for i in selected], dtype=np.int64), exact]), exact
 
 
 def _token_candidates(item: _Prepared, index: CatalogIndex, config: MatchConfig) -> Positions:

@@ -499,3 +499,44 @@ def test_shipped_modules_stay_evaluation_free() -> None:
     package = Path(__file__).resolve().parents[3] / "src" / "port_entity_matching"
     for module in sorted(package.glob("*.py")):
         assert "port_entity_matching.evaluation" not in module.read_text(encoding="utf-8"), module.name
+
+
+def test_injected_candidate_fn_used() -> None:
+    from port_entity_matching import train as train_module
+    from port_entity_matching.candidates import generate_candidates
+
+    calls = {"count": 0}
+    train = _train_frame()
+    catalog = _catalog_frame()
+    config = _config()
+    scenarios = {"no_tonnage": _hangul_only_perturbation}
+    baseline = cross_validate_run(train, catalog, config, scenarios=scenarios)
+    index = CatalogIndex.build(catalog)
+    original_features = train_module.build_features
+    original_score = train_module.score_ensemble
+
+    def _counting(records):
+        calls["count"] += 1
+        assert train_module.build_features is original_features
+        assert train_module.score_ensemble is original_score
+        return generate_candidates(records, index, None, config)
+
+    injected = cross_validate_run(train, catalog, config, scenarios=scenarios, candidate_fn=_counting, index=index)
+    assert calls["count"] == config.cv_splits * 3
+    assert injected.oof.reset_index(drop=True).equals(baseline.oof.reset_index(drop=True))
+
+
+def test_diagnostic_rows_without_candidate_fn() -> None:
+    from port_entity_matching.maps import AttributeMaps
+    from port_entity_matching.train import _diagnostic_rows
+
+    train = _train_frame().iloc[:4]
+    catalog = _catalog_frame()
+    index = CatalogIndex.build(catalog)
+    maps = AttributeMaps.fit(train, index)
+    config = MatchConfig(lgbm_num_rounds=5, lgbm_min_data_in_leaf=1, num_threads=1)
+    bundle = fit_bundle(train, catalog, config)
+    records = records_from_frame(train)
+    targets = [str(value) for value in train["target_vessel_id"].tolist()]
+    rows = _diagnostic_rows(records, targets, index, maps, config, bundle.ranker, candidate_fn=None)
+    assert len(rows) == len(records)

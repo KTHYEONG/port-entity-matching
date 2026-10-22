@@ -17,7 +17,7 @@ from sklearn.model_selection import GroupKFold
 
 from port_entity_matching.artifacts import ArtifactBundle
 from port_entity_matching.augment import degraded_copies, notation_copies
-from port_entity_matching.candidates import generate_candidates
+from port_entity_matching.candidates import CandidateSet, generate_candidates
 from port_entity_matching.catalog import CatalogIndex
 from port_entity_matching.config import MatchConfig
 from port_entity_matching.features import build_features
@@ -65,6 +65,14 @@ DIAGNOSTIC_COLUMNS: tuple[str, ...] = (
 _OOF_COLUMNS: tuple[str, ...] = ("scenario", *DIAGNOSTIC_COLUMNS)
 
 RecordPerturbation = Callable[[QueryRecord], QueryRecord | None]
+CandidateFn = Callable[[Sequence[QueryRecord]], list[CandidateSet]]
+
+
+@dataclass
+class _StageTimes:
+    retrieve: float = 0.0
+    features: float = 0.0
+    score: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -122,6 +130,9 @@ def build_training_data(
     index: CatalogIndex,
     maps: AttributeMaps,
     config: MatchConfig,
+    candidate_fn: CandidateFn | None = None,
+    *,
+    _timings: _StageTimes | None = None,
 ) -> TrainingData:
     """Build the candidate matrix, features and labels; rows whose target is not retrieved are excluded."""
     records = records_from_frame(train)
@@ -137,8 +148,16 @@ def build_training_data(
         notation_targets = [targets[index] for index in notation_sources]
         records = [*records, *copies, *notation]
         targets = [*targets, *copy_targets, *notation_targets]
-    candidate_sets = generate_candidates(records, index, None, config)
+    timings = _timings or _StageTimes()
+    started = time.perf_counter()
+    if candidate_fn is None:
+        candidate_sets = generate_candidates(records, index, None, config)
+    else:
+        candidate_sets = candidate_fn(records)
+    timings.retrieve += time.perf_counter() - started
+    started = time.perf_counter()
     features = build_features(records, candidate_sets, index, maps, config)
+    timings.features += time.perf_counter() - started
 
     sizes = [len(candidate_set.positions) for candidate_set in candidate_sets]
     offsets = np.cumsum([0, *sizes])
@@ -222,13 +241,16 @@ def cross_validate_run(
     catalog: pd.DataFrame,
     config: MatchConfig,
     scenarios: Mapping[str, RecordPerturbation] | None = None,
+    candidate_fn: CandidateFn | None = None,
+    index: CatalogIndex | None = None,
 ) -> CVRun:
     """Vessel-disjoint CV with memory off; each fold's ensemble scores clean rows and every scenario's perturbed rows."""
     scenario_map = dict(scenarios or {})
     if "clean" in scenario_map:
         raise ValueError("Scenario name 'clean' is reserved for the unperturbed rows")
     started = time.perf_counter()
-    index = CatalogIndex.build(catalog)
+    if index is None:
+        index = CatalogIndex.build(catalog)
     folds = fold_indices(train, config.cv_splits)
     logger.info(
         "[DATA] cv start train_rows=%d catalog_rows=%d folds=%d scenarios=%d",
@@ -242,9 +264,12 @@ def cross_validate_run(
     for fold_number, (train_index, valid_index) in enumerate(folds, start=1):
         fold_train = train.iloc[train_index]
         fold_valid = train.iloc[valid_index]
+        timings = _StageTimes()
         maps = AttributeMaps.fit(fold_train, index)
-        training = build_training_data(fold_train, index, maps, config)
+        training = build_training_data(fold_train, index, maps, config, candidate_fn, _timings=timings)
+        fit_start = time.perf_counter()
         ranker = train_ensemble(training.features, training.labels, training.group_sizes, config)
+        fit_s = time.perf_counter() - fit_start
         logger.info(
             "[ALGO] fold=%d train_rows=%d pairs=%d groups=%d members=%d recall_hangul=%.4f recall_latin=%.4f",
             fold_number,
@@ -258,7 +283,9 @@ def cross_validate_run(
 
         records = records_from_frame(fold_valid)
         fold_targets = [str(value) for value in fold_valid["target_vessel_id"].tolist()]
-        clean_rows = _diagnostic_rows(records, fold_targets, index, maps, config, ranker)
+        clean_rows = _diagnostic_rows(
+            records, fold_targets, index, maps, config, ranker, candidate_fn, _timings=timings
+        )
         rows.extend({"scenario": "clean", **row} for row in clean_rows)
         _log_fold_metrics(fold_number, None, clean_rows)
 
@@ -274,9 +301,19 @@ def cross_validate_run(
             if not perturbed_records:
                 _log_fold_metrics(fold_number, scenario_name, [])
                 continue
-            scenario_rows = _diagnostic_rows(perturbed_records, perturbed_targets, index, maps, config, ranker)
+            scenario_rows = _diagnostic_rows(
+                perturbed_records, perturbed_targets, index, maps, config, ranker, candidate_fn, _timings=timings
+            )
             rows.extend({"scenario": scenario_name, **row} for row in scenario_rows)
             _log_fold_metrics(fold_number, scenario_name, scenario_rows)
+        logger.info(
+            "[SYS] fold=%d retrieve_s=%.1f features_s=%.1f fit_s=%.1f score_s=%.1f",
+            fold_number,
+            timings.retrieve,
+            timings.features,
+            fit_s,
+            timings.score,
+        )
 
     oof = pd.DataFrame(rows, columns=list(_OOF_COLUMNS))
     report = _report_from_rows(oof[oof["scenario"] == "clean"])
@@ -297,11 +334,24 @@ def _diagnostic_rows(
     maps: AttributeMaps,
     config: MatchConfig,
     ranker: RankerEnsemble,
+    candidate_fn: CandidateFn | None = None,
+    *,
+    _timings: _StageTimes | None = None,
 ) -> list[dict[str, object]]:
     """Score records with a fold ensemble and return one diagnostic row per record."""
-    candidate_sets = generate_candidates(records, index, None, config)
+    timings = _timings or _StageTimes()
+    started = time.perf_counter()
+    if candidate_fn is None:
+        candidate_sets = generate_candidates(records, index, None, config)
+    else:
+        candidate_sets = candidate_fn(records)
+    timings.retrieve += time.perf_counter() - started
+    started = time.perf_counter()
     features = build_features(records, candidate_sets, index, maps, config)
+    timings.features += time.perf_counter() - started
+    started = time.perf_counter()
     scores = score_ensemble(ranker, features, config)
+    timings.score += time.perf_counter() - started
 
     sizes = [len(candidate_set.positions) for candidate_set in candidate_sets]
     offsets = np.cumsum([0, *sizes])
@@ -392,7 +442,9 @@ def _log_fold_metrics(fold_number: int, scenario: str | None, rows: Sequence[dic
 
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI: fit and save artifacts and/or run cross-validation."""
-    parser = argparse.ArgumentParser(prog="port_entity_matching.train", description="Fit and validate the vessel matcher.")
+    parser = argparse.ArgumentParser(
+        prog="port_entity_matching.train", description="Fit and validate the vessel matcher."
+    )
     parser.add_argument("--train", required=True, type=Path, help="training CSV with target_vessel_id")
     parser.add_argument("--catalog", required=True, type=Path, help="vessel catalog CSV")
     parser.add_argument("--out", type=Path, default=None, help="directory the fitted artifacts are written to")
@@ -429,7 +481,9 @@ def _best_two(
     index: CatalogIndex,
 ) -> tuple[int, float, str, float | None]:
     """Return the best offset and score plus the runner-up vessel id and score."""
-    order = sorted(range(len(catalog_positions)), key=lambda offset: (-float(scores[offset]), int(catalog_positions[offset])))
+    order = sorted(
+        range(len(catalog_positions)), key=lambda offset: (-float(scores[offset]), int(catalog_positions[offset]))
+    )
     best = order[0]
     second_id = ""
     second_score: float | None = None

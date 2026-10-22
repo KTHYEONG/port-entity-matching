@@ -10,7 +10,13 @@ import pytest
 
 from port_entity_matching.config import MatchConfig
 from port_entity_matching.evaluation.cli import (
-    _cast_value, _parse_scenarios, _stress_entry, _write_json, _write_oof, main, parse_overrides,
+    _cast_value,
+    _parse_scenarios,
+    _stress_entry,
+    _write_json,
+    _write_oof,
+    main,
+    parse_overrides,
 )
 from port_entity_matching.evaluation.perturb import PERTURBATIONS
 from port_entity_matching.evaluation.stats import OOF_COLUMNS
@@ -82,13 +88,22 @@ def cv_run(tiny_dataset: tuple[Path, Path], tmp_path_factory: pytest.TempPathFac
     """Run the cv subcommand once and return its output directory."""
     train_path, catalog_path = tiny_dataset
     out_dir = tmp_path_factory.mktemp("cv")
-    assert main([
-        "cv",
-        "--train", str(train_path),
-        "--catalog", str(catalog_path),
-        "--out-dir", str(out_dir),
-        "--set", "ensemble_size=1",
-    ]) == 0
+    assert (
+        main(
+            [
+                "cv",
+                "--train",
+                str(train_path),
+                "--catalog",
+                str(catalog_path),
+                "--out-dir",
+                str(out_dir),
+                "--set",
+                "ensemble_size=1",
+            ]
+        )
+        == 0
+    )
     return out_dir
 
 
@@ -152,14 +167,24 @@ def test_cv_writes_artifacts(cv_run: Path, tiny_dataset: tuple[Path, Path]) -> N
 def test_stress_writes_per_scenario_table(tiny_dataset: tuple[Path, Path], tmp_path: Path) -> None:
     train_path, catalog_path = tiny_dataset
     out_dir = tmp_path / "stress"
-    assert main([
-        "stress",
-        "--train", str(train_path),
-        "--catalog", str(catalog_path),
-        "--out-dir", str(out_dir),
-        "--scenarios", "kor_tonnage_missing,lat_tonnage_missing",
-        "--set", "ensemble_size=1",
-    ]) == 0
+    assert (
+        main(
+            [
+                "stress",
+                "--train",
+                str(train_path),
+                "--catalog",
+                str(catalog_path),
+                "--out-dir",
+                str(out_dir),
+                "--scenarios",
+                "kor_tonnage_missing,lat_tonnage_missing",
+                "--set",
+                "ensemble_size=1",
+            ]
+        )
+        == 0
+    )
     assert (out_dir / "oof_long.csv").is_file()
 
     report = json.loads((out_dir / "stress.json").read_text(encoding="utf-8"))
@@ -176,9 +201,7 @@ def test_compare_is_order_insensitive(cv_run: Path, tmp_path: Path, capsys: pyte
     oof.sample(frac=1.0, random_state=11).to_csv(shuffled_path, index=False)
 
     report_path = tmp_path / "compare.json"
-    exit_code = main([
-        "compare", str(cv_run / "oof.csv"), str(shuffled_path), "--json", str(report_path)
-    ])
+    exit_code = main(["compare", str(cv_run / "oof.csv"), str(shuffled_path), "--json", str(report_path)])
     assert exit_code == 0
 
     printed = capsys.readouterr().out
@@ -194,15 +217,23 @@ def test_compare_is_order_insensitive(cv_run: Path, tmp_path: Path, capsys: pyte
     assert report["rows_broken"] == 0
 
 
-def test_unknown_scenario_is_reported(tiny_dataset: tuple[Path, Path], tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_unknown_scenario_is_reported(
+    tiny_dataset: tuple[Path, Path], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     train_path, catalog_path = tiny_dataset
-    exit_code = main([
-        "stress",
-        "--train", str(train_path),
-        "--catalog", str(catalog_path),
-        "--out-dir", str(tmp_path / "stress"),
-        "--scenarios", "bogus",
-    ])
+    exit_code = main(
+        [
+            "stress",
+            "--train",
+            str(train_path),
+            "--catalog",
+            str(catalog_path),
+            "--out-dir",
+            str(tmp_path / "stress"),
+            "--scenarios",
+            "bogus",
+        ]
+    )
     assert exit_code == 1
     captured = capsys.readouterr()
     assert "bogus" in captured.err
@@ -212,13 +243,22 @@ def test_unknown_scenario_is_reported(tiny_dataset: tuple[Path, Path], tmp_path:
 def test_all_scenarios_are_run_by_default(tiny_dataset: tuple[Path, Path], tmp_path: Path) -> None:
     train_path, catalog_path = tiny_dataset
     out_dir = tmp_path / "stress_all"
-    assert main([
-        "stress",
-        "--train", str(train_path),
-        "--catalog", str(catalog_path),
-        "--out-dir", str(out_dir),
-        "--set", "ensemble_size=1",
-    ]) == 0
+    assert (
+        main(
+            [
+                "stress",
+                "--train",
+                str(train_path),
+                "--catalog",
+                str(catalog_path),
+                "--out-dir",
+                str(out_dir),
+                "--set",
+                "ensemble_size=1",
+            ]
+        )
+        == 0
+    )
     report = json.loads((out_dir / "stress.json").read_text(encoding="utf-8"))
     assert set(report) == set(PERTURBATIONS)
 
@@ -226,14 +266,24 @@ def test_all_scenarios_are_run_by_default(tiny_dataset: tuple[Path, Path], tmp_p
 def test_a_scenario_without_affected_rows_is_reported(tiny_dataset: tuple[Path, Path], tmp_path: Path) -> None:
     train_path, catalog_path = tiny_dataset
     out_dir = tmp_path / "stress_empty"
-    assert main([
-        "stress",
-        "--train", str(train_path),
-        "--catalog", str(catalog_path),
-        "--out-dir", str(out_dir),
-        "--scenarios", "kor_spaces_removed",
-        "--set", "ensemble_size=1",
-    ]) == 0
+    assert (
+        main(
+            [
+                "stress",
+                "--train",
+                str(train_path),
+                "--catalog",
+                str(catalog_path),
+                "--out-dir",
+                str(out_dir),
+                "--scenarios",
+                "kor_spaces_removed",
+                "--set",
+                "ensemble_size=1",
+            ]
+        )
+        == 0
+    )
     report = json.loads((out_dir / "stress.json").read_text(encoding="utf-8"))
     entry = report["kor_spaces_removed"]
     assert entry["affected_rows"] == 0
@@ -244,24 +294,38 @@ def test_a_scenario_without_affected_rows_is_reported(tiny_dataset: tuple[Path, 
 def test_output_directory_is_created(tiny_dataset: tuple[Path, Path], tmp_path: Path) -> None:
     train_path, catalog_path = tiny_dataset
     out_dir = tmp_path / "nested" / "run"
-    assert main([
-        "cv",
-        "--train", str(train_path),
-        "--catalog", str(catalog_path),
-        "--out-dir", str(out_dir),
-        "--set", "ensemble_size=1",
-    ]) == 0
+    assert (
+        main(
+            [
+                "cv",
+                "--train",
+                str(train_path),
+                "--catalog",
+                str(catalog_path),
+                "--out-dir",
+                str(out_dir),
+                "--set",
+                "ensemble_size=1",
+            ]
+        )
+        == 0
+    )
     assert (out_dir / "oof.csv").is_file()
 
 
 def test_writing_inside_a_data_directory_is_refused(tiny_dataset: tuple[Path, Path], tmp_path: Path) -> None:
     train_path, catalog_path = tiny_dataset
-    exit_code = main([
-        "cv",
-        "--train", str(train_path),
-        "--catalog", str(catalog_path),
-        "--out-dir", str(tmp_path / "data" / "eval"),
-    ])
+    exit_code = main(
+        [
+            "cv",
+            "--train",
+            str(train_path),
+            "--catalog",
+            str(catalog_path),
+            "--out-dir",
+            str(tmp_path / "data" / "eval"),
+        ]
+    )
     assert exit_code == 1
 
 
@@ -283,35 +347,52 @@ def test_duplicate_scenarios_run_only_once() -> None:
 
 @pytest.mark.parametrize("bad_id", [None, "T00001"])
 def test_invalid_training_ids_fail_before_cv(
-    tmp_path: Path, bad_id: str | None, capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    bad_id: str | None,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     train_path, catalog_path = _write_fixture(tmp_path)
     train = pd.read_csv(train_path)
     train.loc[0, "sample_id"] = bad_id
     train.to_csv(train_path, index=False)
-    assert main([
-        "cv", "--train", str(train_path), "--catalog", str(catalog_path),
-        "--out-dir", str(tmp_path / "out"),
-    ]) == 1
+    assert (
+        main(
+            [
+                "cv",
+                "--train",
+                str(train_path),
+                "--catalog",
+                str(catalog_path),
+                "--out-dir",
+                str(tmp_path / "out"),
+            ]
+        )
+        == 1
+    )
     assert "sample_id" in capsys.readouterr().err
     assert not (tmp_path / "out").exists()
 
 
 def _stress_frame() -> pd.DataFrame:
-    return pd.DataFrame([
-        {"scenario": "clean", "sample_id": "A", "correct": 0, "target_retrieved": 1},
-        {"scenario": "clean", "sample_id": "B", "correct": 1, "target_retrieved": 1},
-        {"scenario": "clean", "sample_id": "C", "correct": 1, "target_retrieved": 1},
-        {"scenario": "test", "sample_id": "C", "correct": 0, "target_retrieved": 0},
-        {"scenario": "test", "sample_id": "B", "correct": 1, "target_retrieved": 1},
-    ])
+    return pd.DataFrame(
+        [
+            {"scenario": "clean", "sample_id": "A", "correct": 0, "target_retrieved": 1},
+            {"scenario": "clean", "sample_id": "B", "correct": 1, "target_retrieved": 1},
+            {"scenario": "clean", "sample_id": "C", "correct": 1, "target_retrieved": 1},
+            {"scenario": "test", "sample_id": "C", "correct": 0, "target_retrieved": 0},
+            {"scenario": "test", "sample_id": "B", "correct": 1, "target_retrieved": 1},
+        ]
+    )
 
 
 def test_stress_accuracy_joins_only_affected_ids() -> None:
     report = _stress_entry(_stress_frame(), "test")
     assert report == {
-        "affected_rows": 2, "acc_clean": 1.0, "acc_perturbed": 0.5,
-        "delta": -0.5, "recall_perturbed": 0.5,
+        "affected_rows": 2,
+        "acc_clean": 1.0,
+        "acc_perturbed": 0.5,
+        "delta": -0.5,
+        "recall_perturbed": 0.5,
     }
 
 
@@ -351,14 +432,24 @@ def test_argument_errors_exit_two() -> None:
 def test_stress_writes_the_suite_summary(tiny_dataset: tuple[Path, Path], tmp_path: Path) -> None:
     train_path, catalog_path = tiny_dataset
     out_dir = tmp_path / "stress_suite"
-    assert main([
-        "stress",
-        "--train", str(train_path),
-        "--catalog", str(catalog_path),
-        "--out-dir", str(out_dir),
-        "--scenarios", "kor_tonnage_missing,lat_tonnage_missing",
-        "--set", "ensemble_size=1",
-    ]) == 0
+    assert (
+        main(
+            [
+                "stress",
+                "--train",
+                str(train_path),
+                "--catalog",
+                str(catalog_path),
+                "--out-dir",
+                str(out_dir),
+                "--scenarios",
+                "kor_tonnage_missing,lat_tonnage_missing",
+                "--set",
+                "ensemble_size=1",
+            ]
+        )
+        == 0
+    )
     suite = json.loads((out_dir / "suite.json").read_text(encoding="utf-8"))
     assert set(suite) == {"all", "seen", "unseen"}
     for entry in suite.values():
@@ -374,11 +465,26 @@ def test_stress_serializes_a_missing_bucket_as_null(tiny_dataset: tuple[Path, Pa
     latin_path = tmp_path / "latin.csv"
     train.iloc[1::2].to_csv(latin_path, index=False)
     out_dir = tmp_path / "latin_stress"
-    assert main([
-        "stress", "--train", str(latin_path), "--catalog", str(catalog_path),
-        "--out-dir", str(out_dir), "--scenarios", "lat_tonnage_missing",
-        "--set", "ensemble_size=1", "--set", "cv_splits=2",
-    ]) == 0
+    assert (
+        main(
+            [
+                "stress",
+                "--train",
+                str(latin_path),
+                "--catalog",
+                str(catalog_path),
+                "--out-dir",
+                str(out_dir),
+                "--scenarios",
+                "lat_tonnage_missing",
+                "--set",
+                "ensemble_size=1",
+                "--set",
+                "cv_splits=2",
+            ]
+        )
+        == 0
+    )
     suite = json.loads((out_dir / "suite.json").read_text(encoding="utf-8"))
     for entry in suite.values():
         assert entry["kor"] is None
@@ -387,17 +493,29 @@ def test_stress_serializes_a_missing_bucket_as_null(tiny_dataset: tuple[Path, Pa
         assert entry["lat"] is not None
 
 
-def test_compare_accepts_a_scenario(tiny_dataset: tuple[Path, Path], tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_compare_accepts_a_scenario(
+    tiny_dataset: tuple[Path, Path], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     train_path, catalog_path = tiny_dataset
     out_dir = tmp_path / "stress_compare"
-    assert main([
-        "stress",
-        "--train", str(train_path),
-        "--catalog", str(catalog_path),
-        "--out-dir", str(out_dir),
-        "--scenarios", "kor_tonnage_missing,lat_tonnage_missing",
-        "--set", "ensemble_size=1",
-    ]) == 0
+    assert (
+        main(
+            [
+                "stress",
+                "--train",
+                str(train_path),
+                "--catalog",
+                str(catalog_path),
+                "--out-dir",
+                str(out_dir),
+                "--scenarios",
+                "kor_tonnage_missing,lat_tonnage_missing",
+                "--set",
+                "ensemble_size=1",
+            ]
+        )
+        == 0
+    )
     long_path = out_dir / "oof_long.csv"
     first = tmp_path / "first.csv"
     second = tmp_path / "second.csv"
@@ -405,13 +523,111 @@ def test_compare_accepts_a_scenario(tiny_dataset: tuple[Path, Path], tmp_path: P
     long_frame.sample(frac=1.0, random_state=5).to_csv(first, index=False)
     long_frame.to_csv(second, index=False)
 
-    exit_code = main([
-        "compare", str(first), str(second), "--scenario", "lat_tonnage_missing",
-    ])
+    exit_code = main(
+        [
+            "compare",
+            str(first),
+            str(second),
+            "--scenario",
+            "lat_tonnage_missing",
+        ]
+    )
     assert exit_code == 0
     assert "+0.0000" in capsys.readouterr().out
 
-    exit_code = main([
-        "compare", str(first), str(second), "--scenario", "bogus",
-    ])
+    exit_code = main(
+        [
+            "compare",
+            str(first),
+            str(second),
+            "--scenario",
+            "bogus",
+        ]
+    )
     assert exit_code == 1
+
+
+def test_cache_flags_keep_stress_identical(
+    tiny_dataset: tuple[Path, Path], tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    caplog.set_level(logging.INFO)
+    train_path, catalog_path = tiny_dataset
+    cache_dir = tmp_path / "candidate_cache"
+    first_out = tmp_path / "first"
+    second_out = tmp_path / "second"
+    args = ["--set", "ensemble_size=1", "--cache-dir", str(cache_dir)]
+    assert (
+        main(["stress", "--train", str(train_path), "--catalog", str(catalog_path), "--out-dir", str(first_out), *args])
+        == 0
+    )
+    assert (
+        main(
+            ["stress", "--train", str(train_path), "--catalog", str(catalog_path), "--out-dir", str(second_out), *args]
+        )
+        == 0
+    )
+    assert (first_out / "oof_long.csv").read_bytes() == (second_out / "oof_long.csv").read_bytes()
+    assert "misses=0" in caplog.text
+    third_out = tmp_path / "third"
+    assert (
+        main(
+            [
+                "stress",
+                "--train",
+                str(train_path),
+                "--catalog",
+                str(catalog_path),
+                "--out-dir",
+                str(third_out),
+                "--no-cache",
+                "--set",
+                "ensemble_size=1",
+            ]
+        )
+        == 0
+    )
+    assert (first_out / "oof_long.csv").read_bytes() == (third_out / "oof_long.csv").read_bytes()
+
+
+def test_cv_no_cache_matches_cached(tiny_dataset: tuple[Path, Path], tmp_path: Path) -> None:
+    train_path, catalog_path = tiny_dataset
+    cached_out = tmp_path / "cached"
+    assert (
+        main(
+            [
+                "cv",
+                "--train",
+                str(train_path),
+                "--catalog",
+                str(catalog_path),
+                "--out-dir",
+                str(cached_out),
+                "--cache-dir",
+                str(tmp_path / "c"),
+                "--set",
+                "ensemble_size=1",
+            ]
+        )
+        == 0
+    )
+    plain_out = tmp_path / "plain"
+    assert (
+        main(
+            [
+                "cv",
+                "--train",
+                str(train_path),
+                "--catalog",
+                str(catalog_path),
+                "--out-dir",
+                str(plain_out),
+                "--no-cache",
+                "--set",
+                "ensemble_size=1",
+            ]
+        )
+        == 0
+    )
+    assert (cached_out / "oof.csv").read_bytes() == (plain_out / "oof.csv").read_bytes()

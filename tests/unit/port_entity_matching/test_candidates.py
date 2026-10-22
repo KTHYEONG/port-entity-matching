@@ -663,20 +663,28 @@ def test_hangul_without_token_units_skips_token_index() -> None:
 
 
 def test_ubiquitous_hangul_units_skip_token_index() -> None:
-    index = CatalogIndex.build(_catalog_frame([
-        ("G", "GLOBIS SUPREME", 100.0), ("H", "GLOBIS SUPREME", 200.0),
-    ]))
+    index = CatalogIndex.build(
+        _catalog_frame(
+            [
+                ("G", "GLOBIS SUPREME", 100.0),
+                ("H", "GLOBIS SUPREME", 200.0),
+            ]
+        )
+    )
     result = generate_candidates([_record("s", "슈프림 글로비스")], index, None, MatchConfig())[0]
     assert 0 in result.positions.tolist() or 1 in result.positions.tolist()
 
 
 def test_zero_weight_token_index_yields_no_candidates() -> None:
-    index = CatalogIndex.build(_catalog_frame([
-        ("A", "ALPHA ONE", 100.0), ("B", "ALPHA TWO", 200.0),
-    ]))
-    result = generate_candidates(
-        [_record("s", "ALPHA UNKNOWN")], index, None, MatchConfig(token_df_cap=2)
-    )[0]
+    index = CatalogIndex.build(
+        _catalog_frame(
+            [
+                ("A", "ALPHA ONE", 100.0),
+                ("B", "ALPHA TWO", 200.0),
+            ]
+        )
+    )
+    result = generate_candidates([_record("s", "ALPHA UNKNOWN")], index, None, MatchConfig(token_df_cap=2))[0]
     assert not any(_sources_of(result, p) & SRC_TOKEN_INDEX for p in result.positions.tolist())
 
 
@@ -703,14 +711,28 @@ def test_empty_query_units_similarities_are_zero() -> None:
     index = CatalogIndex.build(_catalog_frame([("V0", "Alpha", 1000.0)]))
     record = _record("s", "Alpha")
     hangul_empty = _Prepared(
-        record=_record("s", "아"), is_hangul=True, latin_key="", query_tokens=(), cons_keys=(),
-        vowel_keys=(), tonnages=(), sorted_latin="", sorted_cons=(),
+        record=_record("s", "아"),
+        is_hangul=True,
+        latin_key="",
+        query_tokens=(),
+        cons_keys=(),
+        vowel_keys=(),
+        tonnages=(),
+        sorted_latin="",
+        sorted_cons=(),
     )
     assert _name_similarity(hangul_empty, index, 0) == 0.0
     assert _token_index_similarity(hangul_empty, index, MatchConfig(), 0) == 0.0
     latin_empty = _Prepared(
-        record=record, is_hangul=False, latin_key="", query_tokens=(), cons_keys=(),
-        vowel_keys=(), tonnages=(), sorted_latin="", sorted_cons=(),
+        record=record,
+        is_hangul=False,
+        latin_key="",
+        query_tokens=(),
+        cons_keys=(),
+        vowel_keys=(),
+        tonnages=(),
+        sorted_latin="",
+        sorted_cons=(),
     )
     assert _token_index_similarity(latin_empty, index, MatchConfig(), 0) == 0.0
 
@@ -718,11 +740,92 @@ def test_empty_query_units_similarities_are_zero() -> None:
 def test_zero_denom_token_index_similarity_is_zero() -> None:
     from port_entity_matching.candidates import _token_index_similarity
 
-    index = CatalogIndex.build(_catalog_frame([
-        ("G", "GLOBIS SUPREME", 100.0), ("H", "GLOBIS SUPREME", 200.0),
-    ]))
+    index = CatalogIndex.build(
+        _catalog_frame(
+            [
+                ("G", "GLOBIS SUPREME", 100.0),
+                ("H", "GLOBIS SUPREME", 200.0),
+            ]
+        )
+    )
     record = _record("s", "슈프림 글로비스")
     from port_entity_matching.candidates import _prepare
 
     item = _prepare(record)
     assert _token_index_similarity(item, index, MatchConfig(), 0) == 0.0
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_top_k_desc_matches_stable_argsort(dtype) -> None:
+    from port_entity_matching.candidates import _top_k_desc
+
+    rng = np.random.default_rng(7)
+    for _trial in range(200):
+        length = int(rng.integers(1, 501))
+        vector = rng.random(length).round(2).astype(dtype)
+        for k in (0, 1, 5, 30, length, length + 3):
+            expected = np.argsort(-vector, kind="stable")[:k]
+            np.testing.assert_array_equal(_top_k_desc(vector, k), expected.astype(np.int64))
+
+
+def test_top_k_desc_tie_at_boundary() -> None:
+    from port_entity_matching.candidates import _top_k_desc
+
+    vector = np.asarray([0.5, 0.9, 0.5, 0.5], dtype=np.float32)
+    assert _top_k_desc(vector, 2).tolist() == [1, 0]
+
+
+def test_hangul_window_selection_matches_scalar_reference() -> None:
+    from rapidfuzz.distance import Levenshtein as _Lev
+
+    from port_entity_matching.candidates import _hangul_tonnage, _prepare
+
+    names = ["GLOVIS SPIRIT", "SPIRIT GLOVIS", "OTHER SHIP", "GLOVIS HO", "SHINING ROAD"]
+    entries = [(f"V{i:04d}", names[i % len(names)], 1001.0 + i % 3) for i in range(300)]
+    index = CatalogIndex.build(_catalog_frame(entries))
+    record = _record("s", "글로비스 스피릿", gross_tonnage=1000.0)
+    config = MatchConfig(hangul_window_keep=50)
+    item = _prepare(record)
+    window, _exact = _hangul_tonnage(item, index, config)
+    assert len(window) == 50
+
+    def _scalar(position: int) -> float:
+        base = max(
+            0.5
+            * (
+                _Lev.normalized_similarity(c, index.key2_cons[position])
+                + _Lev.normalized_similarity(v, index.key2_vow[position])
+            )
+            for c, v in zip(item.cons_keys, item.vowel_keys, strict=True)
+        )
+        keys = [key for key in item.sorted_cons if key]
+        sorted_sim = (
+            max(_Lev.normalized_similarity(key, index.sorted_key2_cons[position]) for key in keys) if keys else 0.0
+        )
+        return max(base, sorted_sim)
+
+    full_window = index.gt_range(900.0, 1100.0).tolist()
+    expected = sorted(full_window, key=lambda p: (-_scalar(p), p))[:50]
+    expected_set = set(expected) | set(index.gt_exact(1000.0).tolist())
+    assert set(window.tolist()) == expected_set
+    assert window.tolist() == sorted(expected_set)
+
+
+def test_candidate_sets_match_scalar_reference_path() -> None:
+    index = CatalogIndex.build(
+        _catalog_frame(
+            [
+                ("V0", "Stena Promise", 15000.0),
+                ("V1", "Stena Premium", 16000.0),
+                ("V2", "Hanjin Seattle", 17000.0),
+                ("V3", "Glovis Spirit", 64650.0),
+            ]
+        )
+    )
+    records = [_record("s1", "STENA PROMIISE"), _record("s2", "글로비스 스피릿", international_gross_tonnage=64824.0)]
+    config = MatchConfig()
+    actual = generate_candidates(records, index, None, config)
+    expected = [([0, 1, 2, 3], [97, 97, 33, 33]), ([0, 1, 2, 3], [33, 33, 33, 99])]
+    for result, (positions, sources) in zip(actual, expected, strict=True):
+        assert result.positions.tolist() == positions
+        assert result.sources.tolist() == sources

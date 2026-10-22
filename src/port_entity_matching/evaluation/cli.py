@@ -21,7 +21,10 @@ from typing import Any, cast
 import numpy as np
 import pandas as pd
 
+from port_entity_matching.catalog import CatalogIndex
 from port_entity_matching.config import MatchConfig, config_from_dict, config_to_dict
+from port_entity_matching.evaluation.cache import CandidateCache
+from port_entity_matching.evaluation.paths import guard_data_path
 from port_entity_matching.evaluation.perturb import PERTURBATIONS, perturb_record
 from port_entity_matching.evaluation.stats import (
     OOF_COLUMNS,
@@ -90,6 +93,8 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="KEY=VALUE",
         help="override one MatchConfig field; repeatable",
     )
+    common.add_argument("--cache-dir", type=Path, default=Path("artifacts/cache/candidates"))
+    common.add_argument("--no-cache", action="store_true")
 
     cv = subparsers.add_parser("cv", parents=[common], help="run vessel-disjoint cross-validation")
     cv.add_argument("--train", required=True, type=Path, help="training CSV with target_vessel_id")
@@ -121,7 +126,22 @@ def _run_cv(args: argparse.Namespace) -> int:
     config = parse_overrides(_overrides(args))
     train, catalog = _load_data(args)
     out_dir = _prepare_out_dir(args.out_dir)
-    run = cross_validate_run(train, catalog, config, scenarios=None)
+    index = CatalogIndex.build(catalog)
+    cache = _open_cache(args, catalog, config)
+    try:
+        if cache is None:
+            run = cross_validate_run(train, catalog, config, scenarios=None, index=index)
+        else:
+            run = cross_validate_run(
+                train,
+                catalog,
+                config,
+                scenarios=None,
+                candidate_fn=lambda records: cache.fetch(records, index, config),
+                index=index,
+            )
+    finally:
+        _flush_cache(cache)
     clean = _clean_rows(run.oof)
     _write_oof(out_dir / "oof.csv", clean)
     summary = _cv_summary(clean, config, time.perf_counter() - started)
@@ -147,15 +167,32 @@ def _run_stress(args: argparse.Namespace) -> int:
     out_dir = _prepare_out_dir(args.out_dir)
     seed = int(args.perturb_seed)
     scenario_map = {name: (lambda record, s=name: perturb_record(record, s, seed)) for name in scenarios}
-    run = cross_validate_run(train, catalog, config, scenarios=scenario_map)
+    index = CatalogIndex.build(catalog)
+    cache = _open_cache(args, catalog, config)
+    try:
+        if cache is None:
+            run = cross_validate_run(train, catalog, config, scenarios=scenario_map, index=index)
+        else:
+            run = cross_validate_run(
+                train,
+                catalog,
+                config,
+                scenarios=scenario_map,
+                candidate_fn=lambda records: cache.fetch(records, index, config),
+                index=index,
+            )
+    finally:
+        _flush_cache(cache)
     _write_oof(out_dir / "oof_long.csv", run.oof)
     report = {name: _stress_entry(run.oof, name) for name in scenarios}
     _write_json(out_dir / "stress.json", report)
     suite = suite_scores(run.oof, scenarios)
     _write_json(
         out_dir / "suite.json",
-        {group: {key: _number(value) if isinstance(value, float) else value for key, value in entry.items()}
-         for group, entry in suite.items()},
+        {
+            group: {key: _number(value) if isinstance(value, float) else value for key, value in entry.items()}
+            for group, entry in suite.items()
+        },
     )
     logger.info(
         "[EVAL] suite all_score=%s seen_score=%s unseen_score=%s",
@@ -268,10 +305,7 @@ def _cv_summary(clean: pd.DataFrame, config: MatchConfig, elapsed: float) -> dic
         "kor": float(retrieved[hangul].mean()) if bool(hangul.any()) else math.nan,
         "lat": float(retrieved[~hangul].mean()) if bool((~hangul).any()) else math.nan,
     }
-    intervals = {
-        key: [_number(low), _number(high)]
-        for key, (low, high) in vessel_bootstrap_ci(clean).items()
-    }
+    intervals = {key: [_number(low), _number(high)] for key, (low, high) in vessel_bootstrap_ci(clean).items()}
     return {
         "config": config_to_dict(config),
         "kor": _number(scores["kor"]),
@@ -334,11 +368,24 @@ def _prepare_out_dir(path: Path) -> Path:
 
 
 def _guard_data_path(path: Path) -> Path:
-    """Resolve a path and reject any location inside a directory named 'data'."""
-    resolved = path.expanduser().resolve()
-    if "data" in resolved.parts:
-        raise ValueError(f"Refusing to write evaluation outputs inside a data directory: {resolved}")
+    resolved: Path = guard_data_path(Path(path))
     return resolved
+
+
+def _open_cache(args: argparse.Namespace, catalog: pd.DataFrame, config: MatchConfig) -> CandidateCache | None:
+    """Open the candidate cache unless --no-cache is given."""
+    if bool(getattr(args, "no_cache", False)):
+        return None
+    return CandidateCache.open(args.cache_dir, catalog, config)
+
+
+def _flush_cache(cache: CandidateCache | None) -> None:
+    """Flush the cache and log hit/miss statistics."""
+    if cache is None:
+        return
+    cache.flush()
+    hits, misses = cache.stats
+    logger.info("[SYS] candidate_cache hits=%d misses=%d fingerprint=%s", hits, misses, cache.fingerprint)
 
 
 def _write_oof(path: Path, frame: pd.DataFrame) -> None:
