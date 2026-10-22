@@ -339,6 +339,90 @@ The v2 baseline suite scores are:
 
 Each scenario is one distortion family of equal importance, so the group score is the unweighted mean of the per-scenario accuracies plus the clean item — never a row-count weighted average. These are the reference that the following parts have to beat.
 
+**Notation fixes (measured).** Each step was measured with the full stress suite (5 folds, 20 scenarios):
+
+| Run | Change | Clean score (K errors) | Suite all | Seen | Unseen |
+|---|---|---|---|---|---|
+| `v2_suite` | v2 baseline | 0.9875 (21) | 0.8162 | 0.8154 | 0.8516 |
+| `p2_notation` | + notation and tonnage-noise augmentation | 0.9875 (21) | 0.8832 | 0.8674 | 0.9276 |
+| `p3_retrieval` | + sorted-key and token-index retrieval, 7 order-invariant features | 0.9940 (10) | 0.9391 | 0.9185 | 0.9831 |
+| `speed_p2` | + OSA prefilter, per-record augmentation RNG, 6 threads (new baseline) | 0.9917 (14) | 0.9370 | 0.9159 | 0.9818 |
+
+- Token reversal and rotation are solved: Latin reversal accuracy 0.486 → 0.999, Korean reversal 0.392 → 0.953.
+- The unseen families improve as well (0.8516 → 0.98), so the gain is not limited to the augmented families.
+- The remaining weak spot is a dropped token:
+  - Latin accuracy 0.658 with recall 0.836;
+  - Korean accuracy 0.701 with recall 0.954.
+
+**New baseline (`speed_p2`).** The −0.0023 clean change vs `p3_retrieval` is four Korean rows.
+- Thread count is not the cause: the same fold trained with 4, 6 and 8 threads differs by at most 1e-12 in score.
+- The OSA prefilter is not the cause: every Latin accuracy and recall is unchanged.
+- What remains is the augmentation draw (per-record instead of sequential RNG). The seed study (E31) shows ±1.5 Korean errors from the draw alone, and one 3–4-row vessel flips the count by 3–4.
+
+**Evaluation runtime.** A stage profile of the Part 3 code (3,440 s per stress run) showed the following costs:
+- Latin retrieval: two full unrestricted Damerau–Levenshtein cdists against 78,595 catalog names (16.8 ms/row), one third of it spent on full `argsort`;
+- re-retrieval: every training record was retrieved again in 4 of 5 folds and in every run;
+- LightGBM fitting.
+
+Changes:
+- **Output-identical:**
+  - top-k selection instead of a full sort;
+  - batched Hangul window scoring;
+  - a content-addressed candidate cache under `artifacts/cache/candidates/`, keyed by record content and fingerprinted by retrieval code, catalog contents and retrieval config.
+  - Verified byte-identical OOF against `p3_retrieval`.
+- **Output-changing:**
+  - OSA prefilter (top 200) with Damerau–Levenshtein rescoring;
+  - per-record augmentation RNG, so copies are fold-invariant and hit the cache;
+  - `num_threads` 6.
+
+| Run | Elapsed | Per fold: retrieve / features / fit / score (s) | Peak RSS |
+|---|---|---|---|
+| Part 3 code | 3,440 s | — | — |
+| Exact changes, cold cache | 2,037 s | 150–314 / 41 / 155 / 17 | 1.9 GB |
+| Exact changes, warm cache | 1,094 s | 0.4 / 42 / 155 / 18 | 2.6 GB |
+| All changes, cold cache | 1,060 s | 20–58 / 42 / 123 / 13 | 2.1 GB |
+| All changes, warm cache | 896 s | 0.4 / 42 / 123 / 13 | 2.5 GB |
+
+- Fitting now dominates: one LightGBM member takes ≈ 23 s on 2.1 M pairs, and 8 threads give only 10%.
+- Protocol:
+  - screen candidates with `--set ensemble_size=1` on a warm cache;
+  - confirm finalists with 5 members.
+  - A retrieval change invalidates the cache automatically through the fingerprint.
+
+**Retrieval config sweep (5 members, vs `speed_p2`).**
+
+| Run | Change | Clean score (K errors) | Suite all | Seen | Unseen |
+|---|---|---|---|---|---|
+| `speed_p2` | baseline (window 0.10, rare-token df ≤ 50) | 0.9917 (14) | 0.9370 | 0.9159 | 0.9818 |
+| `sweep_w020` | `hangul_tonnage_window=0.20` | 0.9934 (11) | 0.9454 | 0.9287 | 0.9824 |
+| `sweep_w025` | `hangul_tonnage_window=0.25` | 0.9934 (11) | 0.9482 | 0.9292 | 0.9881 |
+| `exp_w025_k300_rt5000` | + `hangul_window_keep=300`, `rare_token_max_df=5000` | 0.9905 (16) | 0.9466 | 0.9312 | 0.9807 |
+| `exp_w025_rt5000` | + `rare_token_max_df=5000` (**adopted**) | 0.9910 (15) | 0.9477 | 0.9288 | 0.9869 |
+
+- **Wider Korean tonnage window:**
+  - With window 0.25, the Korean tonnage scenarios reach 0.97: ±10–20% noise goes 0.900 → 0.971, ×0.90 goes 0.901 → 0.971, and ×1.12 goes 0.909 → 0.973.
+  - The trade-off: the 200-candidate keep budget inside the wider window loses Korean token-drop recall (0.954 → 0.883).
+  - Raising the keep budget to 300 did not pay off.
+- **Rare-token source:**
+  - Error analysis of `lat_token_dropped` (1,471 unretrieved rows) found two causes:
+    - 48% have a remaining token absent from the catalog vocabulary (a typo inside the token, which needs fuzzy token lookup);
+    - most of the rest have a remaining token with document frequency 50–350, above the rare-token cap of 50.
+  - The rare-token source already requires the ±6% Latin tonnage window, so raising the cap to 5000 adds few candidates.
+  - Result: Latin token-drop recall 0.836 → 0.898, accuracy 0.657 → 0.685, with clean Latin accuracy unchanged.
+- **Korean clean errors are noise here:** they move between 11 and 16 across runs whose Korean retrieval is identical, because Latin rows share the ranker's training data. Within the E31 band.
+- **Adopted defaults:** `hangul_tonnage_window=0.25`, `rare_token_max_df=5000`.
+
+**Final model (2026-10-22).**
+- Retrained on all rows: 2,685,242 pairs, 21,665 groups, 5 members.
+- Two retrains are byte-identical.
+- ZIP: 25 entries, 3.1 MB, no `evaluation/`, smoke test passed.
+- 3,000-row rehearsal: 15.2 s, peak RSS 388 MB.
+- `artifacts/cv_oof.csv` now records the `exp_w025_rt5000` clean OOF, which is the regression guard's reference.
+
+**Open after the final model:**
+- Latin token-drop recall is 0.898 against the 0.97 target. The remaining half needs typo-tolerant token lookup, such as matching a query token to catalog tokens within one edit.
+- Korean token-drop accuracy is 0.65 (recall 0.883).
+
 ### Decisions
 - **No LLMs or large neural models.** CPU rules plus a learned transliteration cost and a GBDT ranker already reach the target. This keeps inference time and ZIP size small, which are the tie-breakers, and avoids synthetic-label compliance questions.
 - **Call-sign memory: adopted as a deterministic override.** It is a lookup table fitted on `train.csv` (allowed training artifact, row-independent). The hash is a stable vessel identity: 1:1 in train and invariant to renames and script. It has no effect if test is vessel-disjoint and is exact otherwise. Vessel-disjoint CV cannot learn its weight, so it is applied as a rule after ranking rather than as a ranker feature. Its effect is measured by an on/off LB probe.

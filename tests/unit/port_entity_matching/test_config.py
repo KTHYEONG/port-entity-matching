@@ -42,8 +42,8 @@ def test_old_manifest_uses_token_retrieval_defaults() -> None:
 
 
 def test_hangul_tonnage_window_default_and_round_trip() -> None:
-    assert MatchConfig().hangul_tonnage_window == 0.10
-    assert config_from_dict({"name_top_k": 5}).hangul_tonnage_window == 0.10
+    assert MatchConfig().hangul_tonnage_window == 0.25
+    assert config_from_dict({"name_top_k": 5}).hangul_tonnage_window == 0.25
     assert config_from_dict({"hangul_tonnage_window": 0.08}).hangul_tonnage_window == 0.08
     assert config_from_dict(config_to_dict(MatchConfig(hangul_tonnage_window=0.08))).hangul_tonnage_window == 0.08
 

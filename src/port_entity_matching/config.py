@@ -19,10 +19,10 @@ class MatchConfig:
     latin_prefilter_k: int = 200
     hangul_key_top_k: int = 30
     tonnage_window: float = 0.06
-    hangul_tonnage_window: float = 0.10
+    hangul_tonnage_window: float = 0.25
     hangul_window_keep: int = 200
     latin_exact_gt_cap: int = 50
-    rare_token_max_df: int = 50
+    rare_token_max_df: int = 5000
     rare_token_min_len: int = 3
     token_top_k: int = 30
     token_df_cap: int = 2000

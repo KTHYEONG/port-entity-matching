@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from pathlib import Path
 
 import pandas as pd
@@ -20,6 +21,15 @@ from port_entity_matching.evaluation.cli import (
 )
 from port_entity_matching.evaluation.perturb import PERTURBATIONS
 from port_entity_matching.evaluation.stats import OOF_COLUMNS
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _isolated_cwd(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
+    # The default --cache-dir is relative; keep it out of the repository's artifacts/.
+    # Module scope so that the module-scoped CLI fixtures also run inside the temp directory.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.chdir(tmp_path_factory.mktemp("cwd"))
+        yield
 
 _VESSELS: list[tuple[str, str, str, int, str, str]] = [
     ("V00", "KAROS", "카로스", 1000, "Tanker", "Panama"),

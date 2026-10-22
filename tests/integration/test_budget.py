@@ -80,8 +80,7 @@ def test_full_data_cv_reproduces_the_recorded_run() -> None:
         pytest.skip(f"recorded OOF run not available at {recorded_path}")
     train = read_csv_checked(TRAIN_PATH, (*RECORD_COLUMNS, "target_vessel_id"))
     catalog = read_csv_checked(CATALOG_PATH, CATALOG_COLUMNS)
-    # Replay the recorded pre-notation run without replacing the production artifacts.
-    run = cross_validate_run(train, catalog, MatchConfig(augment_notation=False))
+    run = cross_validate_run(train, catalog, MatchConfig())
     clean = run.oof[run.oof["scenario"] == "clean"].set_index("sample_id")
     recorded = pd.read_csv(recorded_path).set_index("sample_id")
     assert set(clean.index) == set(recorded.index)
