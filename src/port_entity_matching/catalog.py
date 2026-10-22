@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -14,6 +15,8 @@ from port_entity_matching.normalize import (
     latin_phonetic_key,
     latin_phonetic_key_v2,
     latin_tokens,
+    latin_word_keys,
+    sorted_token_key,
 )
 
 __all__ = ["CatalogIndex"]
@@ -39,6 +42,10 @@ class CatalogIndex:
     flag: tuple[str, ...]
     same_gt_count: NDArray[np.int64]
     token_df: dict[str, int]
+    sorted_canonical: list[str]
+    word_keys: list[tuple[str, ...]]
+    sorted_key2_cons: list[str]
+    word_key_df: dict[str, int]
     id_to_pos: dict[str, int]
     _gt_values: NDArray[np.float64] = field(
         init=False, repr=False, default_factory=lambda: np.empty(0, dtype=np.float64)
@@ -47,6 +54,7 @@ class CatalogIndex:
         init=False, repr=False, default_factory=lambda: np.empty(0, dtype=np.int64)
     )
     _postings: dict[str, NDArray[np.int64]] = field(init=False, repr=False, default_factory=dict)
+    _word_postings: dict[str, NDArray[np.int64]] = field(init=False, repr=False, default_factory=dict)
 
     @classmethod
     def build(cls, catalog: pd.DataFrame) -> CatalogIndex:
@@ -72,8 +80,16 @@ class CatalogIndex:
         key2_cons = [latin_phonetic_key_v2(name, False) for name in names]
         key2_vow = [latin_phonetic_key_v2(name, True) for name in names]
         gt = _gross_tonnages(catalog["gross_tonnage"])
-        vessel_type = tuple(_as_text(value) for value in catalog["vessel_type"].tolist()) if "vessel_type" in catalog.columns else tuple("" for _ in names)
-        flag = tuple(_as_text(value) for value in catalog["flag_name"].tolist()) if "flag_name" in catalog.columns else tuple("" for _ in names)
+        vessel_type = (
+            tuple(_as_text(value) for value in catalog["vessel_type"].tolist())
+            if "vessel_type" in catalog.columns
+            else tuple("" for _ in names)
+        )
+        flag = (
+            tuple(_as_text(value) for value in catalog["flag_name"].tolist())
+            if "flag_name" in catalog.columns
+            else tuple("" for _ in names)
+        )
 
         id_to_pos = {vessel_id: position for position, vessel_id in enumerate(vessel_ids)}
         postings_lists: dict[str, list[int]] = {}
@@ -82,6 +98,16 @@ class CatalogIndex:
                 postings_lists.setdefault(token, []).append(position)
         postings = {token: np.asarray(positions, dtype=np.int64) for token, positions in postings_lists.items()}
         token_df = {token: len(positions) for token, positions in postings_lists.items()}
+
+        word_keys = [latin_word_keys(name) for name in names]
+        sorted_canonical = [sorted_token_key(latin_tokens(name)) for name in names]
+        sorted_key2_cons = [sorted_token_key(keys) for keys in word_keys]
+        word_postings_lists: dict[str, list[int]] = {}
+        for position, keys in enumerate(word_keys):
+            for key in set(keys):
+                word_postings_lists.setdefault(key, []).append(position)
+        word_postings = {key: np.asarray(positions, dtype=np.int64) for key, positions in word_postings_lists.items()}
+        word_key_df = {key: len(positions) for key, positions in word_postings_lists.items()}
 
         finite_positions = np.flatnonzero(np.isfinite(gt))
         order = np.argsort(gt[finite_positions], kind="stable")
@@ -100,11 +126,16 @@ class CatalogIndex:
             flag=flag,
             same_gt_count=_same_gt_counts(gt),
             token_df=token_df,
+            sorted_canonical=sorted_canonical,
+            word_keys=word_keys,
+            sorted_key2_cons=sorted_key2_cons,
+            word_key_df=word_key_df,
             id_to_pos=id_to_pos,
         )
         object.__setattr__(index, "_gt_values", gt[finite_positions][order])
         object.__setattr__(index, "_gt_positions", finite_positions[order].astype(np.int64))
         object.__setattr__(index, "_postings", postings)
+        object.__setattr__(index, "_word_postings", word_postings)
         return index
 
     def __len__(self) -> int:
@@ -133,6 +164,21 @@ class CatalogIndex:
         if postings is None:
             return np.empty(0, dtype=np.int64)
         return postings
+
+    def word_key_postings(self, key: str) -> NDArray[np.int64]:
+        """Ascending positions whose word_keys contain key; empty array if unknown."""
+        postings = self._word_postings.get(key)
+        if postings is None:
+            return np.empty(0, dtype=np.int64)
+        return postings
+
+    def token_idf(self, token: str) -> float:
+        """Log IDF of a Latin token over catalog rows."""
+        return math.log((len(self) + 1) / (self.token_df.get(token, 0) + 1))
+
+    def word_key_idf(self, key: str) -> float:
+        """Log IDF of a word key over catalog rows."""
+        return math.log((len(self) + 1) / (self.word_key_df.get(key, 0) + 1))
 
 
 def _as_text(value: object) -> str:

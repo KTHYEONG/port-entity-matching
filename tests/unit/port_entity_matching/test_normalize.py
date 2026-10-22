@@ -11,12 +11,15 @@ from port_entity_matching.normalize import (
     digit_tokens,
     hangul_phonetic_key,
     hangul_phonetic_key_v2,
+    hangul_token_keys,
     hangul_variants,
     is_hangul_name,
     latin_phonetic_key,
     latin_phonetic_key_v2,
     latin_tokens,
+    latin_word_keys,
     normalize_text,
+    sorted_token_key,
 )
 
 
@@ -147,9 +150,21 @@ def test_empty_and_nonstring_normalization(value: object) -> None:
 
 @pytest.mark.parametrize(
     ("value", "expected"),
-    [("TION", "SN"), ("SION", "SN"), ("PH", "P"), ("CH", "J"),
-     ("SH", "S"), ("TH", "S"), ("CK", "K"), ("QU", "K"),
-     ("X", "KS"), ("CE", "S"), ("GE", "J"), ("GH", ""), ("NG", "N")],
+    [
+        ("TION", "SN"),
+        ("SION", "SN"),
+        ("PH", "P"),
+        ("CH", "J"),
+        ("SH", "S"),
+        ("TH", "S"),
+        ("CK", "K"),
+        ("QU", "K"),
+        ("X", "KS"),
+        ("CE", "S"),
+        ("GE", "J"),
+        ("GH", ""),
+        ("NG", "N"),
+    ],
 )
 def test_ordered_latin_rewrites(value: str, expected: str) -> None:
     assert latin_phonetic_key(value, False) == expected
@@ -237,3 +252,16 @@ def test_v2_key_handles_latin_runs_inside_hangul_literals() -> None:
 
 def test_v2_key_keeps_digits_inside_mixed_words() -> None:
     assert latin_phonetic_key_v2("MSK1", with_vowels=False) == "MSK1"
+
+
+def test_sorted_token_key_is_order_invariant() -> None:
+    assert sorted_token_key(("STAR", "BLUE")) == sorted_token_key(("BLUE", "STAR")) == "BLUESTAR"
+    assert sorted_token_key(("STAR", "", "BLUE")) == "BLUESTAR"
+    assert sorted_token_key(()) == ""
+
+
+def test_hangul_token_keys_match_latin_word_keys() -> None:
+    assert sorted_token_key(hangul_token_keys("슈프림 글로비스")) == sorted_token_key(latin_word_keys("GLOBIS SUPREME"))
+    assert latin_word_keys("GLOBIS SUPREME") == tuple(
+        latin_phonetic_key_v2(word, False) for word in latin_tokens("GLOBIS SUPREME")
+    )

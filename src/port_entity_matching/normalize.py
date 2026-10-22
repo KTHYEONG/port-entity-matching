@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Sequence
 from functools import lru_cache
 
 __all__ = [
@@ -21,12 +22,15 @@ __all__ = [
     "digit_tokens",
     "hangul_phonetic_key",
     "hangul_phonetic_key_v2",
+    "hangul_token_keys",
     "hangul_variants",
     "is_hangul_name",
     "latin_phonetic_key",
     "latin_phonetic_key_v2",
     "latin_tokens",
+    "latin_word_keys",
     "normalize_text",
+    "sorted_token_key",
 ]
 
 _WHITESPACE_RE = re.compile(r"\s+")
@@ -489,6 +493,23 @@ def _latin_v2_word_key(word: str, with_vowels: bool) -> str:
 
 def _strip_vessel_prefix(text: str) -> str:
     return _VESSEL_PREFIX_RE.sub("", text, count=1)
+
+
+def sorted_token_key(tokens: Sequence[str]) -> str:
+    """Concatenation of the non-empty tokens in sorted order."""
+    return "".join(sorted(token for token in tokens if token))
+
+
+def latin_word_keys(value: object) -> tuple[str, ...]:
+    """Key-v2 consonant key of each latin_tokens word."""
+    return tuple(key for key in (latin_phonetic_key_v2(word, False) for word in latin_tokens(value)) if key)
+
+
+def hangul_token_keys(literal: str) -> tuple[str, ...]:
+    """Key-v2 consonant key of each whitespace token of a Hangul literal."""
+    return tuple(
+        key for key in (hangul_phonetic_key_v2(token, False) for token in normalize_text(literal).split()) if key
+    )
 
 
 def _collapse(text: str) -> str:

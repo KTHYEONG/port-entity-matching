@@ -154,9 +154,27 @@ def _korean_index() -> CatalogIndex:
     return CatalogIndex.build(
         pd.DataFrame(
             [
-                {"vessel_id": "H0", "vessel_name": "HEUNG A", "gross_tonnage": 100, "vessel_type": "Tanker", "flag_name": "Panama"},
-                {"vessel_id": "H1", "vessel_name": "OTHER SHIP", "gross_tonnage": 200, "vessel_type": "Tanker", "flag_name": "Panama"},
-                {"vessel_id": "H2", "vessel_name": "HEUNG A", "gross_tonnage": 300, "vessel_type": "Tanker", "flag_name": "Panama"},
+                {
+                    "vessel_id": "H0",
+                    "vessel_name": "HEUNG A",
+                    "gross_tonnage": 100,
+                    "vessel_type": "Tanker",
+                    "flag_name": "Panama",
+                },
+                {
+                    "vessel_id": "H1",
+                    "vessel_name": "OTHER SHIP",
+                    "gross_tonnage": 200,
+                    "vessel_type": "Tanker",
+                    "flag_name": "Panama",
+                },
+                {
+                    "vessel_id": "H2",
+                    "vessel_name": "HEUNG A",
+                    "gross_tonnage": 300,
+                    "vessel_type": "Tanker",
+                    "flag_name": "Panama",
+                },
             ]
         )
     )
@@ -266,8 +284,20 @@ def test_hangul_acronym_hit() -> None:
     index = CatalogIndex.build(
         pd.DataFrame(
             [
-                {"vessel_id": "K0", "vessel_name": "KMTC VENTURE", "gross_tonnage": 100, "vessel_type": "Tanker", "flag_name": "Panama"},
-                {"vessel_id": "K1", "vessel_name": "OTHER SHIP", "gross_tonnage": 100, "vessel_type": "Tanker", "flag_name": "Panama"},
+                {
+                    "vessel_id": "K0",
+                    "vessel_name": "KMTC VENTURE",
+                    "gross_tonnage": 100,
+                    "vessel_type": "Tanker",
+                    "flag_name": "Panama",
+                },
+                {
+                    "vessel_id": "K1",
+                    "vessel_name": "OTHER SHIP",
+                    "gross_tonnage": 100,
+                    "vessel_type": "Tanker",
+                    "flag_name": "Panama",
+                },
             ]
         )
     )
@@ -280,7 +310,13 @@ def test_missing_catalog_tonnage_is_nan() -> None:
     index = CatalogIndex.build(
         pd.DataFrame(
             [
-                {"vessel_id": "G0", "vessel_name": "Alpha", "gross_tonnage": None, "vessel_type": "Tanker", "flag_name": "Panama"},
+                {
+                    "vessel_id": "G0",
+                    "vessel_name": "Alpha",
+                    "gross_tonnage": None,
+                    "vessel_type": "Tanker",
+                    "flag_name": "Panama",
+                },
             ]
         )
     )
@@ -294,7 +330,13 @@ def test_empty_canonical_names_yield_nan_prefix() -> None:
     index = CatalogIndex.build(
         pd.DataFrame(
             [
-                {"vessel_id": "E0", "vessel_name": "###", "gross_tonnage": 100, "vessel_type": "Tanker", "flag_name": "Panama"},
+                {
+                    "vessel_id": "E0",
+                    "vessel_name": "###",
+                    "gross_tonnage": 100,
+                    "vessel_type": "Tanker",
+                    "flag_name": "Panama",
+                },
             ]
         )
     )
@@ -303,9 +345,15 @@ def test_empty_canonical_names_yield_nan_prefix() -> None:
 
 
 def test_missing_catalog_tonnage_does_not_become_a_mismatch() -> None:
-    index = CatalogIndex.build(pd.DataFrame({
-        "vessel_id": ["A", "B"], "vessel_name": ["Alpha", "Beta"], "gross_tonnage": [100, np.nan],
-    }))
+    index = CatalogIndex.build(
+        pd.DataFrame(
+            {
+                "vessel_id": ["A", "B"],
+                "vessel_name": ["Alpha", "Beta"],
+                "gross_tonnage": [100, np.nan],
+            }
+        )
+    )
     matrix = _build([_record("Alpha", igt=100, gt=100)], [_candidate_set([0, 1])], index)
     assert matrix[0, _column("any_exact")] == 1
     assert np.isnan(matrix[1, _column("any_exact")])
@@ -320,9 +368,15 @@ def test_primary_ties_use_catalog_position_not_array_offset() -> None:
 
 @pytest.mark.parametrize("name", ["GRAND GRAND ACE 11", "케이엠티씨 희망호"])
 def test_rare_overlap_counts_shared_tokens_once(name: str) -> None:
-    index = CatalogIndex.build(pd.DataFrame({
-        "vessel_id": ["A"], "vessel_name": ["GRAND ACE 11 KMTC"], "gross_tonnage": [100],
-    }))
+    index = CatalogIndex.build(
+        pd.DataFrame(
+            {
+                "vessel_id": ["A"],
+                "vessel_name": ["GRAND ACE 11 KMTC"],
+                "gross_tonnage": [100],
+            }
+        )
+    )
     matrix = _build([_record(name)], [_candidate_set([0])], index)
     expected = 3 if name.startswith("GRAND") else 1
     assert matrix[0, _column("rare_token_overlap")] == expected
@@ -339,19 +393,36 @@ def test_shuffling_records_does_not_change_features() -> None:
 
 @pytest.mark.parametrize(("query", "catalog"), [(1e-300, 1e300), (1e300, 1e-300)])
 def test_log_tonnage_ratio_remains_finite_at_float_extremes(query: float, catalog: float) -> None:
-    index = CatalogIndex.build(pd.DataFrame({
-        "vessel_id": ["A"], "vessel_name": ["Alpha"], "gross_tonnage": [catalog],
-    }))
+    index = CatalogIndex.build(
+        pd.DataFrame(
+            {
+                "vessel_id": ["A"],
+                "vessel_name": ["Alpha"],
+                "gross_tonnage": [catalog],
+            }
+        )
+    )
     matrix = _build([_record("Alpha", igt=query)], [_candidate_set([0])], index)
     assert np.isfinite(matrix[0, _column("logratio_igt")])
     assert matrix[0, _column("logratio_igt")] == pytest.approx(np.log(query) - np.log(catalog), rel=1e-6)
 
 
-def test_feature_width_grows_to_forty_six() -> None:
+def test_feature_width_grows_to_fifty_three() -> None:
     matrix = _build([_record("GRAND ACE 11", igt=100)], [_candidate_set([0, 1, 2])])
-    assert matrix.shape[1] == len(FEATURE_NAMES) == 46
+    assert matrix.shape[1] == len(FEATURE_NAMES) == 53
     assert FEATURE_NAMES[: len(_PREVIOUS_FEATURE_NAMES)] == _PREVIOUS_FEATURE_NAMES
-    assert FEATURE_NAMES[len(_PREVIOUS_FEATURE_NAMES):] == _KEY_V2_NAMES
+    assert (
+        FEATURE_NAMES[len(_PREVIOUS_FEATURE_NAMES) : len(_PREVIOUS_FEATURE_NAMES) + len(_KEY_V2_NAMES)] == _KEY_V2_NAMES
+    )
+    assert FEATURE_NAMES[len(_PREVIOUS_FEATURE_NAMES) + len(_KEY_V2_NAMES) :] == (
+        "name_sorted_sim",
+        "name_token_cover_query",
+        "name_token_cover_cand",
+        "name_token_fuzzy_cover",
+        "token_count_diff",
+        "src_sorted",
+        "src_token_index",
+    )
 
 
 def test_latin_rows_have_nan_key_v2_columns() -> None:
@@ -406,11 +477,15 @@ def test_key_v2_columns_keep_row_independence() -> None:
 
 @pytest.mark.parametrize("query", ["흥아호", "으", "흥아 KMTC 12"])
 def test_key_v2_similarities_match_scalar_scorers(query: str) -> None:
-    index = CatalogIndex.build(pd.DataFrame({
-        "vessel_id": ["A", "B", "C", "D"],
-        "vessel_name": ["HEUNG A", "HEUNG A HO", "###", "AEIOU"],
-        "gross_tonnage": [100] * 4,
-    }))
+    index = CatalogIndex.build(
+        pd.DataFrame(
+            {
+                "vessel_id": ["A", "B", "C", "D"],
+                "vessel_name": ["HEUNG A", "HEUNG A HO", "###", "AEIOU"],
+                "gross_tonnage": [100] * 4,
+            }
+        )
+    )
     positions = [3, 2, 0, 1]
     matrix = _build([_record(query)], [_candidate_set(positions)], index)
     variants = hangul_variants(query)
@@ -431,12 +506,143 @@ def test_key_v2_similarities_match_scalar_scorers(query: str) -> None:
 
 
 def test_key_v2_context_does_not_replace_v1_context() -> None:
-    index = CatalogIndex.build(pd.DataFrame({
-        "vessel_id": ["A", "B"], "vessel_name": ["EUNG A", "HEUNG A"], "gross_tonnage": [100, 100],
-    }))
+    index = CatalogIndex.build(
+        pd.DataFrame(
+            {
+                "vessel_id": ["A", "B"],
+                "vessel_name": ["EUNG A", "HEUNG A"],
+                "gross_tonnage": [100, 100],
+            }
+        )
+    )
     matrix = _build([_record("흥아")], [_candidate_set([0, 1])], index)
     np.testing.assert_array_equal(matrix[:, _column("primary_rank")], [1, 2])
     np.testing.assert_array_equal(matrix[:, _column("primary_gap")], [0, 0])
     np.testing.assert_array_equal(matrix[:, _column("kor2_primary_rank")], [2, 1])
     assert matrix[0, _column("kor2_primary_gap")] > 0
     assert matrix[1, _column("kor2_primary_gap")] == 0
+
+
+def _order_index() -> CatalogIndex:
+    return CatalogIndex.build(
+        pd.DataFrame(
+            [
+                {
+                    "vessel_id": "T",
+                    "vessel_name": "GOLDEN OCEAN PIONEER",
+                    "gross_tonnage": 1000,
+                    "vessel_type": "Container",
+                    "flag_name": "Panama",
+                },
+                {
+                    "vessel_id": "X",
+                    "vessel_name": "OTHER SHIP",
+                    "gross_tonnage": 2000,
+                    "vessel_type": "Container",
+                    "flag_name": "Panama",
+                },
+            ]
+        )
+    )
+
+
+def test_order_invariant_similarity_and_coverage() -> None:
+    index = _order_index()
+    matrix = _build([_record("PIONEER OCEAN GOLDEN")], [_candidate_set([0])], index)
+    assert matrix[0, _column("name_sorted_sim")] == pytest.approx(1.0)
+    assert matrix[0, _column("name_token_cover_query")] == pytest.approx(1.0)
+    assert matrix[0, _column("token_count_diff")] == pytest.approx(0.0)
+    assert matrix[0, _column("lat_dl_sim")] < 0.6
+
+
+def test_dropped_token_coverage() -> None:
+    index = _order_index()
+    matrix = _build([_record("GOLDEN PIONEER")], [_candidate_set([0])], index)
+    assert matrix[0, _column("name_token_cover_query")] == pytest.approx(1.0)
+    assert matrix[0, _column("name_token_cover_cand")] < 1.0
+    assert matrix[0, _column("token_count_diff")] == pytest.approx(1.0)
+
+
+def test_fuzzy_cover_tolerates_typos() -> None:
+    index = _order_index()
+    matrix = _build([_record("PIONEERR GOLDEN")], [_candidate_set([0])], index)
+    assert matrix[0, _column("name_token_fuzzy_cover")] == pytest.approx(1.0)
+
+
+def test_hangul_sorted_similarity_is_one() -> None:
+    index = CatalogIndex.build(
+        pd.DataFrame(
+            [
+                {
+                    "vessel_id": "G",
+                    "vessel_name": "GLOBIS SUPREME",
+                    "gross_tonnage": 1000,
+                    "vessel_type": "Container",
+                    "flag_name": "Panama",
+                }
+            ]
+        )
+    )
+    matrix = _build([_record("슈프림 글로비스")], [_candidate_set([0])], index)
+    assert matrix[0, _column("name_sorted_sim")] == pytest.approx(1.0)
+
+
+def test_new_columns_have_no_unexpected_nan() -> None:
+    index = _order_index()
+    matrix = _build([_record("GOLDEN PIONEER")], [_candidate_set([0])], index)
+    assert matrix.shape[1] == len(FEATURE_NAMES)
+    for name in (
+        "name_sorted_sim",
+        "name_token_cover_query",
+        "name_token_cover_cand",
+        "token_count_diff",
+        "src_sorted",
+        "src_token_index",
+    ):
+        assert np.all(np.isfinite(matrix[:, _column(name)]))
+    unitless = _build([_record("###")], [_candidate_set([0])], index)
+    assert np.all(np.isnan(unitless[:, _column("name_token_fuzzy_cover")]))
+
+
+def test_mixed_empty_variant_keys_are_skipped() -> None:
+    index = CatalogIndex.build(
+        pd.DataFrame(
+            [{"vessel_id": "A", "vessel_name": "GLORY", "gross_tonnage": 100, "vessel_type": "T", "flag_name": "P"}]
+        )
+    )
+    matrix = _build([_record("아아호")], [_candidate_set([0])], index)
+    assert np.all(np.isfinite(matrix[:, _column("name_sorted_sim")]))
+
+
+def test_latin_fuzzy_against_unitless_candidate_is_zero() -> None:
+    index = CatalogIndex.build(
+        pd.DataFrame(
+            [{"vessel_id": "E0", "vessel_name": "###", "gross_tonnage": 100, "vessel_type": "T", "flag_name": "P"}]
+        )
+    )
+    matrix = _build([_record("GOLDEN PIONEER")], [_candidate_set([0])], index)
+    assert matrix[0, _column("name_token_fuzzy_cover")] == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize(
+    ("query", "candidate"),
+    [("BLUE BLUE STAR", "BLUE BLUE STAR"), ("슈프림 슈프림 글로비스", "SUPREME SUPREME GLOBIS")],
+)
+def test_repeated_tokens_preserved_in_sorted_similarity_and_counts(query: str, candidate: str) -> None:
+    index = CatalogIndex.build(pd.DataFrame({
+        "vessel_id": ["A", "B"], "vessel_name": [candidate, "OTHER SHIP"], "gross_tonnage": [100, 200],
+    }))
+    matrix = _build([_record(query)], [_candidate_set([0])], index)
+    for name in ("name_sorted_sim", "name_token_cover_query", "name_token_cover_cand", "name_token_fuzzy_cover"):
+        assert matrix[0, _column(name)] == pytest.approx(1.0)
+    assert matrix[0, _column("token_count_diff")] == 0
+    shorter = "BLUE STAR" if query.startswith("BLUE") else "슈프림 글로비스"
+    dropped = _build([_record(shorter)], [_candidate_set([0])], index)
+    assert dropped[0, _column("token_count_diff")] == 1
+    assert dropped[0, _column("name_sorted_sim")] < 1
+
+
+def test_fuzzy_cover_weights_repeated_query_occurrences() -> None:
+    index = _order_index()
+    matrix = _build([_record("GOLDEN GOLDEN UNKNOWN")], [_candidate_set([0])], index)
+    assert matrix[0, _column("name_token_fuzzy_cover")] == pytest.approx(12 / 19)

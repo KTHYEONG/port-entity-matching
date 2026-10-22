@@ -318,9 +318,7 @@ def test_notation_augmentation_adds_more_groups() -> None:
     index = CatalogIndex.build(_catalog_frame())
     train = _mixed_frame()
     maps = AttributeMaps.fit(train, index)
-    without = build_training_data(
-        train, index, maps, MatchConfig(augment=True, augment_notation=False, num_threads=1)
-    )
+    without = build_training_data(train, index, maps, MatchConfig(augment=True, augment_notation=False, num_threads=1))
     with_notation = build_training_data(
         train, index, maps, MatchConfig(augment=True, augment_notation=True, num_threads=1)
     )
@@ -333,16 +331,14 @@ def test_notation_ablation_is_exact() -> None:
     index = CatalogIndex.build(_catalog_frame())
     train = _train_frame()
     maps = AttributeMaps.fit(train, index)
-    data = build_training_data(
-        train, index, maps, MatchConfig(augment=True, augment_notation=False, num_threads=1)
-    )
+    data = build_training_data(train, index, maps, MatchConfig(augment=True, augment_notation=False, num_threads=1))
     assert len(data.group_sizes) == 27
     assert set(data.group_sizes) == {12}
     assert hashlib.sha256(data.labels.tobytes()).hexdigest() == (
         "f07a77955422d4a4c6bd8ef8b58216365c5071e1c44c276e35212039c0208c6b"
     )
     assert hashlib.sha256(data.features.tobytes()).hexdigest() == (
-        "ddd0d115d291d10791b7f08c7a66954b40a2a93e16c1e744ea079f136d1ab2b5"
+        "525c07cda3eddb645e442d1498b0ae9b21d6999fa3717341ebcef5d079fcb053"
     )
 
 
@@ -400,9 +396,9 @@ def test_maps_are_unaffected_by_augmentation(tmp_path) -> None:
     without_augmentation = fit_bundle(train, catalog, MatchConfig(augment=False, num_threads=1))
     with_augmentation.maps.to_json(tmp_path / "with.json")
     without_augmentation.maps.to_json(tmp_path / "without.json")
-    assert (tmp_path / "with.json").read_text(encoding="utf-8") == (
-        tmp_path / "without.json"
-    ).read_text(encoding="utf-8")
+    assert (tmp_path / "with.json").read_text(encoding="utf-8") == (tmp_path / "without.json").read_text(
+        encoding="utf-8"
+    )
 
 
 def test_fit_bundle_is_deterministic() -> None:

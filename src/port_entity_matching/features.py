@@ -15,7 +15,7 @@ from numpy.typing import NDArray
 from rapidfuzz import fuzz, process
 from rapidfuzz.distance import DamerauLevenshtein, Indel, JaroWinkler, Levenshtein
 
-from port_entity_matching.candidates import SRC_NAME, SRC_TOKEN, SRC_TONNAGE, CandidateSet
+from port_entity_matching.candidates import SRC_NAME, SRC_SORTED, SRC_TOKEN, SRC_TOKEN_INDEX, SRC_TONNAGE, CandidateSet
 from port_entity_matching.catalog import CatalogIndex
 from port_entity_matching.config import MatchConfig
 from port_entity_matching.maps import AttributeMaps
@@ -25,10 +25,12 @@ from port_entity_matching.normalize import (
     digit_tokens,
     hangul_phonetic_key,
     hangul_phonetic_key_v2,
+    hangul_token_keys,
     hangul_variants,
     is_hangul_name,
     latin_tokens,
     normalize_text,
+    sorted_token_key,
 )
 from port_entity_matching.records import QueryRecord
 
@@ -81,6 +83,13 @@ FEATURE_NAMES: tuple[str, ...] = (
     "kor2_vow_indel",
     "kor2_primary_gap",
     "kor2_primary_rank",
+    "name_sorted_sim",
+    "name_token_cover_query",
+    "name_token_cover_cand",
+    "name_token_fuzzy_cover",
+    "token_count_diff",
+    "src_sorted",
+    "src_token_index",
 )
 
 _LATIN_NAMES: tuple[str, ...] = (
@@ -148,6 +157,7 @@ def _record_features(
 
     _latin_columns(record, positions, index, columns, hangul)
     _hangul_columns(record, positions, index, columns, hangul)
+    _order_invariant_columns(record, positions, index, columns, config, hangul)
     _hangul_v2_columns(record, positions, index, columns, hangul)
     columns["rare_token_overlap"] = _rare_token_overlap(record, positions, index, config, hangul)
     _digit_columns(record, positions, index, columns)
@@ -260,11 +270,138 @@ def _hangul_v2_columns(
     columns["kor2_vow_indel"] = vowel_indel.max(axis=0)
 
     primary = (columns["kor2_cons_sim"] + columns["kor2_vow_sim"]) / 2.0
+    primary = np.maximum(primary, columns["name_sorted_sim"])
     columns["kor2_primary_gap"] = primary.max() - primary
     order = np.lexsort((positions, -primary))
     rank = np.empty(len(positions), dtype=np.float64)
     rank[order] = np.arange(1, len(positions) + 1)
     columns["kor2_primary_rank"] = rank
+
+
+def _order_invariant_columns(
+    record: QueryRecord,
+    positions: NDArray[np.int64],
+    index: CatalogIndex,
+    columns: dict[str, NDArray[np.float64]],
+    config: MatchConfig,
+    hangul: bool,
+) -> None:
+    size = len(positions)
+    threshold = config.token_match_threshold
+    if hangul:
+        variants = hangul_variants(record.vessel_name)
+        variant_keys = [hangul_token_keys(variant) for variant in variants]
+        query_sorted = [sorted_token_key(keys) for keys in variant_keys]
+        candidate_sorted = [index.sorted_key2_cons[position] for position in positions]
+        if variant_keys and any(query_sorted):
+            matrices = [
+                _cdist(key, candidate_sorted, Levenshtein.normalized_similarity) if key else np.zeros(size)
+                for key in query_sorted
+            ]
+            columns["name_sorted_sim"] = np.vstack(matrices).max(axis=0)
+        else:
+            columns["name_sorted_sim"] = np.zeros(size)
+        cover_q = np.zeros(size)
+        cover_c = np.zeros(size)
+        fuzzy = np.full(size, np.nan)
+        if variants and any(variant_keys):
+            has_units = False
+            for keys in variant_keys:
+                if not keys:
+                    continue
+                has_units = True
+                q_idf = {unit: index.word_key_idf(unit) for unit in keys}
+                q_sum = float(sum(q_idf.values()))
+                for offset, position in enumerate(positions):
+                    cand_set = set(index.word_keys[position])
+                    shared = [unit for unit in q_idf if unit in cand_set]
+                    numerator = sum(q_idf[unit] for unit in shared)
+                    cand_sum = float(sum(index.word_key_idf(unit) for unit in sorted(cand_set)))
+                    q_value = numerator / q_sum if q_sum > 0.0 else 0.0
+                    c_value = numerator / cand_sum if cand_sum > 0.0 else 0.0
+                    cover_q[offset] = max(cover_q[offset], q_value)
+                    cover_c[offset] = max(cover_c[offset], c_value)
+            if has_units:
+                fuzzy_vals = np.zeros(size)
+                for keys in variant_keys:
+                    if not keys:
+                        continue
+                    total_weight = float(sum(len(unit) for unit in keys))
+                    for offset, position in enumerate(positions):
+                        cand_units = tuple(set(index.word_keys[position]))
+                        if not cand_units:
+                            value = 0.0
+                        else:
+                            matched = 0.0
+                            for query_unit in keys:
+                                best = 0.0
+                                for cand_unit in cand_units:
+                                    similarity = Levenshtein.normalized_similarity(query_unit, cand_unit)
+                                    if similarity > best:
+                                        best = similarity
+                                        if best >= threshold:
+                                            break
+                                if best >= threshold:
+                                    matched += len(query_unit)
+                            value = matched / total_weight
+                        fuzzy_vals[offset] = max(fuzzy_vals[offset], value)
+                fuzzy = fuzzy_vals
+        columns["name_token_cover_query"] = cover_q
+        columns["name_token_cover_cand"] = cover_c
+        columns["name_token_fuzzy_cover"] = fuzzy
+        query_count = len(variant_keys[0]) if variants and variant_keys else 0
+        columns["token_count_diff"] = np.array(
+            [abs(query_count - len(index.word_keys[position])) for position in positions], dtype=np.float64
+        )
+    else:
+        query_tokens = latin_tokens(record.vessel_name)
+        query_sorted_key = sorted_token_key(query_tokens)
+        candidate_sorted = [index.sorted_canonical[position] for position in positions]
+        columns["name_sorted_sim"] = _cdist(
+            query_sorted_key, candidate_sorted, DamerauLevenshtein.normalized_similarity
+        )
+        if not query_tokens:
+            columns["name_token_cover_query"] = np.zeros(size)
+            columns["name_token_cover_cand"] = np.zeros(size)
+            columns["name_token_fuzzy_cover"] = np.full(size, np.nan)
+            columns["token_count_diff"] = np.array(
+                [len(latin_tokens(index.names[position])) for position in positions], dtype=np.float64
+            )
+            return
+        q_idf = {unit: index.token_idf(unit) for unit in query_tokens}
+        q_sum = float(sum(q_idf.values()))
+        total_weight = float(sum(len(unit) for unit in query_tokens))
+        cover_q = np.zeros(size)
+        cover_c = np.zeros(size)
+        fuzzy = np.zeros(size)
+        for offset, position in enumerate(positions):
+            cand_set = index.tokens[position]
+            shared = [unit for unit in q_idf if unit in cand_set]
+            numerator = sum(q_idf[unit] for unit in shared)
+            cover_q[offset] = numerator / q_sum if q_sum > 0.0 else 0.0
+            cand_sum = float(sum(index.token_idf(unit) for unit in sorted(cand_set)))
+            cover_c[offset] = numerator / cand_sum if cand_sum > 0.0 else 0.0
+            if not cand_set:
+                fuzzy[offset] = 0.0
+            else:
+                matched = 0.0
+                for query_unit in query_tokens:
+                    best = 0.0
+                    for cand_unit in cand_set:
+                        similarity = DamerauLevenshtein.normalized_similarity(query_unit, cand_unit)
+                        if similarity > best:
+                            best = similarity
+                            if best >= threshold:
+                                break
+                    if best >= threshold:
+                        matched += len(query_unit)
+                fuzzy[offset] = matched / total_weight if total_weight > 0.0 else 0.0
+        columns["name_token_cover_query"] = cover_q
+        columns["name_token_cover_cand"] = cover_c
+        columns["name_token_fuzzy_cover"] = fuzzy
+        columns["token_count_diff"] = np.array(
+            [abs(len(query_tokens) - len(latin_tokens(index.names[position]))) for position in positions], dtype=np.float64
+        )
 
 
 def _rare_token_overlap(
@@ -372,9 +509,7 @@ def _attribute_columns(
     columns["flag_logprob"] = np.array(
         [maps.flag_logprob(record.flag_name, index.flag[position]) for position in positions]
     )
-    columns["type_logprior"] = np.array(
-        [maps.type_logprior(index.vessel_type[position]) for position in positions]
-    )
+    columns["type_logprior"] = np.array([maps.type_logprior(index.vessel_type[position]) for position in positions])
 
 
 def _context_columns(
@@ -385,7 +520,10 @@ def _context_columns(
     hangul: bool,
 ) -> None:
     size = len(positions)
-    primary = (columns["kor_cons_sim"] + columns["kor_vow_sim"]) / 2.0 if hangul else columns["lat_dl_sim"]
+    if hangul:
+        primary = (columns["kor_cons_sim"] + columns["kor_vow_sim"]) / 2.0
+    else:
+        primary = np.maximum(columns["lat_dl_sim"], columns["name_sorted_sim"])
     finite = np.isfinite(primary)
     sortable = np.where(finite, primary, -np.inf)
     order = np.lexsort((positions, -sortable))
@@ -404,6 +542,8 @@ def _context_columns(
     columns["src_name"] = ((sources & SRC_NAME) > 0).astype(np.float64)
     columns["src_tonnage"] = ((sources & SRC_TONNAGE) > 0).astype(np.float64)
     columns["src_token"] = ((sources & SRC_TOKEN) > 0).astype(np.float64)
+    columns["src_sorted"] = ((sources & SRC_SORTED) > 0).astype(np.float64)
+    columns["src_token_index"] = ((sources & SRC_TOKEN_INDEX) > 0).astype(np.float64)
 
 
 def _cdist(query: str, choices: Sequence[str], scorer: Scorer) -> NDArray[np.float64]:

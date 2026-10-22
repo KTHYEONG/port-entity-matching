@@ -120,11 +120,16 @@ def test_names_and_keys_are_derived_from_vessel_name() -> None:
 
 
 def test_raw_attributes_and_nullable_tonnage() -> None:
-    frame = pd.DataFrame({
-        "vessel_id": ["A0", "A1"], "vessel_name": ["Alpha", "nan"],
-        "gross_tonnage": pd.Series([100, pd.NA], dtype="Float64"),
-        "vessel_type": [" Cargo ", "nan"], "flag_name": [" Panama ", "nan"],
-    }, index=[0, 1])
+    frame = pd.DataFrame(
+        {
+            "vessel_id": ["A0", "A1"],
+            "vessel_name": ["Alpha", "nan"],
+            "gross_tonnage": pd.Series([100, pd.NA], dtype="Float64"),
+            "vessel_type": [" Cargo ", "nan"],
+            "flag_name": [" Panama ", "nan"],
+        },
+        index=[0, 1],
+    )
     index = CatalogIndex.build(frame)
     assert index.vessel_type == (" Cargo ", "nan")
     assert index.flag == (" Panama ", "nan")
@@ -154,3 +159,22 @@ def test_key_v2_columns_align_with_catalog_rows() -> None:
     for position, name in enumerate(index.names):
         assert index.key2_cons[position] == latin_phonetic_key_v2(name, False)
         assert index.key2_vow[position] == latin_phonetic_key_v2(name, True)
+
+
+def test_sorted_and_word_key_fields() -> None:
+    frame = _catalog(
+        [
+            {"vessel_id": "A0", "vessel_name": "BLUE STAR", "gross_tonnage": 100},
+            {"vessel_id": "A1", "vessel_name": "STAR BLUE", "gross_tonnage": 200},
+            {"vessel_id": "A2", "vessel_name": "RED SUN", "gross_tonnage": 300},
+        ]
+    )
+    index = CatalogIndex.build(frame)
+    assert index.sorted_canonical[0] == index.sorted_canonical[1]
+    assert index.sorted_key2_cons[0] == index.sorted_key2_cons[1]
+    assert index.token_idf("STAR") < index.token_idf("RED")
+    from port_entity_matching.normalize import latin_phonetic_key_v2
+
+    star_key = latin_phonetic_key_v2("STAR", False)
+    assert index.word_key_postings(star_key).tolist() == [0, 1]
+    assert index.word_key_postings("UNKNOWN").tolist() == []

@@ -34,6 +34,13 @@ def test_missing_keys_use_defaults() -> None:
     assert config == MatchConfig(name_top_k=5)
 
 
+def test_old_manifest_uses_token_retrieval_defaults() -> None:
+    config = config_from_dict({"name_top_k": 5})
+    assert config.token_top_k == 30
+    assert config.token_df_cap == 2000
+    assert config.token_match_threshold == 0.8
+
+
 def test_hangul_tonnage_window_default_and_round_trip() -> None:
     assert MatchConfig().hangul_tonnage_window == 0.10
     assert config_from_dict({"name_top_k": 5}).hangul_tonnage_window == 0.10

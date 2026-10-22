@@ -23,6 +23,9 @@ class MatchConfig:
     latin_exact_gt_cap: int = 50
     rare_token_max_df: int = 50
     rare_token_min_len: int = 3
+    token_top_k: int = 30
+    token_df_cap: int = 2000
+    token_match_threshold: float = 0.8
     max_candidates: int = 400
     band_low: float = 0.025
     band_high: float = 0.055
