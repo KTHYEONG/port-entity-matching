@@ -104,3 +104,22 @@ dev = [
     "pytest-cov>=5.0.0",
     "ruff>=0.5.0",
 ]
+# Mirrors the evaluation server's preinstalled neural stack (never listed in the submitted requirements.txt).
+ml = [
+    "torch==2.7.1",
+    "transformers==4.57.6",
+    "accelerate==1.9.0",
+    "safetensors==0.6.2",
+    "sentencepiece==0.2.0",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv]
+default-groups = ["dev", "ml"]
