@@ -171,13 +171,22 @@ def test_fit_bundle_produces_ranker() -> None:
     assert bundle.maps.type_logprob("Tanker", "Tanker") > bundle.maps.type_logprob("Tanker", "Bulk")
 
 
-def test_cli_fit_writes_bundle(tmp_path) -> None:
+def test_cli_fit_writes_bundle(tmp_path, monkeypatch) -> None:
+    from port_entity_matching.transliterate import CachedTransliterator
+
+    monkeypatch.setattr(CachedTransliterator, "translate", lambda self, names: dict.fromkeys(names, ("GLOVIS SPIRIT",)))
     train_path = tmp_path / "train.csv"
     catalog_path = tmp_path / "vessel_catalog.csv"
     model_dir = tmp_path / "model"
+    llm_dir = tmp_path / "llm"
+    llm_dir.mkdir()
+    (llm_dir / "config.json").write_text("{}", encoding="utf-8")
     _train_frame().to_csv(train_path, index=False)
     _catalog_frame().to_csv(catalog_path, index=False)
-    exit_code = main(["--train", str(train_path), "--catalog", str(catalog_path), "--out", str(model_dir)])
+    exit_code = main(
+        ["--train", str(train_path), "--catalog", str(catalog_path), "--out", str(model_dir),
+         "--llm-model", str(llm_dir)]
+    )
     assert exit_code == 0
     for name in ("model_0.txt", "maps.json", "memory.json", "manifest.json"):
         assert (model_dir / name).is_file()
@@ -225,10 +234,16 @@ def test_module_entry_point_is_callable() -> None:
     assert "--diagnostics" in result.stdout
 
 
-def test_cli_cross_validation_writes_diagnostics(tmp_path) -> None:
+def test_cli_cross_validation_writes_diagnostics(tmp_path, monkeypatch) -> None:
+    from port_entity_matching.transliterate import CachedTransliterator
+
+    monkeypatch.setattr(CachedTransliterator, "translate", lambda self, names: dict.fromkeys(names, ("GLOVIS SPIRIT",)))
     train_path = tmp_path / "train.csv"
     catalog_path = tmp_path / "vessel_catalog.csv"
     diagnostics_path = tmp_path / "cv.csv"
+    llm_dir = tmp_path / "llm"
+    llm_dir.mkdir()
+    (llm_dir / "config.json").write_text("{}", encoding="utf-8")
     _train_frame().to_csv(train_path, index=False)
     _catalog_frame().to_csv(catalog_path, index=False)
     exit_code = main(
@@ -240,6 +255,8 @@ def test_cli_cross_validation_writes_diagnostics(tmp_path) -> None:
             "--cv",
             "--diagnostics",
             str(diagnostics_path),
+            "--llm-model",
+            str(llm_dir),
         ]
     )
     assert exit_code == 0
@@ -339,7 +356,7 @@ def test_notation_ablation_is_exact() -> None:
     assert hashlib.sha256(data.labels.tobytes()).hexdigest() == (
         "f07a77955422d4a4c6bd8ef8b58216365c5071e1c44c276e35212039c0208c6b"
     )
-    assert hashlib.sha256(data.features.tobytes()).hexdigest() == (
+    assert hashlib.sha256(data.features[:, :53].copy().tobytes()).hexdigest() == (
         "7e6f3f72b6ee3c5b73f19cf14536c46ae2687d9698e4653464fb9e1ce27e22c7"
     )
 
@@ -542,3 +559,119 @@ def test_diagnostic_rows_without_candidate_fn() -> None:
     targets = [str(value) for value in train["target_vessel_id"].tolist()]
     rows = _diagnostic_rows(records, targets, index, maps, config, bundle.ranker, candidate_fn=None)
     assert len(rows) == len(records)
+
+
+def test_translit_receives_hangul_names_only_once() -> None:
+    from port_entity_matching.maps import AttributeMaps
+
+    calls: list[tuple[str, ...]] = []
+
+    def stub(names) -> dict[str, tuple[str, ...]]:
+        calls.append(tuple(names))
+        return {name: (name + " ALT",) for name in names}
+
+    index = CatalogIndex.build(_catalog_frame())
+    train = _train_frame()
+    maps = AttributeMaps.fit(train, index)
+    config = MatchConfig(augment=True, augment_notation=False, num_threads=1, lgbm_num_rounds=5, lgbm_min_data_in_leaf=1)
+    build_training_data(train, index, maps, config, translit=stub)
+    assert len(calls) == 1
+    from port_entity_matching.normalize import is_hangul_name
+
+    assert calls[0]
+    assert all(is_hangul_name(name) for name in calls[0])
+    assert "GRAND ACE 11" not in calls[0]
+    originals = records_from_frame(train)
+    copies, _ = degraded_copies(originals, config)
+    expected = {record.vessel_name for record in [*originals, *copies] if is_hangul_name(record.vessel_name)}
+    assert set(calls[0]) == expected
+    assert len(calls[0]) == len(expected)
+
+
+def test_disabled_channel_keeps_legacy_matrix() -> None:
+    import numpy as np
+
+    from port_entity_matching.maps import AttributeMaps
+
+    def stub(names):  # pragma: no cover
+        raise AssertionError("translit must not be called")
+
+    index = CatalogIndex.build(_catalog_frame())
+    train = _train_frame()
+    maps = AttributeMaps.fit(train, index)
+    config = MatchConfig(augment=False, num_threads=1, llm_enabled=False)
+    data = build_training_data(train, index, maps, config, translit=stub)
+    start = FEATURE_NAMES.index("llm_dl_sim")
+    assert np.all(np.isnan(np.asarray(data.features[:, start : start + 6])))
+
+
+def test_cv_transliterates_perturbed_names() -> None:
+    import dataclasses
+
+    from port_entity_matching.maps import AttributeMaps
+    from port_entity_matching.records import QueryRecord
+
+    seen: list[tuple[str, ...]] = []
+
+    def stub(names) -> dict[str, tuple[str, ...]]:
+        seen.append(tuple(names))
+        return dict.fromkeys(names, ("PERTURBED ALT",))
+
+    def perturb(record: QueryRecord) -> QueryRecord | None:
+        return dataclasses.replace(record, vessel_name=" perturbed 호")
+
+    train = _train_frame().iloc[:6].copy()
+    catalog = _catalog_frame()
+    config = MatchConfig(
+        augment=False, num_threads=1, cv_splits=2, lgbm_num_rounds=5, lgbm_min_data_in_leaf=1,
+    )
+    cross_validate_run(train, catalog, config, scenarios={"pert": perturb}, translit=stub)
+    assert any(any("perturbed" in name for name in call) for call in seen)
+
+
+def test_fit_bundle_retains_fewshot() -> None:
+    shots = (("글로비스 스피릿", "GLOVIS SPIRIT"),)
+    bundle = fit_bundle(_train_frame(), _catalog_frame(), _config(), fewshot=shots)
+    assert bundle.fewshot == shots
+
+
+def test_cli_requires_llm_model_when_enabled(tmp_path) -> None:
+    train_path = tmp_path / "train.csv"
+    catalog_path = tmp_path / "vessel_catalog.csv"
+    _train_frame().to_csv(train_path, index=False)
+    _catalog_frame().to_csv(catalog_path, index=False)
+    with pytest.raises(SystemExit):
+        main(["--train", str(train_path), "--catalog", str(catalog_path), "--out", str(tmp_path / "model")])
+
+
+def test_cv_logs_disabled_channel_once(caplog) -> None:
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="port_entity_matching.train"):
+        cross_validate_run(_train_frame(), _catalog_frame(), _config())
+    assert caplog.messages.count("[ALGO] llm channel disabled for this run") == 1
+
+
+def test_cv_does_not_reuse_clean_alts_for_untranslated_perturbations() -> None:
+    from port_entity_matching.normalize import is_hangul_name
+
+    observed = []
+    index = CatalogIndex.build(_catalog_frame())
+    config = dataclasses.replace(_config(), augment=False)
+
+    def translit(names):
+        return {name: ("GLOVIS SPIRIT",) for name in names if name != "새로운 이름"}
+
+    def perturb(record):
+        return dataclasses.replace(record, vessel_name="새로운 이름") if is_hangul_name(record.vessel_name) else None
+
+    def candidates(records):
+        observed.extend(record for record in records if record.vessel_name == "새로운 이름")
+        return generate_candidates(records, index, None, config)
+
+    cross_validate_run(
+        _train_frame(), _catalog_frame(), config,
+        scenarios={"changed": perturb}, candidate_fn=candidates, index=index, translit=translit,
+    )
+    assert observed
+    assert all(record.alt_names == () for record in observed)

@@ -15,7 +15,15 @@ from numpy.typing import NDArray
 from rapidfuzz import fuzz, process
 from rapidfuzz.distance import DamerauLevenshtein, Indel, JaroWinkler, Levenshtein
 
-from port_entity_matching.candidates import SRC_NAME, SRC_SORTED, SRC_TOKEN, SRC_TOKEN_INDEX, SRC_TONNAGE, CandidateSet
+from port_entity_matching.candidates import (
+    SRC_LLM,
+    SRC_NAME,
+    SRC_SORTED,
+    SRC_TOKEN,
+    SRC_TOKEN_INDEX,
+    SRC_TONNAGE,
+    CandidateSet,
+)
 from port_entity_matching.catalog import CatalogIndex
 from port_entity_matching.config import MatchConfig
 from port_entity_matching.maps import AttributeMaps
@@ -90,6 +98,13 @@ FEATURE_NAMES: tuple[str, ...] = (
     "token_count_diff",
     "src_sorted",
     "src_token_index",
+    "llm_dl_sim",
+    "llm_token_set",
+    "llm_sorted_sim",
+    "llm_exact",
+    "llm_top1_dl",
+    "llm_best_rank",
+    "src_llm",
 )
 
 _LATIN_NAMES: tuple[str, ...] = (
@@ -116,6 +131,15 @@ _HANGUL_V2_NAMES: tuple[str, ...] = (
     "kor2_vow_indel",
     "kor2_primary_gap",
     "kor2_primary_rank",
+)
+
+_LLM_NAMES: tuple[str, ...] = (
+    "llm_dl_sim",
+    "llm_token_set",
+    "llm_sorted_sim",
+    "llm_exact",
+    "llm_top1_dl",
+    "llm_best_rank",
 )
 
 Scorer = Callable[[str, str], float]
@@ -159,6 +183,7 @@ def _record_features(
     _hangul_columns(record, positions, index, columns, hangul)
     _order_invariant_columns(record, positions, index, columns, config, hangul)
     _hangul_v2_columns(record, positions, index, columns, hangul)
+    _llm_columns(record, positions, index, columns, hangul)
     columns["rare_token_overlap"] = _rare_token_overlap(record, positions, index, config, hangul)
     _digit_columns(record, positions, index, columns)
     _tonnage_columns(record, positions, index, columns, config)
@@ -276,6 +301,56 @@ def _hangul_v2_columns(
     rank = np.empty(len(positions), dtype=np.float64)
     rank[order] = np.arange(1, len(positions) + 1)
     columns["kor2_primary_rank"] = rank
+
+
+def _llm_columns(
+    record: QueryRecord,
+    positions: NDArray[np.int64],
+    index: CatalogIndex,
+    columns: dict[str, NDArray[np.float64]],
+    hangul: bool,
+) -> None:
+    if not hangul:
+        for name in _LLM_NAMES:
+            columns[name] = np.full(len(positions), np.nan)
+        return
+    cleaned: list[str] = []
+    canonicals: list[str] = []
+    for alt in record.alt_names:
+        key = canonical_latin(alt)
+        if not key or key in canonicals:
+            continue
+        canonicals.append(key)
+        cleaned.append(alt)
+    if not cleaned:
+        for name in _LLM_NAMES:
+            columns[name] = np.full(len(positions), np.nan)
+        return
+    candidate_canonical = [index.canonical[position] for position in positions]
+    candidate_sorted = [index.sorted_canonical[position] for position in positions]
+    candidate_token_str = [" ".join(sorted(index.tokens[position])) for position in positions]
+    query_sorted = [sorted_token_key(latin_tokens(alt)) for alt in cleaned]
+    query_token_str = [" ".join(latin_tokens(alt)) for alt in cleaned]
+    dl_matrix = np.vstack([_cdist(key, candidate_canonical, DamerauLevenshtein.normalized_similarity) for key in canonicals])
+    sorted_matrix = np.vstack(
+        [_cdist(key, candidate_sorted, DamerauLevenshtein.normalized_similarity) for key in query_sorted]
+    )
+    token_matrix = np.vstack([_cdist(query, candidate_token_str, fuzz.token_set_ratio) for query in query_token_str]) / 100.0
+    columns["llm_dl_sim"] = dl_matrix.max(axis=0)
+    columns["llm_sorted_sim"] = sorted_matrix.max(axis=0)
+    columns["llm_token_set"] = token_matrix.max(axis=0)
+    columns["llm_top1_dl"] = dl_matrix[0]
+    columns["llm_exact"] = np.array(
+        [1.0 if any(key == candidate for key in canonicals) else 0.0 for candidate in candidate_canonical]
+    )
+    best = columns["llm_dl_sim"]
+    ranks = np.full(len(positions), np.nan)
+    for offset in range(len(positions)):
+        for rank, row in enumerate(dl_matrix):
+            if row[offset] == best[offset]:
+                ranks[offset] = float(rank)
+                break
+    columns["llm_best_rank"] = ranks
 
 
 def _order_invariant_columns(
@@ -544,6 +619,7 @@ def _context_columns(
     columns["src_token"] = ((sources & SRC_TOKEN) > 0).astype(np.float64)
     columns["src_sorted"] = ((sources & SRC_SORTED) > 0).astype(np.float64)
     columns["src_token_index"] = ((sources & SRC_TOKEN_INDEX) > 0).astype(np.float64)
+    columns["src_llm"] = ((sources & SRC_LLM) > 0).astype(np.float64)
 
 
 def _cdist(query: str, choices: Sequence[str], scorer: Scorer) -> NDArray[np.float64]:

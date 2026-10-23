@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -27,6 +28,7 @@ from port_entity_matching.records import QueryRecord
 
 __all__ = [
     "SRC_FALLBACK",
+    "SRC_LLM",
     "SRC_MEMORY",
     "SRC_NAME",
     "SRC_SORTED",
@@ -48,6 +50,7 @@ SRC_MEMORY: int = 8
 SRC_FALLBACK: int = 16
 SRC_SORTED: int = 32
 SRC_TOKEN_INDEX: int = 64
+SRC_LLM: int = 128
 
 
 @dataclass(frozen=True, eq=False)
@@ -88,6 +91,8 @@ def generate_candidates(
         raise ValueError("hangul_tonnage_window must be non-negative")
     if config.token_top_k < 0 or config.token_df_cap < 1:
         raise ValueError("token_top_k and token_df_cap must satisfy token_top_k >= 0 and token_df_cap >= 1")
+    if config.llm_retrieval_beams < 0:
+        raise ValueError("llm_retrieval_beams must be non-negative")
     if not 0.0 < config.token_match_threshold <= 1.0:
         raise ValueError("token_match_threshold must be in (0, 1]")
     results: list[CandidateSet] = []
@@ -104,23 +109,110 @@ def _process_chunk(
     config: MatchConfig,
 ) -> list[CandidateSet]:
     prepared = [_prepare(record) for record in chunk]
-    latin_names = _latin_name_scores(prepared, index, config)
+    pseudo_prepared: list[_Prepared] = []
+    pseudo_owner: list[int] = []
+    pseudo_by_owner: dict[int, list[_Prepared]] = {}
+    for position, item in enumerate(prepared):
+        if not item.is_hangul:
+            continue
+        alts = _llm_kept_alts(item.record, config)
+        if not alts:
+            continue
+        owned: list[_Prepared] = []
+        for alt in alts:
+            pseudo = _prepare(dataclasses.replace(item.record, vessel_name=alt, alt_names=()))
+            pseudo_prepared.append(pseudo)
+            pseudo_owner.append(position)
+            owned.append(pseudo)
+        pseudo_by_owner[position] = owned
+    if pseudo_prepared:
+        extended = [*prepared, *pseudo_prepared]
+        latin_names = _latin_name_scores(extended, index, config)
+        latin_sorted = _latin_sorted_scores(extended, index, config)
+        token_index = _token_index_scores(extended, index, config)
+    else:
+        extended = list(prepared)
+        latin_names = _latin_name_scores(prepared, index, config)
+        hangul_names = _hangul_name_scores(prepared, index, config)
+        latin_sorted = _latin_sorted_scores(prepared, index, config)
+        hangul_sorted = _hangul_sorted_scores(prepared, index, config)
+        token_index = _token_index_scores(prepared, index, config)
+        results = []
+        for position, item in enumerate(prepared):
+            if item.is_hangul:
+                name_positions, name_scores = hangul_names.get(position, _empty_ranking())
+                sorted_positions, sorted_scores = hangul_sorted.get(position, _empty_ranking())
+                tonnage_positions, exact_positions = _hangul_tonnage(item, index, config)
+                token_positions: NDArray[np.int64] = np.empty(0, dtype=np.int64)
+            else:
+                name_positions, name_scores = latin_names.get(position, _empty_ranking())
+                sorted_positions, sorted_scores = latin_sorted.get(position, _empty_ranking())
+                tonnage_positions, exact_positions = _latin_tonnage(item, index, config)
+                token_positions = _token_candidates(item, index, config)
+            tidx_positions, tidx_scores = token_index.get(position, _empty_ranking())
+            results.append(
+                _assemble(
+                    item,
+                    index,
+                    memory,
+                    config,
+                    name_positions,
+                    name_scores,
+                    sorted_positions,
+                    sorted_scores,
+                    tonnage_positions,
+                    token_positions,
+                    tidx_positions,
+                    tidx_scores,
+                    exact_positions,
+                    np.empty(0, dtype=np.int64),
+                    np.empty(0, dtype=np.float64),
+                )
+            )
+        return results
+    base = len(prepared)
+    owner_slots: dict[int, list[int]] = {}
+    for slot, owner in enumerate(pseudo_owner):
+        owner_slots.setdefault(owner, []).append(base + slot)
     hangul_names = _hangul_name_scores(prepared, index, config)
-    latin_sorted = _latin_sorted_scores(prepared, index, config)
     hangul_sorted = _hangul_sorted_scores(prepared, index, config)
-    token_index = _token_index_scores(prepared, index, config)
     results = []
     for position, item in enumerate(prepared):
         if item.is_hangul:
             name_positions, name_scores = hangul_names.get(position, _empty_ranking())
             sorted_positions, sorted_scores = hangul_sorted.get(position, _empty_ranking())
             tonnage_positions, exact_positions = _hangul_tonnage(item, index, config)
-            token_positions: NDArray[np.int64] = np.empty(0, dtype=np.int64)
+            token_positions = np.empty(0, dtype=np.int64)
+            llm_positions, llm_scores = _llm_ranking(
+                owner_slots.get(position, []), latin_names, latin_sorted, token_index, extended, index, config
+            )
         else:
             name_positions, name_scores = latin_names.get(position, _empty_ranking())
             sorted_positions, sorted_scores = latin_sorted.get(position, _empty_ranking())
             tonnage_positions, exact_positions = _latin_tonnage(item, index, config)
             token_positions = _token_candidates(item, index, config)
+            llm_positions, llm_scores = _empty_ranking()
+            tidx_positions, tidx_scores = token_index.get(position, _empty_ranking())
+            results.append(
+                _assemble(
+                    item,
+                    index,
+                    memory,
+                    config,
+                    name_positions,
+                    name_scores,
+                    sorted_positions,
+                    sorted_scores,
+                    tonnage_positions,
+                    token_positions,
+                    tidx_positions,
+                    tidx_scores,
+                    exact_positions,
+                    llm_positions,
+                    llm_scores,
+                )
+            )
+            continue
         tidx_positions, tidx_scores = token_index.get(position, _empty_ranking())
         results.append(
             _assemble(
@@ -137,9 +229,67 @@ def _process_chunk(
                 tidx_positions,
                 tidx_scores,
                 exact_positions,
+                llm_positions,
+                llm_scores,
+                _llm_pseudo=pseudo_by_owner.get(position, ()),
             )
         )
     return results
+
+
+def _llm_kept_alts(record: QueryRecord, config: MatchConfig) -> list[str]:
+    if config.llm_retrieval_beams <= 0:
+        return []
+    seen: dict[str, None] = {}
+    for alt in record.alt_names:
+        key = canonical_latin(alt)
+        if not key or key in seen:
+            continue
+        seen[key] = None
+        if len(seen) >= config.llm_retrieval_beams:
+            break
+    if not seen:
+        return []
+    keys = list(seen)
+    ordered: list[str] = []
+    for alt in record.alt_names:
+        key = canonical_latin(alt)
+        if key in seen and key in keys:
+            keys.remove(key)
+            ordered.append(alt)
+            if not keys:
+                break
+    return ordered
+
+
+def _llm_ranking(
+    slots: Sequence[int],
+    latin_names: dict[int, tuple[Positions, Scores]],
+    latin_sorted: dict[int, tuple[Positions, Scores]],
+    token_index: dict[int, tuple[Positions, Scores]],
+    extended: Sequence[_Prepared],
+    index: CatalogIndex,
+    config: MatchConfig,
+) -> tuple[Positions, Scores]:
+    if not slots:
+        return _empty_ranking()
+    best: dict[int, float] = {}
+    union: list[Positions] = []
+    for slot in slots:
+        name_positions, name_scores = latin_names.get(slot, _empty_ranking())
+        sorted_positions, sorted_scores = latin_sorted.get(slot, _empty_ranking())
+        tidx_positions, tidx_scores = token_index.get(slot, _empty_ranking())
+        token_positions = _token_candidates(extended[slot], index, config)
+        union.extend([name_positions, sorted_positions, tidx_positions, token_positions])
+        for position, similarity in zip(name_positions.tolist(), name_scores.tolist(), strict=True):
+            best[int(position)] = max(best.get(int(position), 0.0), float(similarity))
+        for position, similarity in zip(sorted_positions.tolist(), sorted_scores.tolist(), strict=True):
+            best[int(position)] = max(best.get(int(position), 0.0), float(similarity))
+        for position, similarity in zip(tidx_positions.tolist(), tidx_scores.tolist(), strict=True):
+            best[int(position)] = max(best.get(int(position), 0.0), float(similarity))
+    positions = _union(union)
+    scores = np.asarray([best.get(int(position), 0.0) for position in positions.tolist()], dtype=np.float64)
+    return positions, scores
 
 
 def _prepare(record: QueryRecord) -> _Prepared:
@@ -564,6 +714,17 @@ def _token_index_similarity(item: _Prepared, index: CatalogIndex, config: MatchC
     return float(numerator / denom)
 
 
+def _llm_pseudo_similarity(
+    pseudo_items: Sequence[_Prepared], index: CatalogIndex, config: MatchConfig, position: int
+) -> float:
+    best = 0.0
+    for pseudo in pseudo_items:
+        best = max(best, _name_similarity(pseudo, index, position))
+        best = max(best, _sorted_similarity(pseudo, index, position))
+        best = max(best, _token_index_similarity(pseudo, index, config, position))
+    return float(np.float32(best))
+
+
 def _assemble(
     item: _Prepared,
     index: CatalogIndex,
@@ -578,6 +739,9 @@ def _assemble(
     tidx_positions: Positions,
     tidx_scores: Scores,
     exact_positions: Positions,
+    llm_positions: Positions | None = None,
+    llm_scores: Scores | None = None,
+    _llm_pseudo: Sequence[_Prepared] = (),
 ) -> CandidateSet:
     masks: dict[int, int] = {}
 
@@ -590,6 +754,8 @@ def _assemble(
     add(tonnage_positions, SRC_TONNAGE)
     add(token_positions, SRC_TOKEN)
     add(tidx_positions, SRC_TOKEN_INDEX)
+    if llm_positions is not None:
+        add(llm_positions, SRC_LLM)
     memory_position = memory.lookup(item.record.call_sign) if memory is not None else None
     if memory_position is not None:
         add(np.asarray([memory_position], dtype=np.int64), SRC_MEMORY)
@@ -604,6 +770,9 @@ def _assemble(
         score_of[int(position)] = max(score_of.get(int(position), 0.0), float(similarity))
     for position, similarity in zip(tidx_positions.tolist(), tidx_scores.tolist(), strict=True):
         score_of[int(position)] = max(score_of.get(int(position), 0.0), float(similarity))
+    if llm_positions is not None and llm_scores is not None:
+        for position, similarity in zip(llm_positions.tolist(), llm_scores.tolist(), strict=True):
+            score_of[int(position)] = max(score_of.get(int(position), 0.0), float(similarity))
     name_set = {int(position) for position in name_positions.tolist()}
     sorted_set = {int(position) for position in sorted_positions.tolist()}
     tidx_set = {int(position) for position in tidx_positions.tolist()}
@@ -616,6 +785,8 @@ def _assemble(
                 best = max(best, _sorted_similarity(item, index, position))
             if position not in tidx_set:
                 best = max(best, _token_index_similarity(item, index, config, position))
+            if _llm_pseudo:
+                best = max(best, _llm_pseudo_similarity(_llm_pseudo, index, config, position))
             score_of[position] = float(np.float32(best))
     exact_set = set(exact_positions.tolist())
 

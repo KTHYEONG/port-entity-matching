@@ -924,3 +924,150 @@ def test_latin_sources_match_scalar_ranking_reference(prefilter_k: int, top_k: i
             positions, scores = actual[query_position]
             assert positions.tolist() == expected
             np.testing.assert_array_equal(scores, [dl[p] for p in expected])
+
+
+def test_llm_alt_retrieves_latin_target() -> None:
+    import dataclasses
+
+    from port_entity_matching.candidates import SRC_LLM
+
+    index = CatalogIndex.build(_catalog_frame([("V0", "GLOVIS SUN", 5000.0), ("V1", "OTHER SHIP", 5000.0)]))
+    record = dataclasses.replace(_record("s1", "글로비스 선"), alt_names=("GLOVIS SUN",))
+    result = generate_candidates([record], index, None, MatchConfig(name_top_k=5, hangul_key_top_k=5))[0]
+    assert 0 in result.positions.tolist()
+    assert _sources_of(result, 0) & SRC_LLM
+
+
+def test_llm_empty_alts_keep_legacy_output() -> None:
+    import dataclasses
+
+    base = _record("s1", "글로비스 선")
+    index = CatalogIndex.build(_catalog_frame([("V0", "GLOVIS SUN", 5000.0)]))
+    default = generate_candidates([base], index, None, MatchConfig())[0]
+    explicit = generate_candidates([dataclasses.replace(base, alt_names=())], index, None, MatchConfig())[0]
+    np.testing.assert_array_equal(default.positions, explicit.positions)
+    np.testing.assert_array_equal(default.sources, explicit.sources)
+
+
+def test_llm_retrieval_beams_cap() -> None:
+    import dataclasses
+
+    from port_entity_matching.candidates import SRC_LLM
+
+    index = CatalogIndex.build(
+        _catalog_frame([("V0", "A NAME", 1000.0), ("V1", "B NAME", 1000.0), ("V2", "C NAME", 1000.0)])
+    )
+    record = dataclasses.replace(_record("s1", "알파"), alt_names=("A NAME", "B NAME", "C NAME"))
+    result = generate_candidates(
+        [record], index, None, MatchConfig(name_top_k=1, hangul_key_top_k=1, llm_retrieval_beams=1)
+    )[0]
+    assert _sources_of(result, 0) & SRC_LLM
+    assert not _sources_of(result, 1) & SRC_LLM
+    assert not _sources_of(result, 2) & SRC_LLM
+
+
+def test_llm_row_independence_with_alts() -> None:
+    import dataclasses
+
+    index = CatalogIndex.build(_catalog_frame([
+        ("V0", "GLOVIS SUN", 5000.0), ("V1", "OTHER SHIP", 6000.0), ("V2", "KOBE PIONEER", 7000.0),
+    ]))
+    records = [
+        dataclasses.replace(_record(f"s{i}", name), alt_names=(alt,))
+        for i, (name, alt) in enumerate([
+            ("글로비스 선", "GLOVIS SUN"), ("다른 선박", "OTHER SHIP"), ("고베 파이오니어", "KOBE PIONEER"),
+        ])
+    ]
+    config = MatchConfig(name_top_k=1, hangul_key_top_k=1, token_top_k=1, max_candidates=2, query_chunk=2)
+    batch = generate_candidates(records, index, None, config)
+    individual = [generate_candidates([record], index, None, config)[0] for record in records]
+    shuffled = generate_candidates(records[::-1], index, None, config)[::-1]
+    for grouped, solo, reordered in zip(batch, individual, shuffled, strict=True):
+        np.testing.assert_array_equal(grouped.positions, solo.positions)
+        np.testing.assert_array_equal(grouped.sources, solo.sources)
+        np.testing.assert_array_equal(grouped.positions, reordered.positions)
+        np.testing.assert_array_equal(grouped.sources, reordered.sources)
+    subset = generate_candidates(records[::2], index, None, config)
+    for grouped, partial in zip(batch[::2], subset, strict=True):
+        np.testing.assert_array_equal(grouped.positions, partial.positions)
+        np.testing.assert_array_equal(grouped.sources, partial.sources)
+
+
+def test_llm_negative_beams_rejected() -> None:
+    import dataclasses
+
+    index = CatalogIndex.build(_catalog_frame([("V0", "GLOVIS SUN", 5000.0)]))
+    with pytest.raises(ValueError, match="llm_retrieval_beams"):
+        generate_candidates(
+            [_record("s1", "글로비스 선")], index, None, dataclasses.replace(MatchConfig(), llm_retrieval_beams=-1)
+        )
+
+
+def test_llm_zero_beams_produces_no_llm_source() -> None:
+    import dataclasses
+
+    from port_entity_matching.candidates import SRC_LLM
+
+    index = CatalogIndex.build(_catalog_frame([("V0", "GLOVIS SUN", 5000.0), ("V1", "OTHER SHIP", 5000.0)]))
+    record = dataclasses.replace(_record("s1", "글로비스 선"), alt_names=("GLOVIS SUN",))
+    result = generate_candidates([record], index, None, MatchConfig(llm_retrieval_beams=0))[0]
+    assert not any(source & SRC_LLM for source in result.sources.tolist())
+
+
+def test_llm_empty_and_duplicate_alts_skipped() -> None:
+    import dataclasses
+
+    from port_entity_matching.candidates import SRC_LLM
+
+    index = CatalogIndex.build(_catalog_frame([("V0", "A NAME", 1000.0), ("V1", "OTHER SHIP", 1000.0)]))
+    record = dataclasses.replace(_record("s1", "알파"), alt_names=("", "A NAME", "A NAME", "A-NAME"))
+    result = generate_candidates([record], index, None, MatchConfig(name_top_k=5, hangul_key_top_k=5))[0]
+    assert 0 in result.positions.tolist()
+    assert _sources_of(result, 0) & SRC_LLM
+
+
+def test_llm_mixed_chunk_covers_plain_records() -> None:
+    import dataclasses
+
+    index = CatalogIndex.build(_catalog_frame([("V0", "GLOVIS SUN", 5000.0), ("V1", "OTHER SHIP", 5000.0)]))
+    records = [
+        dataclasses.replace(_record("s1", "글로비스 선"), alt_names=("GLOVIS SUN",)),
+        _record("s2", "글로비스 선"),
+    ]
+    batch = generate_candidates(records, index, None, MatchConfig())
+    solo = generate_candidates([records[1]], index, None, MatchConfig())[0]
+    np.testing.assert_array_equal(batch[1].positions, solo.positions)
+    np.testing.assert_array_equal(batch[1].sources, solo.sources)
+
+
+def test_llm_over_cap_rescoring_keeps_row_independence() -> None:
+    import dataclasses
+
+    entries = [(f"V{i}", f"TEST VESSEL {i}", 1000.0 + i) for i in range(12)]
+    entries.append(("VT", "GLOVIS SUN", 1005.0))
+    index = CatalogIndex.build(_catalog_frame(entries))
+    record = dataclasses.replace(
+        _record("s1", "글로비스 선", gross_tonnage=1005.0, international_gross_tonnage=1005.0),
+        alt_names=("GLOVIS SUN",),
+    )
+    config = MatchConfig(max_candidates=2, name_top_k=10, hangul_key_top_k=10, num_threads=1)
+    solo = generate_candidates([record], index, None, config)[0]
+    batch = generate_candidates([record, _record("s2", "OTHER SHIP")], index, None, config)[0]
+    np.testing.assert_array_equal(batch.positions, solo.positions)
+    np.testing.assert_array_equal(batch.sources, solo.sources)
+    assert len(solo.positions) <= 2
+
+
+def test_llm_over_cap_rescores_other_channels_for_retrieved_positions() -> None:
+    import dataclasses
+
+    from port_entity_matching.candidates import SRC_LLM
+
+    entries = [("V0", "COMMON LONGWORX", 1000.0), ("V1", "LONGWORD", 2000.0)]
+    entries.extend((f"F{i}", f"COMMON {i}", 3000.0 + i) for i in range(5))
+    index = CatalogIndex.build(_catalog_frame(entries))
+    record = dataclasses.replace(_record("s", "가나다"), alt_names=("COMMON LONGWORD",))
+    config = MatchConfig(name_top_k=0, hangul_key_top_k=0, token_top_k=2, max_candidates=1)
+    result = generate_candidates([record], index, None, config)[0]
+    assert result.positions.tolist() == [0]
+    assert _sources_of(result, 0) & SRC_LLM

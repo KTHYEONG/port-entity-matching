@@ -32,6 +32,7 @@ class ArtifactBundle:
     maps: AttributeMaps
     memory: CallSignMemory
     config: MatchConfig
+    fewshot: tuple[tuple[str, str], ...] = ()
 
     def save(self, model_dir: str | Path) -> None:
         """Write the ensemble members, attribute maps, call-sign memory and manifest."""

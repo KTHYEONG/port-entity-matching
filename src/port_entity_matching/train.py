@@ -32,6 +32,7 @@ from port_entity_matching.records import (
     read_csv_checked,
     records_from_frame,
 )
+from port_entity_matching.transliterate import CachedTransliterator, TranslitFn, attach_alt_names, select_fewshot
 
 __all__ = [
     "CVReport",
@@ -66,6 +67,26 @@ _OOF_COLUMNS: tuple[str, ...] = ("scenario", *DIAGNOSTIC_COLUMNS)
 
 RecordPerturbation = Callable[[QueryRecord], QueryRecord | None]
 CandidateFn = Callable[[Sequence[QueryRecord]], list[CandidateSet]]
+
+
+def _maybe_attach_translit(
+    records: Sequence[QueryRecord],
+    config: MatchConfig,
+    translit: TranslitFn | None,
+    *,
+    log_disabled: bool = False,
+) -> list[QueryRecord]:
+    records = list(records)
+    if not config.llm_enabled or translit is None:
+        if config.llm_enabled and translit is None and log_disabled:
+            logger.info("[ALGO] llm channel disabled for this run")
+        return records
+    names = list(dict.fromkeys(record.vessel_name for record in records if is_hangul_name(record.vessel_name)))
+    if not names:
+        return records
+    table = translit(names)
+    attached: list[QueryRecord] = attach_alt_names(records, table)
+    return attached
 
 
 @dataclass
@@ -131,6 +152,7 @@ def build_training_data(
     maps: AttributeMaps,
     config: MatchConfig,
     candidate_fn: CandidateFn | None = None,
+    translit: TranslitFn | None = None,
     *,
     _timings: _StageTimes | None = None,
 ) -> TrainingData:
@@ -148,6 +170,7 @@ def build_training_data(
         notation_targets = [targets[index] for index in notation_sources]
         records = [*records, *copies, *notation]
         targets = [*targets, *copy_targets, *notation_targets]
+    records = _maybe_attach_translit(records, config, translit, log_disabled=_timings is None)
     timings = _timings or _StageTimes()
     started = time.perf_counter()
     if candidate_fn is None:
@@ -202,12 +225,18 @@ def build_training_data(
     )
 
 
-def fit_bundle(train: pd.DataFrame, catalog: pd.DataFrame, config: MatchConfig) -> ArtifactBundle:
+def fit_bundle(
+    train: pd.DataFrame,
+    catalog: pd.DataFrame,
+    config: MatchConfig,
+    translit: TranslitFn | None = None,
+    fewshot: tuple[tuple[str, str], ...] = (),
+) -> ArtifactBundle:
     """Fit the attribute maps, the call-sign memory and the ranker on all given train rows."""
     index = CatalogIndex.build(catalog)
     maps = AttributeMaps.fit(train, index)
     memory = CallSignMemory.fit(train, index)
-    training = build_training_data(train, index, maps, config)
+    training = build_training_data(train, index, maps, config, translit=translit)
     ranker = train_ensemble(training.features, training.labels, training.group_sizes, config)
     logger.info(
         "[ALGO] fitted rows=%d pairs=%d groups=%d members=%d recall_hangul=%.4f recall_latin=%.4f",
@@ -218,7 +247,7 @@ def fit_bundle(train: pd.DataFrame, catalog: pd.DataFrame, config: MatchConfig) 
         training.recall_hangul,
         training.recall_latin,
     )
-    return ArtifactBundle(ranker=ranker, maps=maps, memory=memory, config=config)
+    return ArtifactBundle(ranker=ranker, maps=maps, memory=memory, config=config, fewshot=fewshot)
 
 
 def cross_validate(
@@ -226,9 +255,10 @@ def cross_validate(
     catalog: pd.DataFrame,
     config: MatchConfig,
     diagnostics_path: str | Path | None = None,
+    translit: TranslitFn | None = None,
 ) -> CVReport:
     """Run vessel-disjoint cross-validation without call-sign memory and report the bucket metrics."""
-    run = cross_validate_run(train, catalog, config, scenarios=None)
+    run = cross_validate_run(train, catalog, config, scenarios=None, translit=translit)
     if diagnostics_path is not None:
         clean = run.oof.drop(columns=["scenario"]).loc[:, list(DIAGNOSTIC_COLUMNS)]
         _write_diagnostics(diagnostics_path, clean)
@@ -243,6 +273,7 @@ def cross_validate_run(
     scenarios: Mapping[str, RecordPerturbation] | None = None,
     candidate_fn: CandidateFn | None = None,
     index: CatalogIndex | None = None,
+    translit: TranslitFn | None = None,
 ) -> CVRun:
     """Vessel-disjoint CV with memory off; each fold's ensemble scores clean rows and every scenario's perturbed rows."""
     scenario_map = dict(scenarios or {})
@@ -261,12 +292,14 @@ def cross_validate_run(
     )
 
     rows: list[dict[str, object]] = []
+    if config.llm_enabled and translit is None:
+        logger.info("[ALGO] llm channel disabled for this run")
     for fold_number, (train_index, valid_index) in enumerate(folds, start=1):
         fold_train = train.iloc[train_index]
         fold_valid = train.iloc[valid_index]
         timings = _StageTimes()
         maps = AttributeMaps.fit(fold_train, index)
-        training = build_training_data(fold_train, index, maps, config, candidate_fn, _timings=timings)
+        training = build_training_data(fold_train, index, maps, config, candidate_fn, translit, _timings=timings)
         fit_start = time.perf_counter()
         ranker = train_ensemble(training.features, training.labels, training.group_sizes, config)
         fit_s = time.perf_counter() - fit_start
@@ -281,7 +314,8 @@ def cross_validate_run(
             training.recall_latin,
         )
 
-        records = records_from_frame(fold_valid)
+        raw_records = records_from_frame(fold_valid)
+        records = _maybe_attach_translit(raw_records, config, translit)
         fold_targets = [str(value) for value in fold_valid["target_vessel_id"].tolist()]
         clean_rows = _diagnostic_rows(
             records, fold_targets, index, maps, config, ranker, candidate_fn, _timings=timings
@@ -292,7 +326,7 @@ def cross_validate_run(
         for scenario_name, perturb in scenario_map.items():
             perturbed_records: list[QueryRecord] = []
             perturbed_targets: list[str] = []
-            for record, target in zip(records, fold_targets, strict=True):
+            for record, target in zip(raw_records, fold_targets, strict=True):
                 perturbed = perturb(record)
                 if perturbed is None:
                     continue
@@ -301,6 +335,7 @@ def cross_validate_run(
             if not perturbed_records:
                 _log_fold_metrics(fold_number, scenario_name, [])
                 continue
+            perturbed_records = _maybe_attach_translit(perturbed_records, config, translit)
             scenario_rows = _diagnostic_rows(
                 perturbed_records, perturbed_targets, index, maps, config, ranker, candidate_fn, _timings=timings
             )
@@ -450,6 +485,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--out", type=Path, default=None, help="directory the fitted artifacts are written to")
     parser.add_argument("--cv", action="store_true", help="run vessel-disjoint cross-validation")
     parser.add_argument("--diagnostics", type=Path, default=None, help="CSV path for the out-of-fold diagnostics")
+    parser.add_argument("--llm-model", type=Path, default=None, help="transliteration weights directory")
+    parser.add_argument("--llm-cache", type=Path, default=Path("artifacts/cache/translit"), help="transliteration cache directory")
     args = parser.parse_args(argv)
     if args.cv is False and args.out is None:
         parser.error("nothing to do: pass --cv and/or --out")
@@ -460,8 +497,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     config = MatchConfig()
     logger.info("[DATA] loaded train_rows=%d catalog_rows=%d", len(train), len(catalog))
 
+    translit: TranslitFn | None = None
+    shots: tuple[tuple[str, str], ...] = ()
+    if config.llm_enabled:
+        if args.llm_model is None:
+            parser.error("--llm-model is required when llm_enabled")
+        shots = select_fewshot(train, catalog, config.llm_fewshot, config.llm_fewshot_seed)
+        transliterator = CachedTransliterator(args.llm_cache, args.llm_model, shots, config)
+        translit = transliterator.translate
+        logger.info("[EVAL] llm_fewshot_vessels=%d", len(shots))
+
     if args.cv:
-        report = cross_validate(train, catalog, config, args.diagnostics)
+        report = cross_validate(train, catalog, config, args.diagnostics, translit)
         logger.info(
             "[EVAL] cv weighted_score=%.4f hangul_accuracy=%.4f non_hangul_accuracy=%.4f",
             report.weighted_score,
@@ -469,7 +516,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             report.non_hangul_accuracy,
         )
     if args.out is not None:
-        bundle = fit_bundle(train, catalog, config)
+        bundle = fit_bundle(train, catalog, config, translit, shots)
         bundle.save(args.out)
         logger.info("[SYS] artifacts written path=%s", args.out)
     return 0

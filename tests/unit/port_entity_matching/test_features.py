@@ -407,9 +407,9 @@ def test_log_tonnage_ratio_remains_finite_at_float_extremes(query: float, catalo
     assert matrix[0, _column("logratio_igt")] == pytest.approx(np.log(query) - np.log(catalog), rel=1e-6)
 
 
-def test_feature_width_grows_to_fifty_three() -> None:
+def test_feature_width_grows_to_sixty() -> None:
     matrix = _build([_record("GRAND ACE 11", igt=100)], [_candidate_set([0, 1, 2])])
-    assert matrix.shape[1] == len(FEATURE_NAMES) == 53
+    assert matrix.shape[1] == len(FEATURE_NAMES) == 60
     assert FEATURE_NAMES[: len(_PREVIOUS_FEATURE_NAMES)] == _PREVIOUS_FEATURE_NAMES
     assert (
         FEATURE_NAMES[len(_PREVIOUS_FEATURE_NAMES) : len(_PREVIOUS_FEATURE_NAMES) + len(_KEY_V2_NAMES)] == _KEY_V2_NAMES
@@ -422,6 +422,13 @@ def test_feature_width_grows_to_fifty_three() -> None:
         "token_count_diff",
         "src_sorted",
         "src_token_index",
+        "llm_dl_sim",
+        "llm_token_set",
+        "llm_sorted_sim",
+        "llm_exact",
+        "llm_top1_dl",
+        "llm_best_rank",
+        "src_llm",
     )
 
 
@@ -646,3 +653,58 @@ def test_fuzzy_cover_weights_repeated_query_occurrences() -> None:
     index = _order_index()
     matrix = _build([_record("GOLDEN GOLDEN UNKNOWN")], [_candidate_set([0])], index)
     assert matrix[0, _column("name_token_fuzzy_cover")] == pytest.approx(12 / 19)
+
+
+def test_llm_columns_nan_without_alts() -> None:
+    latin = _record("Kobe Pioneer")
+    hangul = _record("고베 파이오니어")
+    matrix = _build([hangul, latin], [_candidate_set([0, 1]), _candidate_set([0, 1])])
+    for name in ("llm_dl_sim", "llm_token_set", "llm_sorted_sim", "llm_exact", "llm_top1_dl", "llm_best_rank"):
+        assert np.all(np.isnan(matrix[:, _column(name)]))
+    assert np.all(matrix[:, _column("src_llm")] == 0.0)
+
+
+def test_llm_exact_alt_match() -> None:
+    import dataclasses
+
+    record = dataclasses.replace(_record("그랜드 에이스"), alt_names=("GRAND ACE 11", "GRAND ACE 12"))
+    matrix = _build([record], [_candidate_set([0, 3])])
+    assert matrix[0, _column("llm_exact")] == 1.0
+    assert matrix[0, _column("llm_dl_sim")] == 1.0
+    assert matrix[0, _column("llm_best_rank")] == 0.0
+    assert matrix[1, _column("llm_exact")] == 0.0
+
+
+def test_llm_best_rank_tracks_beam() -> None:
+    import dataclasses
+
+    record = dataclasses.replace(
+        _record("글로비스"), alt_names=("TOTALLY DIFFERENT SHIP NAME XYZ", "GLOVIS SPIRIT")
+    )
+    matrix = _build([record], [_candidate_set([3])])
+    assert matrix[0, _column("llm_best_rank")] == 1.0
+    assert matrix[0, _column("llm_top1_dl")] < 1.0
+
+
+def test_llm_feature_names_appended() -> None:
+    assert len(FEATURE_NAMES) == 60
+    assert FEATURE_NAMES[-7:] == (
+        "llm_dl_sim",
+        "llm_token_set",
+        "llm_sorted_sim",
+        "llm_exact",
+        "llm_top1_dl",
+        "llm_best_rank",
+        "src_llm",
+    )
+
+
+def test_llm_empty_and_duplicate_alts_skipped() -> None:
+    import dataclasses
+
+    record = dataclasses.replace(
+        _record("그랜드 에이스"), alt_names=("", "GRAND ACE 11", "GRAND ACE 11", "GRAND-ACE 11")
+    )
+    matrix = _build([record], [_candidate_set([0, 3])])
+    assert matrix[0, _column("llm_exact")] == 1.0
+    assert matrix[0, _column("llm_best_rank")] == 0.0
