@@ -86,7 +86,7 @@ def notation_copies(
     for source_index, record in enumerate(records):
         rng = record_rng(record, config.augment_seed + 1)
         if is_hangul_name(record.vessel_name):
-            record_copies = _hangul_notation_copies(record, rng, config)
+            record_copies = _hangul_notation_copies(record, rng, config) if config.augment_hangul_notation else []
         else:
             latin_copy = _latin_notation_copy(record, rng, config)
             record_copies = [] if latin_copy is None else [latin_copy]

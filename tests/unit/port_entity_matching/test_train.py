@@ -318,9 +318,11 @@ def test_notation_augmentation_adds_more_groups() -> None:
     index = CatalogIndex.build(_catalog_frame())
     train = _mixed_frame()
     maps = AttributeMaps.fit(train, index)
-    without = build_training_data(train, index, maps, MatchConfig(augment=True, augment_notation=False, num_threads=1))
+    without = build_training_data(
+        train, index, maps, MatchConfig(augment=True, augment_notation=False, augment_hangul_notation=True, num_threads=1)
+    )
     with_notation = build_training_data(
-        train, index, maps, MatchConfig(augment=True, augment_notation=True, num_threads=1)
+        train, index, maps, MatchConfig(augment=True, augment_notation=True, augment_hangul_notation=True, num_threads=1)
     )
     assert len(with_notation.group_sizes) > len(without.group_sizes)
     assert with_notation.recall_hangul == without.recall_hangul

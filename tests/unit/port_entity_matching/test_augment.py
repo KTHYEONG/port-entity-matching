@@ -31,7 +31,11 @@ def _record(sample_id: str, name: str, gross: float | None = 1000.0, internation
 
 
 def _config(**overrides: float | int | bool) -> MatchConfig:
-    defaults: dict[str, float | int | bool] = {"augment_tonnage_factor": 1.08, "augment_min_syllables": 3}
+    defaults: dict[str, float | int | bool] = {
+        "augment_tonnage_factor": 1.08,
+        "augment_min_syllables": 3,
+        "augment_hangul_notation": True,
+    }
     defaults.update(overrides)
     return MatchConfig(**defaults)  # type: ignore[arg-type]
 
@@ -480,3 +484,15 @@ def test_degraded_copies_change_with_the_seed() -> None:
     first, _ = degraded_copies(records, _config(augment_seed=0))
     second, _ = degraded_copies(records, _config(augment_seed=1))
     assert [copy.vessel_name for copy in first] != [copy.vessel_name for copy in second]
+
+
+def test_hangul_notation_copies_disabled() -> None:
+    records = [_record("H0", "상하이 보이저", gross=1000.0), _record("L0", "OCEAN PIONEER")]
+    off = _config(augment_hangul_notation=False, augment_latin_rate=1.0)
+    on = _config(augment_hangul_notation=True, augment_latin_rate=1.0)
+    copies_off, sources_off = notation_copies(records, off)
+    assert all(source != 0 for source in sources_off)
+    copies_on, sources_on = notation_copies(records, on)
+    latin_off = [copy for copy, source in zip(copies_off, sources_off, strict=True) if source == 1]
+    latin_on = [copy for copy, source in zip(copies_on, sources_on, strict=True) if source == 1]
+    assert latin_off == latin_on

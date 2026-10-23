@@ -45,6 +45,8 @@ _EXCLUDED_FIELDS: frozenset[str] = frozenset(
 
 
 def _excluded(name: str) -> bool:
+    if name.startswith("llm_"):
+        return name != "llm_retrieval_beams"
     return name in _EXCLUDED_FIELDS or name.startswith("lgbm_") or name.startswith("augment")
 
 

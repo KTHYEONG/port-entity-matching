@@ -34,6 +34,15 @@ def test_missing_keys_use_defaults() -> None:
     assert config == MatchConfig(name_top_k=5)
 
 
+def test_legacy_manifest_uses_llm_defaults() -> None:
+    config = config_from_dict({"name_top_k": 5})
+    assert config.augment_hangul_notation is False
+    assert config.llm_enabled is True
+    assert (config.llm_fewshot, config.llm_fewshot_seed) == (12, 0)
+    assert (config.llm_num_beams, config.llm_max_new_tokens, config.llm_retrieval_beams) == (5, 24, 2)
+    assert config.llm_time_budget_s == 1200.0
+
+
 def test_old_manifest_uses_token_retrieval_defaults() -> None:
     config = config_from_dict({"name_top_k": 5})
     assert config.token_top_k == 30
@@ -42,8 +51,8 @@ def test_old_manifest_uses_token_retrieval_defaults() -> None:
 
 
 def test_hangul_tonnage_window_default_and_round_trip() -> None:
-    assert MatchConfig().hangul_tonnage_window == 0.25
-    assert config_from_dict({"name_top_k": 5}).hangul_tonnage_window == 0.25
+    assert MatchConfig().hangul_tonnage_window == 0.10
+    assert config_from_dict({"name_top_k": 5}).hangul_tonnage_window == 0.10
     assert config_from_dict({"hangul_tonnage_window": 0.08}).hangul_tonnage_window == 0.08
     assert config_from_dict(config_to_dict(MatchConfig(hangul_tonnage_window=0.08))).hangul_tonnage_window == 0.08
 

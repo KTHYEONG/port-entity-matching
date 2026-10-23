@@ -148,6 +148,28 @@ def test_fingerprint_sensitivity(tmp_path: Path) -> None:
         assert retrieval_fingerprint(catalog, dataclasses.replace(config, **{field: value})) == base
 
 
+def test_llm_retrieval_fingerprint_and_alt_name_keys(tmp_path: Path) -> None:
+    catalog = _catalog_frame()
+    config = MatchConfig(num_threads=1)
+    base = retrieval_fingerprint(catalog, config)
+    for field, value in [
+        ("llm_enabled", False),
+        ("llm_fewshot", 0),
+        ("llm_fewshot_seed", 1),
+        ("llm_num_beams", 6),
+        ("llm_max_new_tokens", 25),
+        ("llm_time_budget_s", 1.0),
+        ("augment_hangul_notation", True),
+    ]:
+        assert retrieval_fingerprint(catalog, dataclasses.replace(config, **{field: value})) == base
+    assert retrieval_fingerprint(catalog, dataclasses.replace(config, llm_retrieval_beams=1)) != base
+    cache = CandidateCache.open(tmp_path / "cache", catalog, config)
+    record = _record("A", "그랜드 에이스")
+    index = CatalogIndex.build(catalog)
+    cache.fetch([record, dataclasses.replace(record, alt_names=("GRAND ACE",))], index, config)
+    assert cache.stats == (0, 2)
+
+
 def test_partial_hits_keep_order(tmp_path: Path) -> None:
     catalog = _catalog_frame()
     index = CatalogIndex.build(catalog)

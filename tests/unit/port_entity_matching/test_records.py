@@ -164,6 +164,13 @@ def test_extra_columns_ignored() -> None:
     assert all(isinstance(record, QueryRecord) for record in records)
 
 
+def test_alt_names_are_never_loaded_from_input() -> None:
+    frame = pd.DataFrame(_sample_rows()).assign(alt_names=[("INJECTED",), ("ALSO INJECTED",)])
+    assert all(record.alt_names == () for record in records_from_frame(frame))
+    assert tuple(QueryRecord.__dataclass_fields__)[-1] == "alt_names"
+    assert "alt_names" not in RECORD_COLUMNS
+
+
 def test_frame_missing_columns_raises() -> None:
     frame = pd.DataFrame(_sample_rows()).drop(columns=["arrival_year"])
 

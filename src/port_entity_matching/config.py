@@ -19,7 +19,7 @@ class MatchConfig:
     latin_prefilter_k: int = 200
     hangul_key_top_k: int = 30
     tonnage_window: float = 0.06
-    hangul_tonnage_window: float = 0.25
+    hangul_tonnage_window: float = 0.10
     hangul_window_keep: int = 200
     latin_exact_gt_cap: int = 50
     rare_token_max_df: int = 5000
@@ -46,10 +46,18 @@ class MatchConfig:
     augment_min_syllables: int = 3
     augment_seed: int = 0
     augment_notation: bool = True
+    augment_hangul_notation: bool = False
     augment_latin_rate: float = 0.3
     augment_tonnage_low: float = 0.05
     augment_tonnage_high: float = 0.25
     ensemble_size: int = 5
+    llm_enabled: bool = True
+    llm_fewshot: int = 12
+    llm_fewshot_seed: int = 0
+    llm_num_beams: int = 5
+    llm_max_new_tokens: int = 24
+    llm_retrieval_beams: int = 2
+    llm_time_budget_s: float = 1200.0
 
 
 def config_to_dict(config: MatchConfig) -> dict[str, int | float]:

@@ -51,6 +51,7 @@ class QueryRecord:
     flag_name: str | None
     vessel_type: str | None
     arrival_year: int | None
+    alt_names: tuple[str, ...] = ()
 
 
 def read_csv_checked(path: str | Path, required: Sequence[str]) -> pd.DataFrame:
