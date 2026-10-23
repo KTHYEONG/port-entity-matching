@@ -423,8 +423,41 @@ Changes:
 - Latin token-drop recall is 0.898 against the 0.97 target. The remaining half needs typo-tolerant token lookup, such as matching a query token to catalog tokens within one edit.
 - Korean token-drop accuracy is 0.65 (recall 0.883).
 
+### 2.8 LLM Transliteration Channel (2026-10-23)
+- Frozen Qwen3-4B-Instruct (bf16, CUDA, local weights only) maps each distinct Hangul name to Latin n-best alts (12 few-shot pairs from train Hangul rows, beam 5, 24 new tokens). Alts feed the existing retrieval channel (`SRC_LLM`) and never bypass ranking; records already carrying `alt_names` are not regenerated. Generation is batch-1 per name, so a row's prediction is identical alone, in a subset, or shuffled.
+- Serving: `Matcher.from_dir` loads `<model_dir>/llm` only when `llm_enabled` and `fewshot` are set; `TransliteratorUnavailable` degrades to the Hangul channel with an `[SYS] llm unavailable` warning. Query and few-shot user names are bounded to 64 characters; beam count (5), new-token limit (24), and batch size (1) are fixed per name. No shared deadline or time-based fallback changes predictions. Logs carry counts and seconds only.
+- Budget (RTX 4070 Ti, 12-shot, beam 5, batch 1): load 4.1 s (7.6 GB), 0.376 s per Hangul name, peak VRAM 8.4 GB of 22.4 GB. Test has ~4,632 rows, ~1,064 Korean (23%); conservative L4 factor 2.0 gives ~13.3 min LLM + 2 min load + ~1 min pipeline ≈ 16.5 min, under the 30 min limit. `tests/integration/test_budget.py` projects the server budget from the pseudo run and asserts row independence.
+- Scenario-level CV deltas have not yet been measured for this serving change; no clean or stress-suite improvement is established by the implementation tests. Server timing figures above are projections, not an L4 measurement.
+- Compliance correction: the shared 20-minute fallback has been removed because it made a row's alternatives depend on time spent on other rows. Timing is instead a pre-submission acceptance gate: the full-scale 4,632-row GPU rehearsal must project below 25 minutes on the L4. This is a measured acceptance criterion, not a runtime guarantee; a skipped rehearsal does not approve a submission.
+
+Run the pre-submission checks on the exact fitted bundle and shipped weights:
+
+```bash
+uv run pytest tests/integration/test_budget.py -m slow -k 'llm_server_budget_projection or llm_row_independence' --log-cli-level=INFO
+```
+
+`LLM_BUDGET_MODEL_DIR` can select a separate timing-only bundle for development.
+Such a rehearsal does not establish accuracy or approve a different final bundle;
+repeat the checks on the final artifacts before submission.
+
+**Row-local limit rehearsal (2026-10-23, RTX 4070 Ti).** Both slow checks passed
+with call-sign memory disabled: 4,632 rows, 1,191 Hangul rows, 382 distinct Hangul
+names; load 3.14 s, LLM stage 147.12 s (0.385 s/name), total 179.86 s, peak RSS
+4,913 MB. The specified projection is `147.12 * 2 + (179.86 - 147.12) + 120 =
+446.98 s` (7.45 min), below 25 min. This pseudo file repeats names; conservatively
+extrapolating generation to 1,064 distinct names gives about 16.2 min with the
+same non-LLM overhead, not a measured server runtime. Full-file and shuffled-file
+predictions matched, and five Hangul rows matched when predicted alone or as a
+subset, without memory overrides.
+
+The timing-only bundle at `artifacts/rehearsal/llm_row_local_64` was fitted on all
+provided train rows without LLM training alternatives, because the existing
+production bundle has 53 features while current code expects 60. These checks
+establish serving timing and row independence, not model accuracy or final-bundle
+approval. Aggregate logs: `artifacts/rehearsal/llm_row_local_64/rehearsal_memory_off.log`.
+
 ### Decisions
-- **No LLMs or large neural models.** CPU rules plus a learned transliteration cost and a GBDT ranker already reach the target. This keeps inference time and ZIP size small, which are the tie-breakers, and avoids synthetic-label compliance questions.
+- **Pretrained models allowed (revised 2026-10-23).** The original self-imposed "no LLMs or large neural models" decision is withdrawn: the competition explicitly allows publicly available general pretrained weights, and the server ships torch, transformers and an L4 GPU. LB decoding showed that the rule-based Korean name channel does not generalize to test-style Hangul names (test Korean name-only 0.628 vs CV 0.874). Constraints that still hold: weights ship inside the ZIP (no runtime downloads), fine-tuning uses only `train.csv`/`vessel_catalog.csv`, inference stays deterministic and row-independent, and inference time and ZIP size remain tie-breakers.
 - **Call-sign memory: adopted as a deterministic override.** It is a lookup table fitted on `train.csv` (allowed training artifact, row-independent). The hash is a stable vessel identity: 1:1 in train and invariant to renames and script. It has no effect if test is vessel-disjoint and is exact otherwise. Vessel-disjoint CV cannot learn its weight, so it is applied as a rule after ranking rather than as a ranker feature. Its effect is measured by an on/off LB probe.
 - **Matcher v2 candidates (evidence in §2.5; implemented in §2.6):**
   - adopt key v2 rules and features, without the pinyin rule;

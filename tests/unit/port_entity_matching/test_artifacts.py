@@ -220,3 +220,55 @@ def test_invalid_manifest_normalization_rejected(tmp_path, key, value) -> None:
     path.write_text(json.dumps(manifest), encoding="utf-8")
     with pytest.raises(ValueError, match=r"numeric|finite|positive"):
         ArtifactBundle.load(tmp_path, _index())
+
+
+def test_fewshot_round_trip(tmp_path) -> None:
+    bundle = _bundle()
+    fewshot = (("글로비스 스피릿", "GLOVIS SPIRIT"), ("흥아", "HEUNG-A"))
+    bundle = ArtifactBundle(
+        ranker=bundle.ranker, maps=bundle.maps, memory=bundle.memory, config=bundle.config, fewshot=fewshot
+    )
+    bundle.save(tmp_path)
+    assert (tmp_path / "llm_fewshot.json").is_file()
+    pairs = json.loads((tmp_path / "llm_fewshot.json").read_text(encoding="utf-8"))
+    assert pairs == [["글로비스 스피릿", "GLOVIS SPIRIT"], ["흥아", "HEUNG-A"]]
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["llm"] == {"fewshot_file": "llm_fewshot.json", "weights_dir": "llm"}
+    restored = ArtifactBundle.load(tmp_path, _index())
+    assert restored.fewshot == fewshot
+
+
+def test_legacy_manifest_without_llm_loads_empty_fewshot(tmp_path) -> None:
+    bundle = _bundle()
+    bundle.save(tmp_path)
+    path = tmp_path / "manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    del manifest["llm"]
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    assert ArtifactBundle.load(tmp_path, _index()).fewshot == ()
+
+
+def test_missing_fewshot_file_rejected(tmp_path) -> None:
+    bundle = _bundle()
+    bundle.save(tmp_path)
+    (tmp_path / "llm_fewshot.json").unlink()
+    with pytest.raises(FileNotFoundError, match=r"llm_fewshot\.json"):
+        ArtifactBundle.load(tmp_path, _index())
+
+
+def test_malformed_llm_section_rejected(tmp_path) -> None:
+    _bundle().save(tmp_path)
+    path = tmp_path / "manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    manifest["llm"] = []
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="malformed llm section"):
+        ArtifactBundle.load(tmp_path, _index())
+
+
+@pytest.mark.parametrize("pairs", [{}, ["pair"], [["only-one"]], [["가나", 1]]])
+def test_malformed_fewshot_rejected(tmp_path, pairs) -> None:
+    _bundle().save(tmp_path)
+    (tmp_path / "llm_fewshot.json").write_text(json.dumps(pairs), encoding="utf-8")
+    with pytest.raises(ValueError, match=r"contain a list|malformed pair"):
+        ArtifactBundle.load(tmp_path, _index())

@@ -158,7 +158,7 @@ def test_llm_retrieval_fingerprint_and_alt_name_keys(tmp_path: Path) -> None:
         ("llm_fewshot_seed", 1),
         ("llm_num_beams", 6),
         ("llm_max_new_tokens", 25),
-        ("llm_time_budget_s", 1.0),
+        ("llm_max_name_chars", 32),
         ("augment_hangul_notation", True),
     ]:
         assert retrieval_fingerprint(catalog, dataclasses.replace(config, **{field: value})) == base

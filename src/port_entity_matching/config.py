@@ -57,7 +57,7 @@ class MatchConfig:
     llm_num_beams: int = 5
     llm_max_new_tokens: int = 24
     llm_retrieval_beams: int = 2
-    llm_time_budget_s: float = 1200.0
+    llm_max_name_chars: int = 64
 
 
 def config_to_dict(config: MatchConfig) -> dict[str, int | float]:

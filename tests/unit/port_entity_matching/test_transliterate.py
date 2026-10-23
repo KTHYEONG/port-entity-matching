@@ -171,7 +171,7 @@ def test_load_rejects_invalid_llm_config(tmp_path: Path) -> None:
         ("llm_max_new_tokens", 0),
         ("llm_retrieval_beams", 6),
         ("llm_retrieval_beams", -1),
-        ("llm_time_budget_s", 0.0),
+        ("llm_max_name_chars", 0),
     ],
 )
 def test_load_rejects_each_llm_bound(tmp_path: Path, field: str, value: float) -> None:
@@ -291,7 +291,7 @@ def test_cache_fingerprint_tracks_settings_and_weights(tmp_path: Path) -> None:
     assert fingerprint((("가나", "GANA"),)) != base
     assert fingerprint(cfg=dataclasses.replace(config, llm_num_beams=6)) != base
     assert fingerprint(cfg=dataclasses.replace(config, llm_max_new_tokens=25)) != base
-    assert fingerprint(cfg=dataclasses.replace(config, llm_time_budget_s=1.0)) == base
+    assert fingerprint(cfg=dataclasses.replace(config, llm_max_name_chars=32)) != base
     (weights / "config.json").write_text("{}", encoding="utf-8")
     assert fingerprint() != base
 
@@ -491,12 +491,26 @@ def test_translate_beam_cleanup_and_row_independence(tmp_path: Path, monkeypatch
         assert call["max_new_tokens"] == 24
 
 
-def test_translate_honors_deadline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    tokenizer = _FakeTokenizer([])
+def test_translate_bounds_name_and_keeps_original_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    name = "가" * 80
+    tokenizer = _FakeTokenizer(["SHIP"] * 5)
     _install_fake_stack(monkeypatch, tokenizer)
+    loaded = Transliterator.load(_weights_with_config(tmp_path), [(name, "SHOT")], MatchConfig())
+    assert loaded.translate([name]) == {name: ("SHIP",)}
+    messages = tokenizer.chat_calls[0]["messages"]
+    assert messages[1] == {"role": "user", "content": name[:64]}
+    assert messages[-1] == {"role": "user", "content": name[:64]}
+
+
+def test_elapsed_time_cannot_skip_names(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    tokenizer = _FakeTokenizer(["SHIP"] * 10)
+    model = _install_fake_stack(monkeypatch, tokenizer)
     loaded = Transliterator.load(_weights_with_config(tmp_path), [], MatchConfig())
-    assert loaded.translate(["글로비스 스피릿"], deadline=time.perf_counter() - 1.0) == {}
-    assert tokenizer.chat_calls == []
+    clock = iter((0.0, 3600.0))
+    monkeypatch.setattr("port_entity_matching.transliterate.time.perf_counter", lambda: next(clock))
+    names = ["가" * 80, "다" * 80]
+    assert loaded.translate(names) == dict.fromkeys(names, ("SHIP",))
+    assert len(model.generate_calls) == 2
 
 
 def test_translate_without_attention_mask(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

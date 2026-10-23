@@ -22,6 +22,8 @@ MEMBER_FILE_TEMPLATE = "model_{index}.txt"
 MAPS_FILE = "maps.json"
 MEMORY_FILE = "memory.json"
 MANIFEST_FILE = "manifest.json"
+FEWSHOT_FILE = "llm_fewshot.json"
+LLM_WEIGHTS_DIR = "llm"
 
 
 @dataclass(frozen=True)
@@ -45,6 +47,10 @@ class ArtifactBundle:
             files.append(name)
         self.maps.to_json(destination / MAPS_FILE)
         self.memory.to_json(destination / MEMORY_FILE)
+        (destination / FEWSHOT_FILE).write_text(
+            json.dumps([list(pair) for pair in self.fewshot], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
         manifest = {
             "feature_names": list(FEATURE_NAMES),
             "config": config_to_dict(self.config),
@@ -54,6 +60,7 @@ class ArtifactBundle:
                 "means": list(self.ranker.means),
                 "stds": list(self.ranker.stds),
             },
+            "llm": {"fewshot_file": FEWSHOT_FILE, "weights_dir": LLM_WEIGHTS_DIR},
         }
         (destination / MANIFEST_FILE).write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8"
@@ -106,4 +113,28 @@ class ArtifactBundle:
         )
         maps = AttributeMaps.from_json(source / MAPS_FILE)
         memory = CallSignMemory.from_json(source / MEMORY_FILE, index)
-        return cls(ranker=ranker, maps=maps, memory=memory, config=config_from_dict(raw_config))
+        llm_section = manifest.get("llm")
+        if llm_section is None:
+            fewshot: tuple[tuple[str, str], ...] = ()
+        else:
+            if not isinstance(llm_section, dict):
+                raise ValueError(f"Artifact manifest {source / MANIFEST_FILE} has a malformed llm section")
+            fewshot_name = llm_section.get("fewshot_file", FEWSHOT_FILE)
+            fewshot_path = source / str(fewshot_name)
+            if not fewshot_path.is_file():
+                raise FileNotFoundError(f"Artifact file not found: {fewshot_path}")
+            raw_pairs = json.loads(fewshot_path.read_text(encoding="utf-8"))
+            if not isinstance(raw_pairs, list):
+                raise ValueError(f"Artifact fewshot file {fewshot_path} must contain a list")
+            parsed: list[tuple[str, str]] = []
+            for entry in raw_pairs:
+                if (
+                    not isinstance(entry, list)
+                    or len(entry) != 2
+                    or not isinstance(entry[0], str)
+                    or not isinstance(entry[1], str)
+                ):
+                    raise ValueError(f"Artifact fewshot file {fewshot_path} has a malformed pair")
+                parsed.append((entry[0], entry[1]))
+            fewshot = tuple(parsed)
+        return cls(ranker=ranker, maps=maps, memory=memory, config=config_from_dict(raw_config), fewshot=fewshot)

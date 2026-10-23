@@ -29,6 +29,11 @@ from port_entity_matching.records import (
     read_csv_checked,
     records_from_frame,
 )
+from port_entity_matching.transliterate import (
+    Transliterator,
+    TransliteratorUnavailable,
+    attach_alt_names,
+)
 
 __all__ = ["Matcher", "Prediction", "run_submission"]
 
@@ -60,22 +65,40 @@ class _Ranked:
 class Matcher:
     """Catalog index + fitted bundle; predicts one vessel_id per record independently."""
 
-    def __init__(self, index: CatalogIndex, bundle: ArtifactBundle) -> None:
+    def __init__(self, index: CatalogIndex, bundle: ArtifactBundle, transliterator: Transliterator | None = None) -> None:
         """Bind a built catalog index to a loaded bundle."""
         if bundle.config.batch_size < 1:
             raise ValueError("batch_size must be positive")
         self.index = index
         self.bundle = bundle
+        self.transliterator = transliterator
+        self.llm_load_seconds = 0.0
+        self.llm_seconds = 0.0
 
     @classmethod
     def from_dir(cls, model_dir: str | Path, catalog: pd.DataFrame) -> Matcher:
-        """Build CatalogIndex from catalog and load ArtifactBundle from model_dir."""
+        """Build index, load bundle, and load the transliterator from <model_dir>/llm when enabled and available."""
         index = CatalogIndex.build(catalog)
         bundle = ArtifactBundle.load(model_dir, index)
-        return cls(index, bundle)
+        transliterator: Transliterator | None = None
+        load_seconds = 0.0
+        if bundle.config.llm_enabled and bundle.fewshot:
+            started = time.perf_counter()
+            try:
+                transliterator = Transliterator.load(Path(model_dir) / "llm", bundle.fewshot, bundle.config)
+            except TransliteratorUnavailable as error:
+                logger.warning("[SYS] llm unavailable reason=%s", type(error).__name__)
+                transliterator = None
+            finally:
+                load_seconds = time.perf_counter() - started
+            logger.info("[SYS] llm_load_seconds=%.2f", load_seconds)
+        matcher = cls(index, bundle, transliterator)
+        matcher.llm_load_seconds = load_seconds
+        return matcher
 
     def predict(self, records: Sequence[QueryRecord]) -> list[str]:
         """One catalog vessel_id per record, in input order."""
+        records = self._apply_llm(records)
         ranked = self._rank(records)
         self._log_summary(records, ranked)
         predictions: list[str] = []
@@ -88,6 +111,7 @@ class Matcher:
         """Ranked top-k ids and scores per record for error analysis."""
         if k < 1:
             raise ValueError("k must be at least 1")
+        records = self._apply_llm(records)
         ranked = self._rank(records)
         self._log_summary(records, ranked)
         predictions: list[Prediction] = []
@@ -115,6 +139,32 @@ class Matcher:
                 )
             )
         return predictions
+
+    def _apply_llm(self, records: Sequence[QueryRecord]) -> list[QueryRecord]:
+        """Attach transliterated alt names for Hangul records lacking them."""
+        records = list(records)
+        if not self.bundle.config.llm_enabled or self.transliterator is None or not records:
+            return records
+        names = sorted(
+            {record.vessel_name for record in records if not record.alt_names and is_hangul_name(record.vessel_name)}
+        )
+        if not names:
+            return records
+        started = time.perf_counter()
+        table = self.transliterator.translate(names)
+        elapsed = time.perf_counter() - started
+        self.llm_seconds += elapsed
+        logger.info(
+            "[SYS] llm_seconds=%.2f names=%d generated=%d",
+            elapsed,
+            len(names),
+            len(table),
+        )
+        pending = [record for record in records if not record.alt_names]
+        attached_pending: list[QueryRecord] = attach_alt_names(pending, table)
+        replacements = iter(attached_pending)
+        attached = [record if record.alt_names else next(replacements) for record in records]
+        return attached
 
     def _rank(self, records: Sequence[QueryRecord]) -> list[_Ranked]:
         """Rank candidates for every record, processing fixed-size chunks."""
@@ -192,7 +242,13 @@ def run_submission(
     )
 
     matcher = Matcher.from_dir(model_dir, catalog)
+    llm_load_seconds = matcher.llm_load_seconds
     predictions = matcher.predict(records)
+    logger.info(
+        "[SYS] llm_load_seconds=%.2f llm_seconds=%.2f",
+        llm_load_seconds,
+        matcher.llm_seconds,
+    )
 
     known_ids = set(matcher.index.vessel_ids)
     invalid = sum(1 for prediction in predictions if prediction not in known_ids)

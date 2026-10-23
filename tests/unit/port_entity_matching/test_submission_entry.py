@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import json
 import subprocess
 import sys
 import zipfile
@@ -109,7 +110,7 @@ def _package(tmp_path: Path) -> Path:
     bundle = fit_bundle(
         _train_frame(),
         _catalog_frame(),
-        MatchConfig(lgbm_num_rounds=20, lgbm_min_data_in_leaf=1, cv_splits=2, num_threads=1),
+        MatchConfig(lgbm_num_rounds=20, lgbm_min_data_in_leaf=1, cv_splits=2, num_threads=1, llm_enabled=False),
     )
     bundle.save(root / "model" / "artifacts")
     pd.DataFrame(_TEST_ROWS).to_csv(root / "data" / "test.csv", index=False)
@@ -244,3 +245,100 @@ def test_smoke_rejects_failed_or_missing_output(tmp_path: Path, script: str) -> 
         archive.writestr("script.py", script)
     with pytest.raises(RuntimeError, match="smoke run"):
         smoke_test(archive_path, root / "data")
+
+
+def test_llm_files_packaged_stored(tmp_path: Path) -> None:
+    import json as _json
+
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    for artifact in ("model_0.txt", "maps.json", "memory.json"):
+        (model_dir / artifact).write_text("{}", encoding="utf-8")
+    (model_dir / "manifest.json").write_text(
+        _json.dumps({"config": {"llm_enabled": True}}), encoding="utf-8"
+    )
+    (model_dir / "llm_fewshot.json").write_text('[["가나", "GANA"]]', encoding="utf-8")
+    llm_dir = tmp_path / "llm"
+    llm_dir.mkdir()
+    (llm_dir / "config.json").write_text("{}", encoding="utf-8")
+    (llm_dir / "model.safetensors").write_bytes(b"weights")
+    (llm_dir / "README.md").write_text("skip", encoding="utf-8")
+
+    zip_path = build_submit(model_dir, tmp_path / "submit.zip", llm_dir=llm_dir)
+    with zipfile.ZipFile(zip_path) as archive:
+        names = archive.namelist()
+        assert "model/artifacts/llm/config.json" in names
+        assert "model/artifacts/llm/model.safetensors" in names
+        assert "model/artifacts/llm/README.md" not in names
+        info = archive.getinfo("model/artifacts/llm/model.safetensors")
+        assert info.compress_type == zipfile.ZIP_STORED
+
+
+def test_missing_llm_weights_fail_closed(tmp_path: Path) -> None:
+    import json as _json
+
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    for artifact in ("model_0.txt", "maps.json", "memory.json"):
+        (model_dir / artifact).write_text("{}", encoding="utf-8")
+    (model_dir / "manifest.json").write_text(
+        _json.dumps({"config": {"llm_enabled": True}}), encoding="utf-8"
+    )
+    (model_dir / "llm_fewshot.json").write_text("[]", encoding="utf-8")
+    llm_dir = tmp_path / "llm"
+    llm_dir.mkdir()
+    (llm_dir / "config.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(SystemExit) as error:
+        build_submit(model_dir, tmp_path / "submit.zip", llm_dir=llm_dir)
+    assert error.value.code == 1
+
+
+@pytest.mark.parametrize("limit", ["MAX_COMPRESSED_BYTES", "MAX_UNCOMPRESSED_BYTES"])
+def test_zip_size_limits_remove_oversized_archive(tmp_path: Path, monkeypatch, limit: str) -> None:
+    import tools.build_submit as builder
+
+    root = _package(tmp_path)
+    monkeypatch.setattr(builder, limit, 1)
+    output = tmp_path / "too-large.zip"
+    with pytest.raises(ValueError, match="size budget"):
+        builder.build_submit(root / "model" / "artifacts", output)
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("manifest", ["{", "[]", '{"config": []}'])
+def test_malformed_manifest_fails_closed(tmp_path: Path, manifest: str) -> None:
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "manifest.json").write_text(manifest, encoding="utf-8")
+    with pytest.raises(ValueError, match="manifest"):
+        build_submit(model, tmp_path / "submit.zip")
+
+
+def test_llm_packaging_streams_symlinks_without_copying_dev_directory(tmp_path: Path, monkeypatch) -> None:
+    root = _package(tmp_path)
+    model = root / "model" / "artifacts"
+    manifest_path = model / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["config"]["llm_enabled"] = True
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    weights = tmp_path / "weights"
+    weights.mkdir()
+    (weights / "config.json").write_text("{}", encoding="utf-8")
+    blob = tmp_path / "blob"
+    blob.write_bytes(b"weights")
+    (weights / "model.safetensors").symlink_to(blob)
+    (weights / "LICENSE").write_text("license", encoding="utf-8")
+    (weights / "README.md").write_text("excluded", encoding="utf-8")
+    (model / "llm").symlink_to(weights, target_is_directory=True)
+
+    def reject_read_bytes(self):
+        raise AssertionError("ZIP entries must be streamed")
+
+    monkeypatch.setattr(Path, "read_bytes", reject_read_bytes)
+    output = build_submit(model, tmp_path / "submit.zip", llm_dir=weights)
+    with zipfile.ZipFile(output) as archive:
+        assert archive.read("model/artifacts/llm/model.safetensors") == b"weights"
+        assert "model/artifacts/llm/LICENSE" in archive.namelist()
+        assert "model/artifacts/llm/README.md" not in archive.namelist()
+    with pytest.raises(ValueError, match="outside the LLM"):
+        build_submit(model, weights / "config.json", llm_dir=weights)

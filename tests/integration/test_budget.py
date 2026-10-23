@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import json
+import os
 import re
 import time
 from pathlib import Path
@@ -12,18 +14,20 @@ import pytest
 
 from port_entity_matching.config import MatchConfig
 from port_entity_matching.evaluation.stats import bucket_scores
-from port_entity_matching.pipeline import run_submission
-from port_entity_matching.records import CATALOG_COLUMNS, RECORD_COLUMNS, read_csv_checked
+from port_entity_matching.normalize import is_hangul_name
+from port_entity_matching.pipeline import Matcher, run_submission
+from port_entity_matching.records import CATALOG_COLUMNS, RECORD_COLUMNS, read_csv_checked, records_from_frame
 from port_entity_matching.train import cross_validate, cross_validate_run
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = REPO_ROOT / "data" / "raw" / "open"
 MODEL_DIR = REPO_ROOT / "artifacts" / "model"
+LLM_MODEL_DIR = Path(os.environ.get("LLM_BUDGET_MODEL_DIR", str(MODEL_DIR)))
 TRAIN_PATH = DATA_DIR / "train.csv"
 CATALOG_PATH = DATA_DIR / "vessel_catalog.csv"
 
 REHEARSAL_ROWS = 3000
-TIME_BUDGET_SECONDS = 300.0
+TIME_BUDGET_SECONDS = 900.0
 PEAK_RSS_LIMIT_MB = 8 * 1024
 HANGUL_FLOOR = 0.95
 NON_HANGUL_FLOOR = 0.995
@@ -31,11 +35,11 @@ NON_HANGUL_FLOOR = 0.995
 pytestmark = pytest.mark.slow
 
 
-def _require_inputs() -> None:
+def _require_inputs(model_dir: Path = MODEL_DIR) -> None:
     if not DATA_DIR.is_dir():
         pytest.skip(f"competition data not available at {DATA_DIR}")
-    if not MODEL_DIR.is_dir():
-        pytest.skip(f"fitted artifacts not available at {MODEL_DIR}")
+    if not model_dir.is_dir():
+        pytest.skip(f"fitted artifacts not available at {model_dir}")
 
 
 def test_full_catalog_rehearsal(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
@@ -98,3 +102,83 @@ def _logged_peak_rss(caplog: pytest.LogCaptureFixture) -> list[str]:
             continue
         values.extend(re.findall(r"peak_rss_mb=([0-9.]+)", message))
     return values
+
+
+def _require_llm() -> None:
+    _require_inputs(LLM_MODEL_DIR)
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    if not (LLM_MODEL_DIR / "llm" / "config.json").is_file():
+        pytest.skip(f"transliteration weights not available at {LLM_MODEL_DIR / 'llm'}")
+    manifest = json.loads((LLM_MODEL_DIR / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["config"]["llm_enabled"], "LLM rehearsal requires an enabled bundle"
+    shots = LLM_MODEL_DIR / manifest["llm"]["fewshot_file"]
+    assert json.loads(shots.read_text(encoding="utf-8")), "LLM rehearsal requires few-shot pairs"
+
+
+def _pseudo_llm_frame(train: pd.DataFrame, total: int = 4632) -> pd.DataFrame:
+    hangul = train[train["vessel_name"].map(is_hangul_name)]
+    latin = train[~train["vessel_name"].map(is_hangul_name)]
+    need = max(0, total - len(hangul))
+    frame = pd.concat([hangul, latin.head(need)], ignore_index=True)
+    frame = frame.drop(columns=["target_vessel_id"])
+    # Training-row memory would hide changes in the LLM/ranker path.
+    frame["call_sign"] = None
+    return frame
+
+
+def _logged_llm_seconds(caplog: pytest.LogCaptureFixture) -> float:
+    values: list[float] = []
+    for record in caplog.records:
+        values.extend(float(value) for value in re.findall(r"llm_seconds=([0-9.]+)", record.getMessage()))
+    assert values and max(values) > 0, "no active LLM stage was logged"
+    return max(values)
+
+
+def _logged_elapsed(caplog: pytest.LogCaptureFixture) -> float:
+    values: list[float] = []
+    for record in caplog.records:
+        values.extend(float(value) for value in re.findall(r"elapsed_seconds=([0-9.]+)", record.getMessage()))
+    assert values, "no elapsed_seconds was logged"
+    return max(values)
+
+
+def test_llm_server_budget_projection(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    _require_llm()
+    train = read_csv_checked(TRAIN_PATH, (*RECORD_COLUMNS, "target_vessel_id"))
+    pseudo = _pseudo_llm_frame(train)
+    assert len(pseudo) == 4632
+    test_path = tmp_path / "test.csv"
+    pseudo.to_csv(test_path, index=False)
+    output_path = tmp_path / "output" / "submission.csv"
+    with caplog.at_level(logging.INFO):
+        run_submission(test_path, CATALOG_PATH, LLM_MODEL_DIR, output_path)
+    total = _logged_elapsed(caplog)
+    llm_seconds = _logged_llm_seconds(caplog)
+    projected = llm_seconds * 2.0 + (total - llm_seconds) + 120
+    logging.getLogger(__name__).info(
+        "[EVAL] llm_budget rows=%d llm_seconds=%.2f total_seconds=%.2f projected_server_seconds=%.2f",
+        len(pseudo), llm_seconds, total, projected,
+    )
+    assert "llm unavailable" not in caplog.text
+    assert projected < 25 * 60
+
+
+def test_llm_row_independence(tmp_path: Path) -> None:
+    _require_llm()
+    train = read_csv_checked(TRAIN_PATH, (*RECORD_COLUMNS, "target_vessel_id"))
+    pseudo = _pseudo_llm_frame(train)
+    catalog = read_csv_checked(CATALOG_PATH, CATALOG_COLUMNS)
+    matcher = Matcher.from_dir(LLM_MODEL_DIR, catalog)
+    assert matcher.transliterator is not None
+    full_records = records_from_frame(pseudo)
+    full = matcher.predict(full_records)
+    selected = [position for position, record in enumerate(full_records) if is_hangul_name(record.vessel_name)][:5]
+    assert len(selected) == 5
+    alone = [matcher.predict([full_records[position]])[0] for position in selected]
+    assert [full[position] for position in selected] == alone
+    assert matcher.predict([full_records[position] for position in selected]) == alone
+    shuffled_frame = pseudo.sample(frac=1, random_state=42)
+    shuffled = matcher.predict(records_from_frame(shuffled_frame))
+    assert [full[position] for position in shuffled_frame.index] == shuffled

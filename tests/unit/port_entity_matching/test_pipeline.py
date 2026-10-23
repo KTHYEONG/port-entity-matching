@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import Mock
 
 import pandas as pd
 import pytest
@@ -12,6 +13,7 @@ from port_entity_matching.config import MatchConfig
 from port_entity_matching.pipeline import Matcher, run_submission
 from port_entity_matching.records import QueryRecord, records_from_frame
 from port_entity_matching.train import fit_bundle
+from port_entity_matching.transliterate import Transliterator, TransliteratorUnavailable
 
 _CATALOG: list[tuple[str, str, float, str, str]] = [
     ("V00", "Glovis Spirit", 5000, "Tanker", "Panama"),
@@ -320,3 +322,91 @@ def test_submission_logs_only_aggregate_values(
     for value in ("PRIVATE_SAMPLE", "CALIDA", "CS_V00_0", "V00", "PRIVATE_OUTPUT"):
         assert value not in caplog.text
     assert "memory_hits=1" in caplog.text
+
+
+def test_matcher_without_transliterator_matches_disabled_bundle(model_dir: Path) -> None:
+    catalog = _catalog_frame()
+    enabled = Matcher.from_dir(model_dir, catalog)
+    assert enabled.transliterator is None
+    disabled_bundle = replace(enabled.bundle, config=replace(enabled.bundle.config, llm_enabled=False))
+    disabled = Matcher(enabled.index, disabled_bundle)
+    rows = [_record("R0", "글로비스 스피릿", None, 5000), _record("R1", "CALIDA", None, 61332)]
+    records = _records(rows)
+    assert enabled.predict(records) == disabled.predict(records)
+
+
+def test_precomputed_alts_are_not_regenerated(matcher: Matcher) -> None:
+    import dataclasses
+
+    seen: list[list[str]] = []
+
+    class _Stub:
+        def translate(self, names):  # type: ignore[no-untyped-def]
+            seen.append(list(names))
+            return dict.fromkeys(names, ("ALT",))
+
+    matcher.transliterator = _Stub()  # type: ignore[method-assign]
+    records = _records([_record("R0", "글로비스 스피릿", None, 5000)])
+    records = [dataclasses.replace(record, alt_names=("EXISTING",)) for record in records]
+    matcher.predict(records)
+    assert seen == []
+
+
+@pytest.mark.parametrize("topk", [False, True])
+def test_llm_preserves_existing_alts_for_duplicate_names(matcher: Matcher, monkeypatch, topk: bool) -> None:
+    import port_entity_matching.pipeline as pipeline
+
+    records = _records([_record("R0", "흥아"), _record("R1", "흥아"), _record("R2", "CALIDA")])
+    records[0] = replace(records[0], alt_names=("EXISTING",))
+    stub = Mock(spec=Transliterator)
+    stub.translate.return_value = {"흥아": ("HEUNG-A",)}
+    matcher.transliterator = stub
+    observed = []
+    original = pipeline.generate_candidates
+
+    def capture(rows, *args):
+        observed.extend(rows)
+        return original(rows, *args)
+
+    monkeypatch.setattr(pipeline, "generate_candidates", capture)
+    result = matcher.predict_topk(records) if topk else matcher.predict(records)
+    assert len(result) == 3
+    assert [record.alt_names for record in observed] == [("EXISTING",), ("HEUNG-A",), ()]
+    assert records[1].alt_names == ()
+    stub.translate.assert_called_once()
+    assert stub.translate.call_args.args == (["흥아"],)
+    assert stub.translate.call_args.kwargs == {}
+
+
+def test_from_dir_unavailable_llm_falls_back(model_dir: Path, monkeypatch, caplog) -> None:
+    matcher = Matcher.from_dir(model_dir, _catalog_frame())
+    replace(matcher.bundle, fewshot=(("흥아", "HEUNG-A"),)).save(model_dir)
+    stub = Mock(side_effect=TransliteratorUnavailable("PRIVATE_NAME"))
+    monkeypatch.setattr(Transliterator, "load", stub)
+    with caplog.at_level("WARNING"):
+        fallback = Matcher.from_dir(model_dir, _catalog_frame())
+    records = _records([_record("R0", "흥아")])
+    assert fallback.predict(records) == matcher.predict(records)
+    stub.assert_called_once()
+    assert "llm unavailable reason=TransliteratorUnavailable" in caplog.text
+    assert "PRIVATE_NAME" not in caplog.text
+
+
+def test_disabled_llm_does_not_generate(matcher: Matcher) -> None:
+    stub = Mock(spec=Transliterator)
+    disabled = Matcher(matcher.index, replace(matcher.bundle, config=replace(matcher.bundle.config, llm_enabled=False)), stub)
+    assert disabled.predict(_records([_record("R0", "흥아")]))
+    stub.translate.assert_not_called()
+
+
+def test_empty_llm_alts_log_counts_without_private_values(matcher: Matcher, caplog) -> None:
+    records = _records([_record("PRIVATE_SAMPLE", "흥아")])
+    expected = matcher.predict(records)
+    stub = Mock(spec=Transliterator)
+    stub.translate.return_value = {}
+    matcher.transliterator = stub
+    with caplog.at_level("INFO"):
+        assert matcher.predict(records) == expected
+    assert "generated=0" in caplog.text
+    assert "흥아" not in caplog.text
+    assert "PRIVATE_SAMPLE" not in caplog.text

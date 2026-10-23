@@ -98,8 +98,8 @@ def _validate_llm_config(config: MatchConfig) -> None:
         raise ValueError("llm_max_new_tokens must be at least 1")
     if not 0 <= config.llm_retrieval_beams <= config.llm_num_beams:
         raise ValueError("llm_retrieval_beams must satisfy 0 <= llm_retrieval_beams <= llm_num_beams")
-    if not config.llm_time_budget_s > 0:
-        raise ValueError("llm_time_budget_s must be positive")
+    if config.llm_max_name_chars < 1:
+        raise ValueError("llm_max_name_chars must be positive")
 
 
 class Transliterator:
@@ -145,15 +145,15 @@ class Transliterator:
     def _prompt_for(self, name: str) -> str:
         messages: list[dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
         for hangul, latin in self._shots:
-            messages.append({"role": "user", "content": hangul})
+            messages.append({"role": "user", "content": hangul[: self._config.llm_max_name_chars]})
             messages.append({"role": "assistant", "content": latin})
-        messages.append({"role": "user", "content": name})
+        messages.append({"role": "user", "content": name[: self._config.llm_max_name_chars]})
         rendered: Any = self._tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
         )
         return str(rendered)
 
-    def translate(self, names: Sequence[str], deadline: float | None = None) -> dict[str, tuple[str, ...]]:
+    def translate(self, names: Sequence[str]) -> dict[str, tuple[str, ...]]:
         """Map each distinct Hangul name to its Latin n-best list in sorted order."""
         import torch
 
@@ -162,8 +162,6 @@ class Transliterator:
         generated = 0
         started = time.perf_counter()
         for name in distinct:
-            if deadline is not None and time.perf_counter() > deadline:
-                break
             prompt = self._prompt_for(name)
             inputs = self._tokenizer(prompt, return_tensors="pt")
             input_ids = inputs["input_ids"].to(self._model.device)
@@ -191,14 +189,12 @@ class Transliterator:
                     beams.append(cleaned)
             out[name] = tuple(beams)
             generated += 1
-        skipped = len(distinct) - len(out)
         elapsed = time.perf_counter() - started
         per_name = elapsed / generated if generated else 0.0
         logger.info(
-            "[ALGO] translit names=%d generated=%d skipped_by_deadline=%d seconds=%.2f seconds_per_name=%.3f",
+            "[ALGO] translit names=%d generated=%d seconds=%.2f seconds_per_name=%.3f",
             len(distinct),
             generated,
-            skipped,
             elapsed,
             per_name,
         )
@@ -211,7 +207,13 @@ def _translit_fingerprint(shots: Sequence[tuple[str, str]], config: MatchConfig,
     digest.update(b"\x1f")
     digest.update(json.dumps([list(pair) for pair in shots], ensure_ascii=False, sort_keys=True).encode("utf-8"))
     digest.update(b"\x1f")
-    digest.update(json.dumps({"beams": config.llm_num_beams, "new_tokens": config.llm_max_new_tokens}).encode())
+    digest.update(
+        json.dumps({
+            "beams": config.llm_num_beams,
+            "new_tokens": config.llm_max_new_tokens,
+            "max_name_chars": config.llm_max_name_chars,
+        }).encode()
+    )
     digest.update(b"\x1f")
     config_path = Path(weights_dir) / "config.json"
     try:

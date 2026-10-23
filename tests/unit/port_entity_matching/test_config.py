@@ -40,7 +40,7 @@ def test_legacy_manifest_uses_llm_defaults() -> None:
     assert config.llm_enabled is True
     assert (config.llm_fewshot, config.llm_fewshot_seed) == (12, 0)
     assert (config.llm_num_beams, config.llm_max_new_tokens, config.llm_retrieval_beams) == (5, 24, 2)
-    assert config.llm_time_budget_s == 1200.0
+    assert config.llm_max_name_chars == 64
 
 
 def test_old_manifest_uses_token_retrieval_defaults() -> None:
