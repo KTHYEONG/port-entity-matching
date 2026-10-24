@@ -36,12 +36,15 @@ def test_missing_keys_use_defaults() -> None:
 
 def test_legacy_manifest_uses_llm_defaults() -> None:
     config = config_from_dict({"name_top_k": 5})
-    assert config.augment_hangul_notation is True
+    assert config.augment_hangul_notation is False
     assert config.augment_hangul_tonnage_noise is False
     assert config.llm_enabled is True
     assert (config.llm_fewshot, config.llm_fewshot_seed) == (12, 0)
     assert (config.llm_num_beams, config.llm_max_new_tokens, config.llm_retrieval_beams) == (5, 24, 2)
     assert config.llm_max_name_chars == 64
+    assert config.llm_rerank_enabled is True
+    assert config.llm_rerank_top_k == 10
+    assert config.llm_rerank_weight == 0.2
 
 
 def test_old_manifest_uses_token_retrieval_defaults() -> None:
@@ -89,6 +92,18 @@ def test_notation_augmentation_defaults_and_round_trip() -> None:
     assert config.augment_tonnage_low == 0.05
     assert config.augment_tonnage_high == 0.25
     assert config_from_dict(config_to_dict(config)) == config
+
+
+def test_notation_copies_off_by_default() -> None:
+    assert MatchConfig().augment_hangul_notation is False
+
+
+def test_rerank_defaults() -> None:
+    config = MatchConfig()
+    assert config.llm_rerank_enabled is True
+    assert config.llm_rerank_top_k == 10
+    assert config.llm_rerank_weight == 0.2
+    assert config_from_dict({}) == config
 
 
 def test_old_manifest_without_notation_fields_uses_defaults() -> None:

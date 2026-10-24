@@ -46,7 +46,7 @@ class MatchConfig:
     augment_min_syllables: int = 3
     augment_seed: int = 0
     augment_notation: bool = True
-    augment_hangul_notation: bool = True
+    augment_hangul_notation: bool = False
     augment_hangul_tonnage_noise: bool = False
     augment_latin_rate: float = 0.3
     augment_tonnage_low: float = 0.05
@@ -59,6 +59,9 @@ class MatchConfig:
     llm_max_new_tokens: int = 24
     llm_retrieval_beams: int = 2
     llm_max_name_chars: int = 64
+    llm_rerank_enabled: bool = True
+    llm_rerank_top_k: int = 10
+    llm_rerank_weight: float = 0.2
 
 
 def config_to_dict(config: MatchConfig) -> dict[str, int | float]:

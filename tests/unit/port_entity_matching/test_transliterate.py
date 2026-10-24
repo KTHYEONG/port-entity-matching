@@ -172,6 +172,9 @@ def test_load_rejects_invalid_llm_config(tmp_path: Path) -> None:
         ("llm_retrieval_beams", 6),
         ("llm_retrieval_beams", -1),
         ("llm_max_name_chars", 0),
+        ("llm_rerank_weight", float("nan")),
+        ("llm_rerank_weight", float("inf")),
+        ("llm_rerank_weight", float("-inf")),
     ],
 )
 def test_load_rejects_each_llm_bound(tmp_path: Path, field: str, value: float) -> None:
@@ -330,11 +333,20 @@ class _FakeTokenizer:
         self._texts = texts
         self._with_mask = with_mask
         self.padding_side = "right"
+        self.pad_token_id = None
         self.chat_calls: list[dict[str, object]] = []
 
     def apply_chat_template(self, messages, **kwargs):  # type: ignore[no-untyped-def]
         self.chat_calls.append({"messages": messages, **kwargs})
-        return "PROMPT:" + str(messages[-1]["content"])
+        return "PROMPT:" + str(messages[-1]["content"]) + "<|eot|>"
+
+    def encode(self, text, add_special_tokens=False):  # type: ignore[no-untyped-def]
+        assert add_special_tokens is False
+        if text == "<|eot|>":
+            return [7]
+        if text == "":
+            return []
+        return [(ord(c) % 90) + 10 for c in text[:8]]
 
     def __call__(self, prompt, return_tensors=None):  # type: ignore[no-untyped-def]
         payload: dict[str, _FakeTensor] = {"input_ids": _FakeTensor()}
@@ -350,10 +362,13 @@ class _FakeTokenizer:
 
 class _FakeModel:
     def __init__(self, beams: int = 5) -> None:
+        import types as _types
+
         self.device = "cuda"
         self.beams = beams
         self.evaled = False
         self.generate_calls: list[dict[str, object]] = []
+        self.generation_config = _types.SimpleNamespace(eos_token_id=2, pad_token_id=None)
 
     def eval(self) -> _FakeModel:
         self.evaled = True
@@ -473,7 +488,7 @@ def test_translate_beam_cleanup_and_row_independence(tmp_path: Path, monkeypatch
     assert out["글로비스 스피릿"] == ("SHIP C", "SHIP D")
     tokenizer._texts = ["SHIP A\ntrailing line", "SHIP A", "", "   ", "SHIP B"]
     assert loaded.translate(["그랜드 에이스", "그랜드 에이스"]) == {"그랜드 에이스": out["그랜드 에이스"]}
-    first_call = tokenizer.chat_calls[0]
+    first_call = tokenizer.chat_calls[1]
     assert first_call["add_generation_prompt"] is True
     assert first_call["enable_thinking"] is False
     messages = first_call["messages"]
@@ -497,7 +512,7 @@ def test_translate_bounds_name_and_keeps_original_key(tmp_path: Path, monkeypatc
     _install_fake_stack(monkeypatch, tokenizer)
     loaded = Transliterator.load(_weights_with_config(tmp_path), [(name, "SHOT")], MatchConfig())
     assert loaded.translate([name]) == {name: ("SHIP",)}
-    messages = tokenizer.chat_calls[0]["messages"]
+    messages = tokenizer.chat_calls[1]["messages"]
     assert messages[1] == {"role": "user", "content": name[:64]}
     assert messages[-1] == {"role": "user", "content": name[:64]}
 
@@ -543,3 +558,389 @@ def test_single_name_equals_batch_call() -> None:
     assert single[names[0]] == batch[names[0]]
     assert model.translate(names) == batch
     assert json.dumps(single, ensure_ascii=False)
+
+
+class _EotTokenizer:
+    def __init__(self, tail: str = "<|eot|>", tail_ids: tuple[int, ...] = (7,)) -> None:
+        self._tail = tail
+        self._tail_ids = tail_ids
+        self.padding_side = "right"
+        self.pad_token_id = None
+
+    def apply_chat_template(self, messages, **kwargs):  # type: ignore[no-untyped-def]
+        assert kwargs.get("tokenize") is False
+        return "PREFIX " + str(messages[1]["content"]) + self._tail
+
+    def encode(self, text, add_special_tokens=False):  # type: ignore[no-untyped-def]
+        assert add_special_tokens is False
+        if text == self._tail:
+            return list(self._tail_ids)
+        if text == "":
+            return []
+        return [(ord(c) % 90) + 10 for c in text]
+
+
+class _NoSentinelTokenizer(_EotTokenizer):
+    def apply_chat_template(self, messages, **kwargs):  # type: ignore[no-untyped-def]
+        return "PREFIX without content"
+
+
+class _ScoreTokenizer:
+    def __init__(self, eot_id: int = 99) -> None:
+        self._eot = eot_id
+        self.padding_side = "left"
+        self.pad_token_id = None
+
+    def apply_chat_template(self, messages, **kwargs):  # type: ignore[no-untyped-def]
+        return "PROMPT:" + str(messages[-1]["content"]) + "<|eot|>"
+
+    def encode(self, text, add_special_tokens=False):  # type: ignore[no-untyped-def]
+        if text == "<|eot|>":
+            return [self._eot]
+        if text.startswith("PROMPT:"):
+            return [1, 2, 3]
+        if text == "":
+            return []
+        out: list[int] = []
+        for ch in text:
+            if ch == " ":
+                continue
+            out.append((ord(ch) % 60) + 10)
+        return out
+
+
+class _ScoreOut:
+    def __init__(self, logits, past=None):  # type: ignore[no-untyped-def]
+        self.logits = logits
+        self.past_key_values = past
+
+
+class _ScoreModel:
+    def __init__(self) -> None:
+        import torch
+
+        self._torch = torch
+        self.device = "cpu"
+        self.calls = 0
+
+    def __call__(self, input_ids=None, past_key_values=None, attention_mask=None, use_cache=True):  # type: ignore[no-untyped-def]
+        self.calls += 1
+        torch = self._torch
+        if past_key_values is None:
+            past = ((torch.zeros(input_ids.shape[0], 1, 2, 2), torch.zeros(input_ids.shape[0], 1, 2, 2)),)
+            logits = torch.zeros(input_ids.shape[0], input_ids.shape[1], 128)
+            return _ScoreOut(logits, past)
+        logits = torch.zeros(input_ids.shape[0], input_ids.shape[1], 128)
+        logits[..., 10] += 1.0
+        return _ScoreOut(logits, past_key_values)
+
+
+def _scoring_translator() -> Transliterator:
+    tok = _ScoreTokenizer()
+    model = _ScoreModel()
+    return Transliterator(model, tok, [], MatchConfig())  # type: ignore[arg-type]
+
+
+def test_end_of_turn_id_from_template() -> None:
+    from port_entity_matching.transliterate import end_of_turn_token_id
+
+    assert end_of_turn_token_id(_EotTokenizer()) == 7
+
+
+def test_end_of_turn_missing_sentinel_raises() -> None:
+    from port_entity_matching.transliterate import TransliteratorUnavailable, end_of_turn_token_id
+
+    with pytest.raises(TransliteratorUnavailable):
+        end_of_turn_token_id(_NoSentinelTokenizer())
+
+
+def test_load_adds_end_of_turn_to_eos(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+    import types
+
+    tok = _EotTokenizer()
+    model_holder: dict[str, object] = {}
+
+    class _Gen:
+        def __init__(self) -> None:
+            self.eos_token_id = 2
+            self.pad_token_id = None
+
+    class _M:
+        def __init__(self) -> None:
+            self.device = "cpu"
+            self.generation_config = _Gen()
+
+        def eval(self):  # type: ignore[no-untyped-def]
+            return self
+
+    inst = _M()
+    model_holder["inst"] = inst
+    torch_mod = types.ModuleType("torch")
+    torch_mod.cuda = types.SimpleNamespace(is_available=lambda: True)  # type: ignore[attr-defined]
+    torch_mod.bfloat16 = "bfloat16"  # type: ignore[attr-defined]
+    torch_mod.inference_mode = _null_context  # type: ignore[attr-defined]
+    transformers_mod = types.ModuleType("transformers")
+
+    class _FakeAutoTokenizer:
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):  # type: ignore[no-untyped-def]
+            return tok
+
+    class _FakeAutoModel:
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):  # type: ignore[no-untyped-def]
+            return inst
+
+    transformers_mod.AutoTokenizer = _FakeAutoTokenizer  # type: ignore[attr-defined]
+    transformers_mod.AutoModelForCausalLM = _FakeAutoModel  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "torch", torch_mod)
+    monkeypatch.setitem(sys.modules, "transformers", transformers_mod)
+    loaded = Transliterator.load(_weights_with_config(tmp_path), [], MatchConfig())
+    assert loaded._model.generation_config.eos_token_id == [2, 7]  # type: ignore[union-attr]
+
+
+def test_score_candidates_preserves_order_and_duplicates() -> None:
+    tr = _scoring_translator()
+    out = tr.score_candidates("가나", ["B", "A", "B"])
+    assert len(out) == 3
+    assert out[0] == out[2]
+    mapped = tr.score_candidates("가나", ["A", "B"])
+    assert out[0] == mapped[1]
+    assert out[1] == mapped[0]
+
+
+def test_score_candidates_row_independent() -> None:
+    tr = _scoring_translator()
+    first = tr.score_candidates("가나", ["A", "B"])
+    tr.score_candidates("다라", ["C", "D"])
+    assert tr.score_candidates("가나", ["A", "B"]) == first
+
+
+def test_score_candidates_empty_input() -> None:
+    tr = _scoring_translator()
+    assert tr.score_candidates("가나", []) == ()
+    assert tr._model.calls == 0
+
+
+@pytest.mark.parametrize("modern_cache", [False, True])
+def test_candidate_scores_match_causal_full_forward(modern_cache: bool) -> None:
+    import types
+
+    import torch
+
+    class Cache:
+        def __init__(self) -> None:
+            self.batch_size = 1
+
+        def batch_repeat_interleave(self, repeats):  # type: ignore[no-untyped-def]
+            self.batch_size *= repeats
+
+    class Model:
+        device = "cpu"
+
+        def __init__(self) -> None:
+            self.shapes: list[tuple[int, ...]] = []
+
+        def __call__(self, input_ids, past_key_values=None, attention_mask=None, use_cache=True):  # type: ignore[no-untyped-def]
+            assert torch.is_inference_mode_enabled()
+            self.shapes.append(tuple(input_ids.shape))
+            if past_key_values is None:
+                assert input_ids.tolist() == [[1, 2, 3]]
+                past = Cache() if modern_cache else ((torch.zeros(1, 1, 3, 2),),)
+            else:
+                cache_batch = past_key_values.batch_size if modern_cache else past_key_values[0][0].shape[0]
+                assert cache_batch == 3
+                assert input_ids.tolist() == [[99, 99, 99], [15, 99, 99], [16, 17, 99]]
+                assert attention_mask.tolist() == [
+                    [1, 1, 1, 1, 0, 0],
+                    [1, 1, 1, 1, 1, 0],
+                    [1, 1, 1, 1, 1, 1],
+                ]
+                past = past_key_values
+            vocab = torch.arange(128)
+            logits = -((vocab - (input_ids.unsqueeze(-1) + 1)) ** 2).to(torch.bfloat16)
+            return types.SimpleNamespace(logits=logits, past_key_values=past)
+
+    model = Model()
+    tr = Transliterator(model, _ScoreTokenizer(), [], MatchConfig())
+    actual = tr.score_candidates("가나", ["BC", "", "A", "BC"])
+    expected = []
+    for tokens in ([16, 17, 99], [99], [15, 99], [16, 17, 99]):
+        full = torch.tensor([1, 2, 3, *tokens])
+        logits = -((torch.arange(128) - (full.unsqueeze(-1) + 1)) ** 2).to(torch.bfloat16)
+        log_probs = logits.float().log_softmax(-1)
+        expected.append(sum(float(log_probs[2 + j, token]) for j, token in enumerate(tokens)) / len(tokens))
+    assert actual == pytest.approx(expected, abs=1e-3)
+    assert model.shapes == [(1, 3), (3, 3)]
+
+
+def _load_with_tokenizer_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tok: object, model: object
+) -> Transliterator:
+    import sys
+    import types
+
+    torch_mod = types.ModuleType("torch")
+    torch_mod.cuda = types.SimpleNamespace(is_available=lambda: True)  # type: ignore[attr-defined]
+    torch_mod.bfloat16 = "bfloat16"  # type: ignore[attr-defined]
+    torch_mod.inference_mode = _null_context  # type: ignore[attr-defined]
+    transformers_mod = types.ModuleType("transformers")
+
+    class _FakeAutoTokenizer:
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):  # type: ignore[no-untyped-def]
+            return tok
+
+    class _FakeAutoModel:
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):  # type: ignore[no-untyped-def]
+            return model
+
+    transformers_mod.AutoTokenizer = _FakeAutoTokenizer  # type: ignore[attr-defined]
+    transformers_mod.AutoModelForCausalLM = _FakeAutoModel  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "torch", torch_mod)
+    monkeypatch.setitem(sys.modules, "transformers", transformers_mod)
+    return Transliterator.load(_weights_with_config(tmp_path), [], MatchConfig())
+
+
+def test_end_of_turn_empty_tail_raises() -> None:
+    from port_entity_matching.transliterate import TransliteratorUnavailable, end_of_turn_token_id
+
+    with pytest.raises(TransliteratorUnavailable):
+        end_of_turn_token_id(_EotTokenizer(tail_ids=()))
+
+
+def test_rerank_weight_non_finite_type_rejected() -> None:
+    from port_entity_matching.transliterate import _validate_llm_config
+
+    with pytest.raises(ValueError, match="llm_rerank_weight"):
+        _validate_llm_config(MatchConfig(llm_rerank_weight="bad"))  # type: ignore[arg-type]
+
+
+def _gen_model(eos: object, pad: object):  # type: ignore[no-untyped-def]
+    import types as _types
+
+    class _Gen:
+        def __init__(self) -> None:
+            self.eos_token_id = eos
+            self.pad_token_id = pad
+
+    class _M:
+        def __init__(self) -> None:
+            self.device = "cpu"
+            self.generation_config = _Gen()
+
+        def eval(self):  # type: ignore[no-untyped-def]
+            return self
+
+    return _M()
+
+
+def test_load_eos_variants_and_bad_pad(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    none_loaded = _load_with_tokenizer_model(tmp_path, monkeypatch, _EotTokenizer(), _gen_model(None, None))
+    assert none_loaded._model.generation_config.eos_token_id == [7]  # type: ignore[union-attr]
+    padded_tok = _EotTokenizer()
+    padded_tok.pad_token_id = 5
+    list_loaded = _load_with_tokenizer_model(tmp_path, monkeypatch, padded_tok, _gen_model([3, 2], None))
+    assert list_loaded._model.generation_config.eos_token_id == [2, 3, 7]  # type: ignore[union-attr]
+    assert list_loaded._model.generation_config.pad_token_id == 5  # type: ignore[union-attr]
+    bad_tok = _EotTokenizer()
+    bad_tok.pad_token_id = "bad"
+    bad_pad = _load_with_tokenizer_model(tmp_path, monkeypatch, bad_tok, _gen_model(2, None))
+    assert bad_pad._model.generation_config.pad_token_id == 7  # type: ignore[union-attr]
+
+
+def test_score_cache_same_instance_second_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Stub:
+        def score_candidates(self, name, cands):  # type: ignore[no-untyped-def]
+            return tuple(0.5 for _ in cands)
+
+    monkeypatch.setattr(Transliterator, "load", lambda *args, **kwargs: _Stub())
+    weights = _weights_with_config(tmp_path)
+    cache = CachedTransliterator(tmp_path / "cache", weights, [], MatchConfig())
+    assert cache.score_candidates("가나", ["A"]) == (0.5,)
+    assert cache.score_candidates("다라", ["B"]) == (0.5,)
+    assert cache.score_candidates("가나", []) == ()
+
+
+def test_score_cache_skips_bad_rows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import json as _json
+
+    class _Stub:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def score_candidates(self, name, cands):  # type: ignore[no-untyped-def]
+            self.calls += 1
+            return tuple(1.0 for _ in cands)
+
+    stub = _Stub()
+    monkeypatch.setattr(Transliterator, "load", lambda *args, **kwargs: stub)
+    weights = _weights_with_config(tmp_path)
+    CachedTransliterator(tmp_path / "cache", weights, [], MatchConfig()).score_candidates("가나", ["A"])
+    cache_file = next((tmp_path / "cache").glob("*.scores.jsonl"))
+    with open(cache_file, "ab") as handle:
+        handle.write(b"\n")
+        handle.write(_json.dumps({"name": "가나", "cands": ["B", "A"], "scores": [1.0, 2.0]}).encode() + b"\n")
+        handle.write(_json.dumps({"name": "가나", "cands": "bad", "scores": [1.0]}).encode() + b"\n")
+    fresh = CachedTransliterator(tmp_path / "cache", weights, [], MatchConfig())
+    assert fresh.score_candidates("가나", ["A"]) == (1.0,)
+    assert stub.calls == 1
+
+
+def test_score_cache_appends_without_trailing_newline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Stub:
+        def score_candidates(self, name, cands):  # type: ignore[no-untyped-def]
+            return tuple(2.0 for _ in cands)
+
+    monkeypatch.setattr(Transliterator, "load", lambda *args, **kwargs: _Stub())
+    weights = _weights_with_config(tmp_path)
+    cache = CachedTransliterator(tmp_path / "cache", weights, [], MatchConfig())
+    assert cache.score_candidates("가나", ["A"]) == (2.0,)
+    cache_file = next((tmp_path / "cache").glob("*.scores.jsonl"))
+    with open(cache_file, "ab") as handle:
+        handle.truncate(handle.tell() - 1)
+    assert cache.score_candidates("다라", ["B"]) == (2.0,)
+    assert CachedTransliterator(tmp_path / "cache", weights, [], MatchConfig()).score_candidates(
+        "다라", ["B"]
+    ) == (2.0,)
+
+
+def test_score_cache_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = {"n": 0}
+
+    class _Stub:
+        def score_candidates(self, name, cands):  # type: ignore[no-untyped-def]
+            calls["n"] += 1
+            return tuple(float(len(c)) for c in cands)
+
+    monkeypatch.setattr(Transliterator, "load", lambda *args, **kwargs: _Stub())
+    weights = _weights_with_config(tmp_path)
+    first = CachedTransliterator(tmp_path / "cache", weights, [], MatchConfig())
+    assert first.score_candidates("가나", ["B", "A", "B"]) == (1.0, 1.0, 1.0)
+    second = CachedTransliterator(tmp_path / "cache", weights, [], MatchConfig())
+    assert second.score_candidates("가나", ["A", "B"]) == (1.0, 1.0)
+    assert calls["n"] == 1
+
+
+def test_score_cache_ignores_corrupt_line(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Stub:
+        def score_candidates(self, name, cands):  # type: ignore[no-untyped-def]
+            return tuple(0.5 for _ in cands)
+
+    monkeypatch.setattr(Transliterator, "load", lambda *args, **kwargs: _Stub())
+    weights = _weights_with_config(tmp_path)
+    CachedTransliterator(tmp_path / "cache", weights, [], MatchConfig()).score_candidates("가나", ["A"])
+    cache_file = next((tmp_path / "cache").glob("*.scores.jsonl"))
+    with open(cache_file, "ab") as handle:
+        handle.write(b'{"name":')
+    fresh = CachedTransliterator(tmp_path / "cache", weights, [], MatchConfig())
+    assert fresh.score_candidates("가나", ["A"]) == (0.5,)
+
+
+def test_rerank_config_bounds(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="llm_rerank_top_k"):
+        Transliterator.load(tmp_path, [], MatchConfig(llm_rerank_top_k=0))
+    with pytest.raises(ValueError, match="llm_rerank_weight"):
+        Transliterator.load(tmp_path, [], MatchConfig(llm_rerank_weight=-0.1))

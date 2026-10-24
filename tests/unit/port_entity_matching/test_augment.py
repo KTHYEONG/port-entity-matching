@@ -536,9 +536,9 @@ def test_single_token_hangul_without_tonnage_noise_gets_no_copy() -> None:
     assert sources == []
 
 
-def test_hangul_notation_is_on_by_default() -> None:
+def test_hangul_notation_is_off_by_default() -> None:
     config = MatchConfig()
-    assert config.augment_hangul_notation is True
+    assert config.augment_hangul_notation is False
     assert config.augment_hangul_tonnage_noise is False
 
 

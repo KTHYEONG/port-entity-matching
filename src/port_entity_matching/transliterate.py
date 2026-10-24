@@ -6,6 +6,7 @@ import dataclasses
 import hashlib
 import json
 import logging
+import math
 import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -21,10 +22,12 @@ from port_entity_matching.records import QueryRecord
 __all__ = [
     "SYSTEM_PROMPT",
     "CachedTransliterator",
+    "CandidateScoreFn",
     "TranslitFn",
     "Transliterator",
     "TransliteratorUnavailable",
     "attach_alt_names",
+    "end_of_turn_token_id",
     "select_fewshot",
 ]
 
@@ -36,8 +39,33 @@ SYSTEM_PROMPT: str = (
 )
 
 TranslitFn = Callable[[Sequence[str]], Mapping[str, tuple[str, ...]]]
+CandidateScoreFn = Callable[[str, Sequence[str]], tuple[float, ...]]
 
 logger = logging.getLogger(__name__)
+
+_EOT_SENTINEL = "__EOT_SENTINEL_7f3a__"
+
+
+def _ids_from_tokenizer(tokenizer: Any, text: str) -> list[int]:
+    ids = tokenizer.encode(text, add_special_tokens=False)
+    return [int(v) for v in ids]
+
+
+def end_of_turn_token_id(tokenizer: Any) -> int:
+    """Return the first token id the chat template emits after an assistant message."""
+    messages = [
+        {"role": "user", "content": "ping"},
+        {"role": "assistant", "content": _EOT_SENTINEL},
+    ]
+    rendered = str(tokenizer.apply_chat_template(messages, tokenize=False))
+    pos = rendered.find(_EOT_SENTINEL)
+    if pos < 0:
+        raise TransliteratorUnavailable("chat template dropped assistant content")
+    tail = rendered[pos + len(_EOT_SENTINEL) :]
+    ids = _ids_from_tokenizer(tokenizer, tail)
+    if not ids:
+        raise TransliteratorUnavailable("end-of-turn tail tokenizes to nothing")
+    return int(ids[0])
 
 
 class TransliteratorUnavailable(RuntimeError):  # noqa: N818
@@ -100,6 +128,14 @@ def _validate_llm_config(config: MatchConfig) -> None:
         raise ValueError("llm_retrieval_beams must satisfy 0 <= llm_retrieval_beams <= llm_num_beams")
     if config.llm_max_name_chars < 1:
         raise ValueError("llm_max_name_chars must be positive")
+    if config.llm_rerank_top_k < 1:
+        raise ValueError("llm_rerank_top_k must be at least 1")
+    try:
+        finite = math.isfinite(config.llm_rerank_weight)
+    except TypeError as error:
+        raise ValueError("llm_rerank_weight must be finite") from error
+    if not finite or config.llm_rerank_weight < 0:
+        raise ValueError("llm_rerank_weight must be a finite non-negative number")
 
 
 class Transliterator:
@@ -140,6 +176,21 @@ class Transliterator:
             raise TransliteratorUnavailable(f"failed to load transliteration weights: {error}") from error
         model.eval()  # type: ignore[no-untyped-call]
         tokenizer.padding_side = "left"
+        eot_id = end_of_turn_token_id(tokenizer)
+        existing = getattr(model.generation_config, "eos_token_id", None)
+        if existing is None:
+            merged = [int(eot_id)]
+        elif isinstance(existing, int):
+            merged = sorted({int(existing), int(eot_id)})
+        else:
+            merged = sorted({int(v) for v in list(existing)} | {int(eot_id)})
+        model.generation_config.eos_token_id = merged  # type: ignore[union-attr]
+        pad_id = getattr(tokenizer, "pad_token_id", None)
+        try:
+            pad_value = int(pad_id) if pad_id is not None else int(eot_id)
+        except (TypeError, ValueError):
+            pad_value = int(eot_id)
+        model.generation_config.pad_token_id = pad_value  # type: ignore[union-attr]
         return cls(model, tokenizer, shots, config)
 
     def _prompt_for(self, name: str) -> str:
@@ -200,6 +251,76 @@ class Transliterator:
         )
         return out
 
+    def _continuation_logprobs(
+        self, prefix_ids: list[int], conts: list[list[int]], pad_id: int
+    ) -> list[float]:
+        import torch
+        import torch.nn.functional as func
+
+        model = self._model
+        batch = len(conts)
+        prefix_len = len(prefix_ids)
+        max_len = max(len(c) for c in conts)
+        device_str = str(getattr(model, "device", "cpu"))
+        prefix_tensor = torch.tensor([prefix_ids], dtype=torch.long, device=device_str)
+        cont_tensor = torch.full((batch, max_len), pad_id, dtype=torch.long, device=device_str)
+        full_mask = torch.zeros((batch, prefix_len + max_len), dtype=torch.long, device=device_str)
+        for i, cont in enumerate(conts):
+            cont_tensor[i, : len(cont)] = torch.tensor(cont, dtype=torch.long, device=device_str)
+            full_mask[i, :prefix_len] = 1
+            full_mask[i, prefix_len : prefix_len + len(cont)] = 1
+        with torch.inference_mode():
+            prefix_out = model(input_ids=prefix_tensor, use_cache=True)
+            past = prefix_out.past_key_values
+            if hasattr(past, "batch_repeat_interleave"):
+                past.batch_repeat_interleave(batch)
+            else:
+                past = tuple(tuple(value.repeat_interleave(batch, dim=0) for value in layer) for layer in past)
+            cont_out = model(
+                input_ids=cont_tensor,
+                past_key_values=past,
+                attention_mask=full_mask,
+                use_cache=True,
+            )
+            # Causal logits predict the next token, including the first answer token from the prefix.
+            first_logits = prefix_out.logits[:, -1:, :].expand(batch, -1, -1)
+            logits = torch.cat((first_logits, cont_out.logits[:, :-1, :]), dim=1)
+            log_probs = func.log_softmax(logits.float(), dim=-1)
+            gathered = log_probs.gather(-1, cont_tensor.unsqueeze(-1)).squeeze(-1)
+            lengths = torch.tensor([len(c) for c in conts], device=device_str)
+            mask = torch.arange(max_len, device=device_str).unsqueeze(0) < lengths.unsqueeze(1)
+            sums = (gathered * mask).sum(dim=1)
+            counts = mask.sum(dim=1).clamp_min(1)
+            means = sums / counts
+            return [float(v) for v in means.tolist()]
+
+    def score_candidates(self, name: str, candidates: Sequence[str]) -> tuple[float, ...]:
+        """Per-token mean log-likelihood of each candidate (plus end-of-turn) as the answer for one Hangul name."""
+        if len(candidates) == 0:
+            return ()
+        started = time.perf_counter()
+        distinct = sorted(set(candidates))
+        prompt = self._prompt_for(name)
+        prefix_ids = list(self._tokenizer.encode(prompt))
+        eot_id = end_of_turn_token_id(self._tokenizer)
+        conts: list[list[int]] = []
+        for cand in distinct:
+            cids = _ids_from_tokenizer(self._tokenizer, cand)
+            conts.append([*cids, eot_id] if cids else [eot_id])
+        raw_pad = getattr(self._tokenizer, "pad_token_id", None)
+        pad_id = int(raw_pad) if raw_pad is not None else int(eot_id)
+        scores_sorted = self._continuation_logprobs(prefix_ids, conts, pad_id)
+        index = {cand: i for i, cand in enumerate(distinct)}
+        out = tuple(float(scores_sorted[index[cand]]) for cand in candidates)
+        elapsed = time.perf_counter() - started
+        logger.debug(
+            "[ALGO] score_candidates distinct=%d total=%d seconds=%.3f",
+            len(distinct),
+            len(candidates),
+            elapsed,
+        )
+        return out
+
 
 def _translit_fingerprint(shots: Sequence[tuple[str, str]], config: MatchConfig, weights_dir: str | Path) -> str:
     digest = hashlib.sha256()
@@ -239,8 +360,11 @@ class CachedTransliterator:
         self._config = config
         self._fingerprint = _translit_fingerprint(self._shots, config, self._weights_dir)
         self._cache_file = self._cache_dir / f"{self._fingerprint}.jsonl"
+        self._scores_file = self._cache_dir / f"{self._fingerprint}.scores.jsonl"
         self._memory: dict[str, tuple[str, ...]] = {}
+        self._scores: dict[tuple[str, tuple[str, ...]], tuple[float, ...]] = {}
         self._loaded_file = False
+        self._scores_loaded = False
         self._model: Transliterator | None = None
 
     def _ensure_loaded(self) -> None:
@@ -287,3 +411,58 @@ class CachedTransliterator:
                         line = json.dumps({"name": name, "alts": list(fresh[name])}, ensure_ascii=False) + "\n"
                         handle.write(line.encode("utf-8"))
         return {name: self._memory[name] for name in distinct if name in self._memory}
+
+    def _ensure_scores_loaded(self) -> None:
+        if self._scores_loaded:
+            return
+        self._scores_loaded = True
+        if not self._scores_file.is_file():
+            return
+        for line in self._scores_file.read_bytes().splitlines():
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line.decode("utf-8"))
+                name = payload["name"]
+                cands = payload["cands"]
+                scores = payload["scores"]
+                if (
+                    not isinstance(name, str)
+                    or not isinstance(cands, list)
+                    or not all(isinstance(c, str) for c in cands)
+                    or not isinstance(scores, list)
+                    or len(cands) != len(scores)
+                    or not all(isinstance(s, (int, float)) for s in scores)
+                ):
+                    continue
+                if tuple(cands) != tuple(sorted(set(cands))):
+                    continue
+            except (ValueError, KeyError, TypeError, AttributeError):
+                continue
+            self._scores[(name, tuple(cands))] = tuple(float(s) for s in scores)
+
+    def score_candidates(self, name: str, candidates: Sequence[str]) -> tuple[float, ...]:
+        """Cached score_candidates keyed by the name and the sorted distinct candidate tuple."""
+        if len(candidates) == 0:
+            return ()
+        self._ensure_scores_loaded()
+        distinct = sorted(set(candidates))
+        key = (name, tuple(distinct))
+        if key not in self._scores:
+            if self._model is None:
+                self._model = Transliterator.load(self._weights_dir, self._shots, self._config)
+            scores_sorted = self._model.score_candidates(name, distinct)
+            self._scores[key] = tuple(float(s) for s in scores_sorted)
+            self._cache_dir.mkdir(parents=True, exist_ok=True)
+            with open(self._scores_file, "ab+") as handle:
+                if handle.tell():
+                    handle.seek(-1, 2)
+                    if handle.read(1) != b"\n":
+                        handle.write(b"\n")
+                line = json.dumps(
+                    {"name": name, "cands": list(distinct), "scores": list(self._scores[key])},
+                    ensure_ascii=False,
+                ) + "\n"
+                handle.write(line.encode("utf-8"))
+        index = {cand: i for i, cand in enumerate(distinct)}
+        return tuple(float(self._scores[key][index[cand]]) for cand in candidates)
