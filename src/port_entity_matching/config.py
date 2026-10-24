@@ -46,7 +46,8 @@ class MatchConfig:
     augment_min_syllables: int = 3
     augment_seed: int = 0
     augment_notation: bool = True
-    augment_hangul_notation: bool = False
+    augment_hangul_notation: bool = True
+    augment_hangul_tonnage_noise: bool = False
     augment_latin_rate: float = 0.3
     augment_tonnage_low: float = 0.05
     augment_tonnage_high: float = 0.25

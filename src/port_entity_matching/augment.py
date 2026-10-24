@@ -100,7 +100,7 @@ def _hangul_notation_copies(
     rng: np.random.Generator,
     config: MatchConfig,
 ) -> list[QueryRecord]:
-    """Return the reversed, dropped-token and tonnage-noise copies of one Hangul record."""
+    """Return the reversed and dropped-token copies of one Hangul record, plus the tonnage-noise copy when enabled."""
     copies: list[QueryRecord] = []
     name = record.vessel_name
     if len(name.split()) >= 2:
@@ -118,7 +118,9 @@ def _hangul_notation_copies(
                 vessel_name=drop_token(name, rng),
             )
         )
-    if record.gross_tonnage is not None or record.international_gross_tonnage is not None:
+    if config.augment_hangul_tonnage_noise and (
+        record.gross_tonnage is not None or record.international_gross_tonnage is not None
+    ):
         sign = -1.0 if rng.random() < 0.5 else 1.0
         magnitude = float(rng.uniform(config.augment_tonnage_low, config.augment_tonnage_high))
         factor = 1.0 + sign * magnitude

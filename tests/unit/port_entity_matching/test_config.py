@@ -36,7 +36,8 @@ def test_missing_keys_use_defaults() -> None:
 
 def test_legacy_manifest_uses_llm_defaults() -> None:
     config = config_from_dict({"name_top_k": 5})
-    assert config.augment_hangul_notation is False
+    assert config.augment_hangul_notation is True
+    assert config.augment_hangul_tonnage_noise is False
     assert config.llm_enabled is True
     assert (config.llm_fewshot, config.llm_fewshot_seed) == (12, 0)
     assert (config.llm_num_beams, config.llm_max_new_tokens, config.llm_retrieval_beams) == (5, 24, 2)

@@ -290,7 +290,9 @@ def test_degraded_copies_output_is_unchanged() -> None:
 
 
 def test_hangul_notation_copies_cover_tokens_and_tonnage() -> None:
-    copies, sources = notation_copies([_record("S0", "상하이 보이저", gross=1000.0)], _config())
+    copies, sources = notation_copies(
+        [_record("S0", "상하이 보이저", gross=1000.0)], _config(augment_hangul_tonnage_noise=True)
+    )
     assert sources == [0, 0, 0]
     assert [copy.sample_id for copy in copies] == ["S0#aug3", "S0#aug4", "S0#aug5"]
     assert copies[0].vessel_name == "보이저 상하이"
@@ -300,14 +302,16 @@ def test_hangul_notation_copies_cover_tokens_and_tonnage() -> None:
 
 
 def test_single_token_hangul_gets_only_the_tonnage_copy() -> None:
-    copies, sources = notation_copies([_record("S0", "신간", gross=1000.0)], _config())
+    copies, sources = notation_copies([_record("S0", "신간", gross=1000.0)], _config(augment_hangul_tonnage_noise=True))
     assert sources == [0]
     assert [copy.sample_id for copy in copies] == ["S0#aug5"]
     assert copies[0].vessel_name == "신간"
 
 
 def test_hangul_without_tonnage_has_no_tonnage_copy() -> None:
-    copies, _ = notation_copies([_record("S0", "상하이 보이저", gross=None)], _config())
+    copies, _ = notation_copies(
+        [_record("S0", "상하이 보이저", gross=None)], _config(augment_hangul_tonnage_noise=True)
+    )
     assert [copy.sample_id for copy in copies] == ["S0#aug3", "S0#aug4"]
 
 
@@ -342,7 +346,10 @@ def test_notation_copies_change_with_the_seed() -> None:
 
 
 def test_notation_copies_keep_the_other_fields() -> None:
-    copies, _ = notation_copies([_record("S0", "상하이 보이저", gross=1000.0, international=900.0)], _config())
+    copies, _ = notation_copies(
+        [_record("S0", "상하이 보이저", gross=1000.0, international=900.0)],
+        _config(augment_hangul_tonnage_noise=True),
+    )
     for copy in copies:
         assert copy.call_sign == "CS_A"
         assert copy.flag_name == "파나마"
@@ -395,7 +402,7 @@ def test_notation_rng_order_and_missing_tonnage() -> None:
         _record("kor", "상하이 보이저", gross=None, international=900.0),
         _record("lat", "OCEAN PIONEER"),
     ]
-    config = _config(augment_latin_rate=1.0)
+    config = _config(augment_latin_rate=1.0, augment_hangul_tonnage_noise=True)
     kor_rng = record_rng(records[1], config.augment_seed + 1)
     dropped = drop_token(records[1].vessel_name, kor_rng)
     sign = -1.0 if kor_rng.random() < 0.5 else 1.0
@@ -486,13 +493,60 @@ def test_degraded_copies_change_with_the_seed() -> None:
     assert [copy.vessel_name for copy in first] != [copy.vessel_name for copy in second]
 
 
-def test_hangul_notation_copies_disabled() -> None:
+@pytest.mark.parametrize("tonnage_noise", [False, True])
+def test_hangul_notation_copies_disabled(tonnage_noise: bool) -> None:
     records = [_record("H0", "상하이 보이저", gross=1000.0), _record("L0", "OCEAN PIONEER")]
-    off = _config(augment_hangul_notation=False, augment_latin_rate=1.0)
-    on = _config(augment_hangul_notation=True, augment_latin_rate=1.0)
+    off = _config(
+        augment_hangul_notation=False, augment_latin_rate=1.0, augment_hangul_tonnage_noise=tonnage_noise
+    )
+    on = _config(
+        augment_hangul_notation=True, augment_latin_rate=1.0, augment_hangul_tonnage_noise=tonnage_noise
+    )
     copies_off, sources_off = notation_copies(records, off)
     assert all(source != 0 for source in sources_off)
     copies_on, sources_on = notation_copies(records, on)
     latin_off = [copy for copy, source in zip(copies_off, sources_off, strict=True) if source == 1]
     latin_on = [copy for copy, source in zip(copies_on, sources_on, strict=True) if source == 1]
     assert latin_off == latin_on
+
+
+def test_hangul_notation_copies_omit_tonnage_noise_by_default() -> None:
+    copies, sources = notation_copies([_record("S0", "상하이 보이저", gross=1000.0)], _config())
+    assert [copy.sample_id for copy in copies] == ["S0#aug3", "S0#aug4"]
+    assert sources == [0, 0]
+    assert all(copy.gross_tonnage == 1000.0 for copy in copies)
+
+
+def test_hangul_notation_token_copies_identical_with_and_without_tonnage_noise() -> None:
+    records = [
+        _record(f"S{i}", name, gross=1000.0)
+        for i, name in enumerate(["상하이 보이저", "글로비스 스피릿", "한진 해운 부산"])
+    ]
+    off, off_sources = notation_copies(records, _config())
+    on, _ = notation_copies(records, _config(augment_hangul_tonnage_noise=True))
+    assert [copy.sample_id for copy in off] == ["S0#aug3", "S0#aug4", "S1#aug3", "S1#aug4", "S2#aug3", "S2#aug4"]
+    assert off_sources == [0, 0, 1, 1, 2, 2]
+    on_tokens = [copy for copy in on if not copy.sample_id.endswith("#aug5")]
+    assert on_tokens == off
+
+
+def test_single_token_hangul_without_tonnage_noise_gets_no_copy() -> None:
+    copies, sources = notation_copies([_record("S0", "신간", gross=1000.0)], _config())
+    assert copies == []
+    assert sources == []
+
+
+def test_hangul_notation_is_on_by_default() -> None:
+    config = MatchConfig()
+    assert config.augment_hangul_notation is True
+    assert config.augment_hangul_tonnage_noise is False
+
+
+def test_config_round_trip_keeps_hangul_tonnage_noise_flag() -> None:
+    from port_entity_matching.config import config_from_dict, config_to_dict
+
+    config = MatchConfig(augment_hangul_tonnage_noise=True)
+    assert config_from_dict(config_to_dict(config)) == config
+    plain = config_to_dict(MatchConfig())
+    del plain["augment_hangul_tonnage_noise"]
+    assert config_from_dict(plain) == MatchConfig()
