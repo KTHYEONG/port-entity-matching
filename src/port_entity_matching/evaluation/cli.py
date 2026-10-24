@@ -14,7 +14,7 @@ import logging
 import math
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, cast
 
@@ -34,8 +34,10 @@ from port_entity_matching.evaluation.stats import (
     suite_scores,
     vessel_bootstrap_ci,
 )
+from port_entity_matching.evaluation.twin import build_twin, reverse_llm, twin_scenarios
 from port_entity_matching.records import CATALOG_COLUMNS, RECORD_COLUMNS, read_csv_checked
 from port_entity_matching.train import cross_validate_run
+from port_entity_matching.transliterate import CachedTransliterator, select_fewshot
 
 __all__ = ["main", "parse_overrides"]
 
@@ -61,7 +63,7 @@ def parse_overrides(pairs: Sequence[str]) -> MatchConfig:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Evaluation CLI with subcommands cv, stress, compare; returns a process exit code."""
+    """Evaluation CLI with subcommands cv, stress, twin and compare; returns a process exit code."""
     parser = _build_parser()
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -70,6 +72,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run_cv(args)
         if args.command == "stress":
             return _run_stress(args)
+        if args.command == "twin":
+            return _run_twin(args)
         return _run_compare(args)
     except (ValueError, FileNotFoundError) as error:
         sys.stderr.write(f"error: {error}\n")
@@ -77,7 +81,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    """Build the argparse tree with the cv, stress and compare subcommands."""
+    """Build the argparse tree with the cv, stress, twin and compare subcommands."""
     parser = argparse.ArgumentParser(
         prog="evaluate",
         description="Evaluation toolkit: vessel-disjoint CV, perturbation stress tests and paired comparisons.",
@@ -111,6 +115,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="comma-separated perturbation names, or 'all' for every known scenario",
     )
     stress.add_argument("--perturb-seed", type=int, default=0, help="seed of the perturbation draws")
+
+    twin = subparsers.add_parser("twin", parents=[common], help="run the twin foreign-vessel-in-Hangul evaluation")
+    twin.add_argument("--train", required=True, type=Path, help="training CSV with target_vessel_id")
+    twin.add_argument("--catalog", required=True, type=Path, help="vessel catalog CSV")
+    twin.add_argument("--out-dir", required=True, type=Path, help="directory for oof.csv, twin.json and summary.json")
+    twin.add_argument("--rows", type=int, default=1500, help="number of Latin rows to twin")
+    twin.add_argument("--seed", type=int, default=0, help="sampling seed of the twin rows")
+    twin.add_argument("--llm-model", type=Path, default=None, help="LLM weights directory for transliteration and rerank")
+    twin.add_argument("--reverse-model", type=Path, default=None, help="LLM weights directory for the reverse channel")
+    twin.add_argument(
+        "--llm-cache", type=Path, default=Path("artifacts/cache/translit"), help="transliteration cache directory"
+    )
 
     compare = subparsers.add_parser("compare", help="compare two out-of-fold CSV runs")
     compare.add_argument("a", type=Path, help="baseline OOF CSV")
@@ -204,6 +220,103 @@ def _run_stress(args: argparse.Namespace) -> int:
     logger.info("[SYS] stress artifacts written out_dir=%s", out_dir)
     sys.stdout.write(f"out_dir={out_dir} files=oof_long.csv,stress.json,suite.json\n")
     return 0
+
+
+def _run_twin(args: argparse.Namespace) -> int:
+    """Build the twin map and run cross-validation over the twin scenarios."""
+    started = time.perf_counter()
+    config = parse_overrides(_overrides(args))
+    if config.llm_enabled and args.llm_model is None:
+        raise ValueError("--llm-model is required when llm_enabled")
+    llm_cache = _guard_data_path(args.llm_cache)
+    train, catalog = _load_data(args)
+    out_dir = _prepare_out_dir(args.out_dir)
+    shots = select_fewshot(train, catalog, config.llm_fewshot, config.llm_fewshot_seed)
+    twin = _load_or_build_twin(args, train, out_dir, shots)
+    scenarios = twin_scenarios(twin)
+    translit = None
+    rerank = None
+    if config.llm_enabled:
+        transliterator = CachedTransliterator(llm_cache, args.llm_model, shots, config)
+        translit = transliterator.translate
+        rerank = transliterator.score_candidates
+    index = CatalogIndex.build(catalog)
+    cache = _open_cache(args, catalog, config)
+    try:
+        if cache is None:
+            run = cross_validate_run(
+                train, catalog, config, scenarios=scenarios, index=index, translit=translit, rerank=rerank
+            )
+        else:
+            run = cross_validate_run(
+                train,
+                catalog,
+                config,
+                scenarios=scenarios,
+                candidate_fn=lambda records: cache.fetch(records, index, config),
+                index=index,
+                translit=translit,
+                rerank=rerank,
+            )
+    finally:
+        _flush_cache(cache)
+    _write_oof(out_dir / "oof.csv", run.oof)
+    summary = _twin_summary(run.oof, config, time.perf_counter() - started, list(scenarios))
+    _write_json(out_dir / "summary.json", summary)
+    logger.info("[EVAL] twin scenarios=%d elapsed_seconds=%.1f", len(scenarios), summary["elapsed_seconds"])
+    logger.info("[SYS] twin artifacts written out_dir=%s", out_dir)
+    sys.stdout.write(f"out_dir={out_dir} files=oof.csv,summary.json,twin.json\n")
+    return 0
+
+
+def _load_or_build_twin(
+    args: argparse.Namespace, train: pd.DataFrame, out_dir: Path, shots: tuple[tuple[str, str], ...]
+) -> dict[str, dict[str, str]]:
+    """Load twin.json from the output directory or build and persist it."""
+    twin_path = out_dir / "twin.json"
+    if twin_path.is_file():
+        payload = json.loads(twin_path.read_text(encoding="utf-8"))
+        loaded: dict[str, dict[str, str]] = {
+            str(key): {str(inner): str(text) for inner, text in dict(value).items()}
+            for key, value in payload.items()
+        }
+        return loaded
+    reverse: Callable[[Sequence[str]], Mapping[str, str]] | None = None
+    if getattr(args, "reverse_model", None) is not None:
+        reverse = reverse_llm(args.reverse_model, shots)
+    twin: dict[str, dict[str, str]] = build_twin(train, int(args.rows), int(args.seed), reverse)
+    _write_json(twin_path, twin)
+    return twin
+
+
+def _twin_summary(
+    oof: pd.DataFrame, config: MatchConfig, elapsed: float, scenarios: Sequence[str]
+) -> dict[str, Any]:
+    """Summarize the twin run per bucket with size, accuracy and correct count."""
+    buckets: dict[str, dict[str, float | int | None]] = {}
+    clean = oof[oof["scenario"].astype(str) == "clean"]
+    for bucket, mask in (
+        ("clean_K", clean["is_hangul"].astype(bool).to_numpy()),
+        ("clean_L", (~clean["is_hangul"].astype(bool)).to_numpy()),
+    ):
+        subset = clean[mask]
+        buckets[bucket] = _bucket_entry(subset)
+    for scenario in scenarios:
+        buckets[scenario] = _bucket_entry(oof[oof["scenario"].astype(str) == scenario])
+    return {
+        "config": config_to_dict(config),
+        "buckets": buckets,
+        "elapsed_seconds": round(float(elapsed), 3),
+    }
+
+
+def _bucket_entry(frame: pd.DataFrame) -> dict[str, float | int | None]:
+    """Summarize one bucket with its size, accuracy and correct count."""
+    size = len(frame)
+    if size == 0:
+        return {"size": 0, "accuracy": None, "correct": 0}
+    correct = int(frame["correct"].astype(bool).to_numpy().sum())
+    return {"size": size, "accuracy": _number(float(correct) / float(size)), "correct": correct}
 
 
 def _run_compare(args: argparse.Namespace) -> int:

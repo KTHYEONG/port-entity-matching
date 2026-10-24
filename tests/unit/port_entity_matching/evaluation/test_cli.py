@@ -10,7 +10,9 @@ import pandas as pd
 import pytest
 
 from port_entity_matching.config import MatchConfig
+from port_entity_matching.evaluation import cli as cli_module
 from port_entity_matching.evaluation.cli import (
+    _bucket_entry,
     _cast_value,
     _parse_scenarios,
     _stress_entry,
@@ -641,3 +643,138 @@ def test_cv_no_cache_matches_cached(tiny_dataset: tuple[Path, Path], tmp_path: P
         == 0
     )
     assert (cached_out / "oof.csv").read_bytes() == (plain_out / "oof.csv").read_bytes()
+
+
+def _twin_args(
+    tiny_dataset: tuple[Path, Path], tmp_path: Path, *extra: str, rows: str = "2", out: str = "twin"
+) -> list[str]:
+    train_path, catalog_path = tiny_dataset
+    return [
+        "twin",
+        "--train",
+        str(train_path),
+        "--catalog",
+        str(catalog_path),
+        "--out-dir",
+        str(tmp_path / out),
+        "--rows",
+        rows,
+        "--seed",
+        "0",
+        *extra,
+    ]
+
+
+def test_twin_writes_buckets_with_llm_disabled(tiny_dataset: tuple[Path, Path], tmp_path: Path) -> None:
+    out_dir = tmp_path / "twin"
+    assert (
+        main(
+            _twin_args(
+                tiny_dataset,
+                tmp_path,
+                "--set",
+                "llm_enabled=false",
+                "--set",
+                "ensemble_size=1",
+                "--no-cache",
+            )
+        )
+        == 0
+    )
+    twin = json.loads((out_dir / "twin.json").read_text(encoding="utf-8"))
+    assert len(twin) == 2
+    assert all(set(entry) == {"src", "r"} for entry in twin.values())
+
+    summary = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
+    for bucket in ("clean_K", "clean_L", "kor_nt", "r2k_wt", "r2k_nt"):
+        entry = summary["buckets"][bucket]
+        assert entry["size"] > 0
+        assert 0 <= entry["correct"] <= entry["size"]
+        assert entry["accuracy"] == entry["correct"] / entry["size"]
+
+    oof = pd.read_csv(out_dir / "oof.csv")
+    assert {"clean", "kor_nt", "r2k_wt", "r2k_nt"} <= set(oof["scenario"].unique())
+
+
+def test_twin_reuses_existing_twin_file(tiny_dataset: tuple[Path, Path], tmp_path: Path) -> None:
+    first_args = _twin_args(tiny_dataset, tmp_path, "--set", "llm_enabled=false", "--set", "ensemble_size=1")
+    assert main(first_args) == 0
+    twin_path = tmp_path / "twin" / "twin.json"
+    before = twin_path.read_bytes()
+    assert main(first_args) == 0
+    assert twin_path.read_bytes() == before
+
+
+def test_twin_requires_llm_model_when_enabled(
+    tiny_dataset: tuple[Path, Path], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(_twin_args(tiny_dataset, tmp_path)) == 1
+    assert "llm-model" in capsys.readouterr().err
+    assert not (tmp_path / "twin").exists()
+
+
+def test_twin_refuses_transliteration_cache_in_data(
+    tiny_dataset: tuple[Path, Path], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(
+        _twin_args(tiny_dataset, tmp_path, "--llm-model", "weights", "--llm-cache", str(tmp_path / "data" / "cache"))
+    ) == 1
+    assert "data directory" in capsys.readouterr().err
+    assert not (tmp_path / "twin").exists()
+
+
+def test_twin_summary_includes_scenarios_with_no_valid_renderings(
+    tiny_dataset: tuple[Path, Path], tmp_path: Path
+) -> None:
+    out_dir = tmp_path / "twin"
+    out_dir.mkdir()
+    (out_dir / "twin.json").write_text(
+        json.dumps({"T00001": {"src": "TOMOS", "r": "LATIN", "q": ""}}), encoding="utf-8"
+    )
+    assert main(_twin_args(tiny_dataset, tmp_path, "--set", "llm_enabled=false", "--set", "ensemble_size=1")) == 0
+    summary = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
+    for name in ("r2k_wt", "r2k_nt", "q2k_wt", "q2k_nt"):
+        assert summary["buckets"][name] == {"size": 0, "correct": 0, "accuracy": None}
+
+
+def test_twin_with_llm_and_reverse_models(
+    tiny_dataset: tuple[Path, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _FakeTransliterator:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def translate(self, names: object) -> dict[str, tuple[str, ...]]:
+            return {}
+
+        def score_candidates(self, name: str, candidates: object) -> tuple[float, ...]:
+            return tuple(0.0 for _ in list(candidates))  # type: ignore[arg-type]
+
+    monkeypatch.setattr(cli_module, "CachedTransliterator", _FakeTransliterator)
+    monkeypatch.setattr(
+        cli_module, "reverse_llm", lambda weights_dir, shots: (lambda names: {str(n): "가나다" for n in names})
+    )
+    out_dir = tmp_path / "twin_llm"
+    assert (
+        main(
+            _twin_args(
+                tiny_dataset,
+                tmp_path,
+                "--llm-model",
+                str(tmp_path / "llm"),
+                "--reverse-model",
+                str(tmp_path / "rev"),
+                "--set",
+                "ensemble_size=1",
+                out="twin_llm",
+            )
+        )
+        == 0
+    )
+    summary = json.loads((out_dir / "summary.json").read_text(encoding="utf-8"))
+    assert {"q2k_wt", "q2k_nt"} <= set(summary["buckets"])
+
+
+def test_bucket_entry_handles_an_empty_frame() -> None:
+    entry = _bucket_entry(pd.DataFrame({"correct": pd.Series([], dtype=bool)}))
+    assert entry == {"size": 0, "accuracy": None, "correct": 0}
