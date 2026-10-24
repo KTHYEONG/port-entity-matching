@@ -20,7 +20,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_DIR = REPO_ROOT / "src" / "port_entity_matching"
 SCRIPT_DIR = REPO_ROOT / "submission"
-DEFAULT_LLM_DIR = REPO_ROOT / "artifacts" / "hf" / "Qwen3-4B-Instruct-2507"
+DEFAULT_LLM_DIR = REPO_ROOT / "artifacts" / "hf" / "kanana-1.5-2.1b-instruct-2505"
 
 REQUIRED_ARTIFACTS: tuple[str, ...] = ("model_0.txt", "maps.json", "memory.json", "manifest.json")
 FEWSHOT_ARTIFACT = "llm_fewshot.json"

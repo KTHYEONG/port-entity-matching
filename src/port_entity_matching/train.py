@@ -32,7 +32,14 @@ from port_entity_matching.records import (
     read_csv_checked,
     records_from_frame,
 )
-from port_entity_matching.transliterate import CachedTransliterator, TranslitFn, attach_alt_names, select_fewshot
+from port_entity_matching.rerank import rerank_scores
+from port_entity_matching.transliterate import (
+    CachedTransliterator,
+    CandidateScoreFn,
+    TranslitFn,
+    attach_alt_names,
+    select_fewshot,
+)
 
 __all__ = [
     "CVReport",
@@ -256,9 +263,10 @@ def cross_validate(
     config: MatchConfig,
     diagnostics_path: str | Path | None = None,
     translit: TranslitFn | None = None,
+    rerank: CandidateScoreFn | None = None,
 ) -> CVReport:
     """Run vessel-disjoint cross-validation without call-sign memory and report the bucket metrics."""
-    run = cross_validate_run(train, catalog, config, scenarios=None, translit=translit)
+    run = cross_validate_run(train, catalog, config, scenarios=None, translit=translit, rerank=rerank)
     if diagnostics_path is not None:
         clean = run.oof.drop(columns=["scenario"]).loc[:, list(DIAGNOSTIC_COLUMNS)]
         _write_diagnostics(diagnostics_path, clean)
@@ -274,6 +282,7 @@ def cross_validate_run(
     candidate_fn: CandidateFn | None = None,
     index: CatalogIndex | None = None,
     translit: TranslitFn | None = None,
+    rerank: CandidateScoreFn | None = None,
 ) -> CVRun:
     """Vessel-disjoint CV with memory off; each fold's ensemble scores clean rows and every scenario's perturbed rows."""
     scenario_map = dict(scenarios or {})
@@ -318,7 +327,7 @@ def cross_validate_run(
         records = _maybe_attach_translit(raw_records, config, translit)
         fold_targets = [str(value) for value in fold_valid["target_vessel_id"].tolist()]
         clean_rows = _diagnostic_rows(
-            records, fold_targets, index, maps, config, ranker, candidate_fn, _timings=timings
+            records, fold_targets, index, maps, config, ranker, candidate_fn, _timings=timings, rerank=rerank
         )
         rows.extend({"scenario": "clean", **row} for row in clean_rows)
         _log_fold_metrics(fold_number, None, clean_rows)
@@ -337,7 +346,15 @@ def cross_validate_run(
                 continue
             perturbed_records = _maybe_attach_translit(perturbed_records, config, translit)
             scenario_rows = _diagnostic_rows(
-                perturbed_records, perturbed_targets, index, maps, config, ranker, candidate_fn, _timings=timings
+                perturbed_records,
+                perturbed_targets,
+                index,
+                maps,
+                config,
+                ranker,
+                candidate_fn,
+                _timings=timings,
+                rerank=rerank,
             )
             rows.extend({"scenario": scenario_name, **row} for row in scenario_rows)
             _log_fold_metrics(fold_number, scenario_name, scenario_rows)
@@ -372,6 +389,7 @@ def _diagnostic_rows(
     candidate_fn: CandidateFn | None = None,
     *,
     _timings: _StageTimes | None = None,
+    rerank: CandidateScoreFn | None = None,
 ) -> list[dict[str, object]]:
     """Score records with a fold ensemble and return one diagnostic row per record."""
     timings = _timings or _StageTimes()
@@ -386,6 +404,8 @@ def _diagnostic_rows(
     timings.features += time.perf_counter() - started
     started = time.perf_counter()
     scores = score_ensemble(ranker, features, config)
+    if rerank is not None:
+        scores = rerank_scores(records, candidate_sets, scores, index, rerank, config)
     timings.score += time.perf_counter() - started
 
     sizes = [len(candidate_set.positions) for candidate_set in candidate_sets]
@@ -485,8 +505,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--out", type=Path, default=None, help="directory the fitted artifacts are written to")
     parser.add_argument("--cv", action="store_true", help="run vessel-disjoint cross-validation")
     parser.add_argument("--diagnostics", type=Path, default=None, help="CSV path for the out-of-fold diagnostics")
-    parser.add_argument("--llm-model", type=Path, default=None, help="transliteration weights directory")
-    parser.add_argument("--llm-cache", type=Path, default=Path("artifacts/cache/translit"), help="transliteration cache directory")
+    parser.add_argument(
+        "--llm-model", type=Path, default=None, help="LLM weights directory for transliteration and rerank"
+    )
+    parser.add_argument(
+        "--llm-cache", type=Path, default=Path("artifacts/cache/translit"), help="transliteration cache directory"
+    )
     args = parser.parse_args(argv)
     if args.cv is False and args.out is None:
         parser.error("nothing to do: pass --cv and/or --out")
@@ -508,7 +532,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         logger.info("[EVAL] llm_fewshot_vessels=%d", len(shots))
 
     if args.cv:
-        report = cross_validate(train, catalog, config, args.diagnostics, translit)
+        rerank: CandidateScoreFn | None = None
+        if config.llm_enabled:
+            rerank = transliterator.score_candidates
+        report = cross_validate(train, catalog, config, args.diagnostics, translit, rerank)
         logger.info(
             "[EVAL] cv weighted_score=%.4f hangul_accuracy=%.4f non_hangul_accuracy=%.4f",
             report.weighted_score,

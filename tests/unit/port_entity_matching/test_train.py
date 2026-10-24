@@ -156,6 +156,40 @@ def test_report_arithmetic() -> None:
     assert 0.0 <= report.non_hangul_accuracy <= 1.0
 
 
+def test_cv_reranks_clean_and_scenario_diagnostics(tmp_path: Path) -> None:
+    from collections.abc import Sequence
+
+    from port_entity_matching.normalize import is_hangul_name
+    from port_entity_matching.records import QueryRecord
+
+    config = dataclasses.replace(_config(), llm_rerank_top_k=100)
+    train = _train_frame()
+    catalog = _catalog_frame()
+
+    def scorer(name: str, names: Sequence[str]) -> tuple[float, ...]:
+        assert is_hangul_name(name)
+        assert "Glovis Spirit" in names
+        return tuple(0.0 if name == "Glovis Spirit" else -1e6 for name in names)
+
+    def no_tonnage(record: QueryRecord) -> QueryRecord | None:
+        if not is_hangul_name(record.vessel_name):
+            return None
+        return dataclasses.replace(record, gross_tonnage=None, international_gross_tonnage=None)
+
+    baseline = cross_validate_run(train, catalog, config)
+    run = cross_validate_run(train, catalog, config, scenarios={"no_tonnage": no_tonnage}, rerank=scorer)
+    hangul = run.oof[run.oof["is_hangul"] == 1]
+    assert set(hangul["scenario"]) == {"clean", "no_tonnage"}
+    assert set(hangul["pred_vessel_id"]) == {"V00"}
+    latin = run.oof[run.oof["is_hangul"] == 0].reset_index(drop=True)
+    expected_latin = baseline.oof[baseline.oof["is_hangul"] == 0].reset_index(drop=True)
+    pd.testing.assert_frame_equal(latin, expected_latin)
+    path = tmp_path / "reranked.csv"
+    cross_validate(train, catalog, config, diagnostics_path=path, rerank=scorer)
+    saved = pd.read_csv(path)
+    assert set(saved.loc[saved["is_hangul"] == 1, "pred_vessel_id"]) == {"V00"}
+
+
 def test_diagnostics_written(tmp_path) -> None:
     path = tmp_path / "cv_oof.csv"
     cross_validate(_train_frame(), _catalog_frame(), _config(), path)
@@ -184,8 +218,16 @@ def test_cli_fit_writes_bundle(tmp_path, monkeypatch) -> None:
     _train_frame().to_csv(train_path, index=False)
     _catalog_frame().to_csv(catalog_path, index=False)
     exit_code = main(
-        ["--train", str(train_path), "--catalog", str(catalog_path), "--out", str(model_dir),
-         "--llm-model", str(llm_dir)]
+        [
+            "--train",
+            str(train_path),
+            "--catalog",
+            str(catalog_path),
+            "--out",
+            str(model_dir),
+            "--llm-model",
+            str(llm_dir),
+        ]
     )
     assert exit_code == 0
     for name in ("model_0.txt", "maps.json", "memory.json", "manifest.json"):
@@ -238,6 +280,11 @@ def test_cli_cross_validation_writes_diagnostics(tmp_path, monkeypatch) -> None:
     from port_entity_matching.transliterate import CachedTransliterator
 
     monkeypatch.setattr(CachedTransliterator, "translate", lambda self, names: dict.fromkeys(names, ("GLOVIS SPIRIT",)))
+    monkeypatch.setattr(
+        CachedTransliterator,
+        "score_candidates",
+        lambda self, name, candidates: tuple(0.0 for _ in candidates),
+    )
     train_path = tmp_path / "train.csv"
     catalog_path = tmp_path / "vessel_catalog.csv"
     diagnostics_path = tmp_path / "cv.csv"
@@ -336,10 +383,16 @@ def test_notation_augmentation_adds_more_groups() -> None:
     train = _mixed_frame()
     maps = AttributeMaps.fit(train, index)
     without = build_training_data(
-        train, index, maps, MatchConfig(augment=True, augment_notation=False, augment_hangul_notation=True, num_threads=1)
+        train,
+        index,
+        maps,
+        MatchConfig(augment=True, augment_notation=False, augment_hangul_notation=True, num_threads=1),
     )
     with_notation = build_training_data(
-        train, index, maps, MatchConfig(augment=True, augment_notation=True, augment_hangul_notation=True, num_threads=1)
+        train,
+        index,
+        maps,
+        MatchConfig(augment=True, augment_notation=True, augment_hangul_notation=True, num_threads=1),
     )
     assert len(with_notation.group_sizes) > len(without.group_sizes)
     assert with_notation.recall_hangul == without.recall_hangul
@@ -573,7 +626,9 @@ def test_translit_receives_hangul_names_only_once() -> None:
     index = CatalogIndex.build(_catalog_frame())
     train = _train_frame()
     maps = AttributeMaps.fit(train, index)
-    config = MatchConfig(augment=True, augment_notation=False, num_threads=1, lgbm_num_rounds=5, lgbm_min_data_in_leaf=1)
+    config = MatchConfig(
+        augment=True, augment_notation=False, num_threads=1, lgbm_num_rounds=5, lgbm_min_data_in_leaf=1
+    )
     build_training_data(train, index, maps, config, translit=stub)
     assert len(calls) == 1
     from port_entity_matching.normalize import is_hangul_name
@@ -623,7 +678,11 @@ def test_cv_transliterates_perturbed_names() -> None:
     train = _train_frame().iloc[:6].copy()
     catalog = _catalog_frame()
     config = MatchConfig(
-        augment=False, num_threads=1, cv_splits=2, lgbm_num_rounds=5, lgbm_min_data_in_leaf=1,
+        augment=False,
+        num_threads=1,
+        cv_splits=2,
+        lgbm_num_rounds=5,
+        lgbm_min_data_in_leaf=1,
     )
     cross_validate_run(train, catalog, config, scenarios={"pert": perturb}, translit=stub)
     assert any(any("perturbed" in name for name in call) for call in seen)
@@ -670,8 +729,13 @@ def test_cv_does_not_reuse_clean_alts_for_untranslated_perturbations() -> None:
         return generate_candidates(records, index, None, config)
 
     cross_validate_run(
-        _train_frame(), _catalog_frame(), config,
-        scenarios={"changed": perturb}, candidate_fn=candidates, index=index, translit=translit,
+        _train_frame(),
+        _catalog_frame(),
+        config,
+        scenarios={"changed": perturb},
+        candidate_fn=candidates,
+        index=index,
+        translit=translit,
     )
     assert observed
     assert all(record.alt_names == () for record in observed)

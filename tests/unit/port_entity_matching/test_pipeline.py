@@ -345,6 +345,9 @@ def test_precomputed_alts_are_not_regenerated(matcher: Matcher) -> None:
             seen.append(list(names))
             return dict.fromkeys(names, ("ALT",))
 
+        def score_candidates(self, name, candidates):  # type: ignore[no-untyped-def]
+            return tuple(0.0 for _ in candidates)
+
     matcher.transliterator = _Stub()  # type: ignore[method-assign]
     records = _records([_record("R0", "글로비스 스피릿", None, 5000)])
     records = [dataclasses.replace(record, alt_names=("EXISTING",)) for record in records]
@@ -360,6 +363,7 @@ def test_llm_preserves_existing_alts_for_duplicate_names(matcher: Matcher, monke
     records[0] = replace(records[0], alt_names=("EXISTING",))
     stub = Mock(spec=Transliterator)
     stub.translate.return_value = {"흥아": ("HEUNG-A",)}
+    stub.score_candidates.side_effect = lambda name, candidates: tuple(0.0 for _ in candidates)
     matcher.transliterator = stub
     observed = []
     original = pipeline.generate_candidates
@@ -394,7 +398,9 @@ def test_from_dir_unavailable_llm_falls_back(model_dir: Path, monkeypatch, caplo
 
 def test_disabled_llm_does_not_generate(matcher: Matcher) -> None:
     stub = Mock(spec=Transliterator)
-    disabled = Matcher(matcher.index, replace(matcher.bundle, config=replace(matcher.bundle.config, llm_enabled=False)), stub)
+    disabled = Matcher(
+        matcher.index, replace(matcher.bundle, config=replace(matcher.bundle.config, llm_enabled=False)), stub
+    )
     assert disabled.predict(_records([_record("R0", "흥아")]))
     stub.translate.assert_not_called()
 
@@ -404,9 +410,67 @@ def test_empty_llm_alts_log_counts_without_private_values(matcher: Matcher, capl
     expected = matcher.predict(records)
     stub = Mock(spec=Transliterator)
     stub.translate.return_value = {}
+    stub.score_candidates.side_effect = lambda name, candidates: tuple(0.0 for _ in candidates)
     matcher.transliterator = stub
     with caplog.at_level("INFO"):
         assert matcher.predict(records) == expected
     assert "generated=0" in caplog.text
     assert "흥아" not in caplog.text
     assert "PRIVATE_SAMPLE" not in caplog.text
+
+
+class _FavorSecondChoice:
+    """Fake transliterator leaving retrieval unchanged while reranking toward the ranker's second choice."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, list[str]]] = []
+
+    def translate(self, names):  # type: ignore[no-untyped-def]
+        return {}
+
+    def score_candidates(self, name: str, candidates) -> tuple[float, ...]:  # type: ignore[no-untyped-def]
+        self.calls.append((name, list(candidates)))
+        return tuple(0.0 if position == 1 else -100.0 for position in range(len(candidates)))
+
+
+def test_rerank_applied_in_serving(matcher: Matcher) -> None:
+    hangul = _records([_record("H0", "글로비스 스피릿", None, 5000)])
+    latin = _records([_record("L0", "CALIDA", None, 61332)])
+    baseline_second = matcher.predict_topk(hangul, k=3)[0].vessel_ids[1]
+    baseline_latin = matcher.predict(latin)
+    assert matcher.predict(hangul) != [baseline_second]
+    stub = _FavorSecondChoice()
+    matcher.transliterator = stub  # type: ignore[assignment]
+    assert matcher.predict(hangul) == [baseline_second]
+    assert matcher.predict(latin) == baseline_latin
+
+
+def test_row_independence_with_rerank(matcher: Matcher) -> None:
+    stub = _FavorSecondChoice()
+    matcher.transliterator = stub  # type: ignore[assignment]
+    rows = [
+        _record("H0", "글로비스 스피릿", None, 5000),
+        _record("L0", "CALIDA", None, 61332),
+        _record("H1", "카시마 마루", None, 8000),
+    ]
+    batch = matcher.predict(_records(rows))
+    assert matcher.predict(_records([rows[0]])) == [batch[0]]
+    assert matcher.predict(_records(rows[:2])) == batch[:2]
+    order = [2, 0, 1]
+    shuffled = matcher.predict(_records([rows[position] for position in order]))
+    assert [batch[order[position]] for position in range(len(order))] == shuffled
+    hangul_calls = [name for name, _ in stub.calls if any("\uac00" <= ch <= "\ud7a3" for ch in name)]
+    assert hangul_calls
+    assert all("CALIDA" not in name for name, _ in stub.calls)
+
+
+def test_memory_override_wins_over_rerank(matcher: Matcher) -> None:
+    records = _records([_record("M0", "글로비스 스피릿", "CS_V00_0", 5000)])
+    ranked_second = matcher.predict_topk(records, k=2)[0].vessel_ids[1]
+    assert ranked_second != "V00"
+    stub = _FavorSecondChoice()
+    matcher.transliterator = stub  # type: ignore[assignment]
+    without_memory = [replace(records[0], call_sign=None)]
+    assert matcher.predict(without_memory) == [ranked_second]
+    assert matcher.predict(records) == ["V00"]
+    assert matcher.predict_topk(records, k=2)[0].vessel_ids[0] == "V00"

@@ -29,6 +29,7 @@ from port_entity_matching.records import (
     read_csv_checked,
     records_from_frame,
 )
+from port_entity_matching.rerank import rerank_scores
 from port_entity_matching.transliterate import (
     Transliterator,
     TransliteratorUnavailable,
@@ -65,7 +66,9 @@ class _Ranked:
 class Matcher:
     """Catalog index + fitted bundle; predicts one vessel_id per record independently."""
 
-    def __init__(self, index: CatalogIndex, bundle: ArtifactBundle, transliterator: Transliterator | None = None) -> None:
+    def __init__(
+        self, index: CatalogIndex, bundle: ArtifactBundle, transliterator: Transliterator | None = None
+    ) -> None:
         """Bind a built catalog index to a loaded bundle."""
         if bundle.config.batch_size < 1:
             raise ValueError("batch_size must be positive")
@@ -74,6 +77,7 @@ class Matcher:
         self.transliterator = transliterator
         self.llm_load_seconds = 0.0
         self.llm_seconds = 0.0
+        self.rerank_seconds = 0.0
 
     @classmethod
     def from_dir(cls, model_dir: str | Path, catalog: pd.DataFrame) -> Matcher:
@@ -99,7 +103,13 @@ class Matcher:
     def predict(self, records: Sequence[QueryRecord]) -> list[str]:
         """One catalog vessel_id per record, in input order."""
         records = self._apply_llm(records)
+        rerank_before = self.rerank_seconds
         ranked = self._rank(records)
+        logger.info(
+            "[SYS] rerank_seconds=%.2f rows=%d",
+            self.rerank_seconds - rerank_before,
+            len(records),
+        )
         self._log_summary(records, ranked)
         predictions: list[str] = []
         for item in ranked:
@@ -112,7 +122,13 @@ class Matcher:
         if k < 1:
             raise ValueError("k must be at least 1")
         records = self._apply_llm(records)
+        rerank_before = self.rerank_seconds
         ranked = self._rank(records)
+        logger.info(
+            "[SYS] rerank_seconds=%.2f rows=%d",
+            self.rerank_seconds - rerank_before,
+            len(records),
+        )
         self._log_summary(records, ranked)
         predictions: list[Prediction] = []
         for record, item in zip(records, ranked, strict=True):
@@ -122,9 +138,7 @@ class Matcher:
                 head = item.memory_position
                 head_score = scores[positions.index(head)]
                 rest = tuple(
-                    (position, score)
-                    for position, score in zip(positions, scores, strict=True)
-                    if position != head
+                    (position, score) for position, score in zip(positions, scores, strict=True) if position != head
                 )
                 ordered = ((head, head_score), *rest)
             else:
@@ -181,6 +195,12 @@ class Matcher:
         candidate_sets = generate_candidates(records, self.index, self.bundle.memory, config)
         features = build_features(records, candidate_sets, self.index, self.bundle.maps, config)
         scores = score_ensemble(self.bundle.ranker, features, config)
+        if self.transliterator is not None:
+            started = time.perf_counter()
+            scores = rerank_scores(
+                records, candidate_sets, scores, self.index, self.transliterator.score_candidates, config
+            )
+            self.rerank_seconds += time.perf_counter() - started
         tops = select_top1(scores, candidate_sets)
         ranked: list[_Ranked] = []
         offset = 0

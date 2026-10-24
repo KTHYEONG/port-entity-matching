@@ -424,9 +424,9 @@ Changes:
 - Korean token-drop accuracy is 0.65 (recall 0.883).
 
 ### 2.8 LLM Transliteration Channel (2026-10-23)
-- Frozen Qwen3-4B-Instruct (bf16, CUDA, local weights only) maps each distinct Hangul name to Latin n-best alts (12 few-shot pairs from train Hangul rows, beam 5, 24 new tokens). Alts feed the existing retrieval channel (`SRC_LLM`) and never bypass ranking; records already carrying `alt_names` are not regenerated. Generation is batch-1 per name, so a row's prediction is identical alone, in a subset, or shuffled.
+- Frozen Kanana-1.5-2.1b-instruct-2505 (bf16, CUDA, local weights only) maps each distinct Hangul name to Latin n-best alts (12 few-shot pairs from train Hangul rows, beam 5, 24 new tokens). The LB 0.9163 submission used Qwen3-4B-Instruct with the same prompt and beam settings. Alts feed the existing retrieval channel (`SRC_LLM`) and never bypass ranking; records already carrying `alt_names` are not regenerated. Generation is batch-1 per name, so a row's prediction is identical alone, in a subset, or shuffled. The same model re-scores each Hangul row's top-10 ranker candidates by per-token mean candidate likelihood (see rerank below).
 - Serving: `Matcher.from_dir` loads `<model_dir>/llm` only when `llm_enabled` and `fewshot` are set; `TransliteratorUnavailable` degrades to the Hangul channel with an `[SYS] llm unavailable` warning. Query and few-shot user names are bounded to 64 characters; beam count (5), new-token limit (24), and batch size (1) are fixed per name. No shared deadline or time-based fallback changes predictions. Logs carry counts and seconds only.
-- Budget (RTX 4070 Ti, 12-shot, beam 5, batch 1): load 4.1 s (7.6 GB), 0.376 s per Hangul name, peak VRAM 8.4 GB of 22.4 GB. Test has ~4,632 rows, ~1,064 Korean (23%); conservative L4 factor 2.0 gives ~13.3 min LLM + 2 min load + ~1 min pipeline ≈ 16.5 min, under the 30 min limit. `tests/integration/test_budget.py` projects the server budget from the pseudo run and asserts row independence.
+- Historical generation-only budget (RTX 4070 Ti, Qwen, 12-shot, beam 5, batch 1): load 4.1 s (7.6 GB), 0.376 s per Hangul name, peak VRAM 8.4 GB of 22.4 GB. Kanana generates at ~0.24 s per name (model table below), but these measurements exclude likelihood reranking. The previous Qwen generation-only L4 projection was ~16.5 min for ~1,064 distinct Hangul names. It does not approve the Kanana + rerank path: reranking runs per eligible row, including repeated names. Repeat the full rehearsal on the final fitted bundle with both generation and rerank GPU time included in the server projection.
 - Implementation tests alone do not establish accuracy gains; the measured augmentation comparison is reported below. Server timing figures above are projections, not an L4 measurement.
 - Compliance correction: the shared 20-minute fallback has been removed because it made a row's alternatives depend on time spent on other rows. Timing is instead a pre-submission acceptance gate: the full-scale 4,632-row GPU rehearsal must project below 25 minutes on the L4. This is a measured acceptance criterion, not a runtime guarantee; a skipped rehearsal does not approve a submission.
 
@@ -456,25 +456,49 @@ production bundle has 53 features while current code expects 60. These checks
 establish serving timing and row independence, not model accuracy or final-bundle
 approval. Aggregate logs: `artifacts/rehearsal/llm_row_local_64/rehearsal_memory_off.log`.
 
-**LLM submission.** LB 0.9163057588 (K 479/532, L 1701/1784).
+**LLM submissions.** LLM submission LB 0.9163057588 (K 479/532, L 1701/1784).
+The notation-augmented variant (E1) scores LB 0.9035682676 (K 469, L 1703.5):
+Relative to E1, the LLM baseline gains 10 Korean correct rows and loses 2.5
+non-Korean correct rows. The notation copies are therefore reverted;
+the shipped bundle keeps `augment_hangul_notation=False` on the LLM path.
 
-**Damaged-name CV with integrated LLM ranker** (5-fold vessel-disjoint,
-`scratch/stress/llm.oof.csv` vs `scratch/stress/e1.oof.csv`; clean unchanged at
-K 9 errors, L 4 errors; the run kept the `#aug3`/`#aug4` copies and dropped `#aug5`):
+**Twin evaluation set.** The twin maps sampled Latin rows to rule-rendered (`r`)
+and LLM-reverse-rendered (`q`) Hangul names, scored with and without tonnage
+(`_wt` / `_nt`). Twin `q2k_wt` accuracy reproduces the LB Korean ordering:
+C 0.925 < E1 0.967 < Qwen 0.970 against LB K 453 < 469 < 479. It is the only
+local signal that tracks the LB ranking, so rerank weights are selected on it.
 
-| Scenario | LLM baseline | LLM + Hangul token augmentation (E1) |
-|---|---|---|
-| `kor_tokens_reversed` (no tonnage) | 0.543 | 0.871 |
-| `kor_tokens_reversed` (with tonnage) | 0.914 | 0.981 |
-| `kor_reverse_plus_jamo` (no tonnage) | 0.334 | 0.645 |
-| `kor_reverse_plus_jamo` (with tonnage) | 0.847 | 0.959 |
-| `kor_token_dropped` (with tonnage) | 0.676 | 0.733 |
+**Transliteration model comparison** (production prompt, beam 5; n-best = any of
+5 beams equals the catalog name; 4070 Ti seconds per name):
 
-All other scenarios move within ±1.5pt. Retrieval-vs-ranking split: 193 of 402
-reversed-name failures already had an LLM n-best whose token set equals the GT
-name, so the bottleneck there is ranking, not retrieval.
+| Model | kor n-best | r2k n-best | q2k n-best | s/name |
+|---|---|---|---|---|
+| Qwen3-4B-Instruct-2507 | 0.586 | 0.243 | 0.315 | 0.41 |
+| Kanana 1.5 2.1B instruct 2505 | 0.686 | 0.298 | 0.343 | 0.24 |
+| Midm 2.0 Mini Instruct | 0.754 | 0.373 | 0.386 | 0.57 |
 
-**Adopted default.** `augment_hangul_notation=True` without tonnage-noise copies.
+Kanana is the default: higher n-best hit than Qwen at ~60% of the generation
+time, and 2.1B weights keep the ZIP far below the 10 GB cap where 7–8B models
+do not fit. Rejected after measurement: n-best unions across models (generation
+time and ZIP size add per model), 7–8B models (weights approach the 10 GB ZIP
+budget), and a 24-shot Kanana prompt (kor n-best 0.654, below the 12-shot
+0.686).
+
+**LLM likelihood rerank.** Each Hangul row's top-10 ranker candidates are
+re-scored with the transliterator's per-token mean candidate log-likelihood
+(candidate plus end-of-turn as the answer):
+`adjusted_i = score_i + w * (lp_i - max_j lp_j)`, `w = 0.2`.
+Non-top-k candidates are shifted by one per-record constant so they stay
+strictly below every adjusted top-k score while keeping their relative order.
+Row independence holds: a row's scorer input depends only on its own record
+and candidate set. Twin-CV deltas at `w = 0.2` (Kanana translit + Kanana
+rerank vs. Qwen translit without rerank, correct-row counts):
+
+| Bucket | kor_wt | kor_nt | q2k_wt | q2k_nt | r2k_wt | r2k_nt |
+|---|---|---|---|---|---|---|
+| Δ correct | +6 | +11 | +10 | +28 | +6 | +18 |
+
+The gain plateaus for `w` in 0.15–0.4.
 
 **Reverse channel (catalog Latin→Hangul by LLM), measured and deprioritized:**
 exact 0.314, jamo 0.802 against human Hangul; pool top-1 0.835 vs rule key 0.908
