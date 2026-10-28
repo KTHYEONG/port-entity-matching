@@ -19,8 +19,9 @@ from port_entity_matching.artifacts import ArtifactBundle
 from port_entity_matching.augment import degraded_copies, notation_copies
 from port_entity_matching.candidates import CandidateSet, generate_candidates
 from port_entity_matching.catalog import CatalogIndex
-from port_entity_matching.config import MatchConfig
-from port_entity_matching.features import build_features
+from port_entity_matching.config import RECIPES, MatchConfig, recipe_config
+from port_entity_matching.families import FamilyContext, family_copies
+from port_entity_matching.features import build_features, feature_names
 from port_entity_matching.maps import AttributeMaps
 from port_entity_matching.memory import CallSignMemory
 from port_entity_matching.normalize import is_hangul_name
@@ -33,6 +34,8 @@ from port_entity_matching.records import (
     records_from_frame,
 )
 from port_entity_matching.rerank import rerank_scores
+from port_entity_matching.reverse import ReverseChannel
+from port_entity_matching.synthetic import synthetic_latin_rows
 from port_entity_matching.transliterate import (
     CachedTransliterator,
     CandidateScoreFn,
@@ -161,6 +164,8 @@ def build_training_data(
     candidate_fn: CandidateFn | None = None,
     translit: TranslitFn | None = None,
     *,
+    reverse: ReverseChannel | None = None,
+    families: FamilyContext | None = None,
     _timings: _StageTimes | None = None,
 ) -> TrainingData:
     """Build the candidate matrix, features and labels; rows whose target is not retrieved are excluded."""
@@ -174,19 +179,22 @@ def build_training_data(
         notation_sources: list[int] = []
         if config.augment_notation:
             notation, notation_sources = notation_copies(records, config)
+            if config.augment_families:
+                if families is None:
+                    raise ValueError("augment_families requires a FamilyContext")
+                extra, extra_sources = family_copies(records, config, families)
+                notation.extend(extra)
+                notation_sources.extend(extra_sources)
         notation_targets = [targets[index] for index in notation_sources]
         records = [*records, *copies, *notation]
         targets = [*targets, *copy_targets, *notation_targets]
     records = _maybe_attach_translit(records, config, translit, log_disabled=_timings is None)
     timings = _timings or _StageTimes()
     started = time.perf_counter()
-    if candidate_fn is None:
-        candidate_sets = generate_candidates(records, index, None, config)
-    else:
-        candidate_sets = candidate_fn(records)
+    candidate_sets = _candidates(records, index, config, candidate_fn, reverse)
     timings.retrieve += time.perf_counter() - started
     started = time.perf_counter()
-    features = build_features(records, candidate_sets, index, maps, config)
+    features = build_features(records, candidate_sets, index, maps, config, reverse)
     timings.features += time.perf_counter() - started
 
     sizes = [len(candidate_set.positions) for candidate_set in candidate_sets]
@@ -232,29 +240,50 @@ def build_training_data(
     )
 
 
+def _candidates(
+    records: Sequence[QueryRecord],
+    index: CatalogIndex,
+    config: MatchConfig,
+    candidate_fn: CandidateFn | None,
+    reverse: ReverseChannel | None,
+) -> list[CandidateSet]:
+    candidate_sets: list[CandidateSet]
+    if candidate_fn is None:
+        candidate_sets = generate_candidates(records, index, None, config, reverse)
+        return candidate_sets
+    candidate_sets = candidate_fn(records)
+    return candidate_sets if reverse is None else reverse.extend(records, candidate_sets, config)
+
+
 def fit_bundle(
     train: pd.DataFrame,
     catalog: pd.DataFrame,
     config: MatchConfig,
     translit: TranslitFn | None = None,
     fewshot: tuple[tuple[str, str], ...] = (),
+    *,
+    reverse: ReverseChannel | None = None,
+    families: FamilyContext | None = None,
+    synthetic: pd.DataFrame | None = None,
 ) -> ArtifactBundle:
-    """Fit the attribute maps, the call-sign memory and the ranker on all given train rows."""
+    """Fit maps and call-sign memory on `train`, the ranker on `train` plus training-only `synthetic` rows."""
     index = CatalogIndex.build(catalog)
     maps = AttributeMaps.fit(train, index)
     memory = CallSignMemory.fit(train, index)
-    training = build_training_data(train, index, maps, config, translit=translit)
-    ranker = train_ensemble(training.features, training.labels, training.group_sizes, config)
+    rows = train if synthetic is None else pd.concat([train, synthetic[train.columns]], ignore_index=True)
+    training = build_training_data(rows, index, maps, config, translit=translit, reverse=reverse, families=families)
+    names = feature_names(reverse is not None)
+    ranker = train_ensemble(training.features, training.labels, training.group_sizes, config, names)
     logger.info(
         "[ALGO] fitted rows=%d pairs=%d groups=%d members=%d recall_hangul=%.4f recall_latin=%.4f",
-        len(train),
+        len(rows),
         int(training.features.shape[0]),
         len(training.group_sizes),
         len(ranker.boosters),
         training.recall_hangul,
         training.recall_latin,
     )
-    return ArtifactBundle(ranker=ranker, maps=maps, memory=memory, config=config, fewshot=fewshot)
+    return ArtifactBundle(ranker=ranker, maps=maps, memory=memory, config=config, fewshot=fewshot, reverse=reverse)
 
 
 def cross_validate(
@@ -283,6 +312,7 @@ def cross_validate_run(
     index: CatalogIndex | None = None,
     translit: TranslitFn | None = None,
     rerank: CandidateScoreFn | None = None,
+    reverse: ReverseChannel | None = None,
 ) -> CVRun:
     """Vessel-disjoint CV with memory off; each fold's ensemble scores clean rows and every scenario's perturbed rows."""
     scenario_map = dict(scenarios or {})
@@ -308,9 +338,12 @@ def cross_validate_run(
         fold_valid = train.iloc[valid_index]
         timings = _StageTimes()
         maps = AttributeMaps.fit(fold_train, index)
-        training = build_training_data(fold_train, index, maps, config, candidate_fn, translit, _timings=timings)
+        training = build_training_data(
+            fold_train, index, maps, config, candidate_fn, translit, reverse=reverse, _timings=timings
+        )
         fit_start = time.perf_counter()
-        ranker = train_ensemble(training.features, training.labels, training.group_sizes, config)
+        names = feature_names(reverse is not None)
+        ranker = train_ensemble(training.features, training.labels, training.group_sizes, config, names)
         fit_s = time.perf_counter() - fit_start
         logger.info(
             "[ALGO] fold=%d train_rows=%d pairs=%d groups=%d members=%d recall_hangul=%.4f recall_latin=%.4f",
@@ -327,7 +360,16 @@ def cross_validate_run(
         records = _maybe_attach_translit(raw_records, config, translit)
         fold_targets = [str(value) for value in fold_valid["target_vessel_id"].tolist()]
         clean_rows = _diagnostic_rows(
-            records, fold_targets, index, maps, config, ranker, candidate_fn, _timings=timings, rerank=rerank
+            records,
+            fold_targets,
+            index,
+            maps,
+            config,
+            ranker,
+            candidate_fn,
+            _timings=timings,
+            rerank=rerank,
+            reverse=reverse,
         )
         rows.extend({"scenario": "clean", **row} for row in clean_rows)
         _log_fold_metrics(fold_number, None, clean_rows)
@@ -355,6 +397,7 @@ def cross_validate_run(
                 candidate_fn,
                 _timings=timings,
                 rerank=rerank,
+                reverse=reverse,
             )
             rows.extend({"scenario": scenario_name, **row} for row in scenario_rows)
             _log_fold_metrics(fold_number, scenario_name, scenario_rows)
@@ -390,17 +433,15 @@ def _diagnostic_rows(
     *,
     _timings: _StageTimes | None = None,
     rerank: CandidateScoreFn | None = None,
+    reverse: ReverseChannel | None = None,
 ) -> list[dict[str, object]]:
     """Score records with a fold ensemble and return one diagnostic row per record."""
     timings = _timings or _StageTimes()
     started = time.perf_counter()
-    if candidate_fn is None:
-        candidate_sets = generate_candidates(records, index, None, config)
-    else:
-        candidate_sets = candidate_fn(records)
+    candidate_sets = _candidates(records, index, config, candidate_fn, reverse)
     timings.retrieve += time.perf_counter() - started
     started = time.perf_counter()
-    features = build_features(records, candidate_sets, index, maps, config)
+    features = build_features(records, candidate_sets, index, maps, config, reverse)
     timings.features += time.perf_counter() - started
     started = time.perf_counter()
     scores = score_ensemble(ranker, features, config)
@@ -511,6 +552,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--llm-cache", type=Path, default=Path("artifacts/cache/translit"), help="transliteration cache directory"
     )
+    parser.add_argument("--recipe", choices=sorted(RECIPES), default="default", help="named config recipe")
+    parser.add_argument(
+        "--reverse", type=Path, nargs="+", default=None, help="catalog Hangul rendering JSONL files (reverse channel)"
+    )
+    parser.add_argument(
+        "--rename-lexicon", type=Path, default=None, help="rendering JSONL for Hangul rename tokens (families)"
+    )
+    parser.add_argument(
+        "--synthetic-exclude", type=Path, default=None, help="vessel ids never drawn as synthetic rows, one per line"
+    )
     args = parser.parse_args(argv)
     if args.cv is False and args.out is None:
         parser.error("nothing to do: pass --cv and/or --out")
@@ -518,8 +569,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     train = read_csv_checked(args.train, (*RECORD_COLUMNS, "target_vessel_id"))
     catalog = read_csv_checked(args.catalog, CATALOG_COLUMNS)
-    config = MatchConfig()
-    logger.info("[DATA] loaded train_rows=%d catalog_rows=%d", len(train), len(catalog))
+    config = recipe_config(args.recipe)
+    logger.info("[DATA] loaded train_rows=%d catalog_rows=%d recipe=%s", len(train), len(catalog), args.recipe)
+    index = CatalogIndex.build(catalog)
+    reverse = ReverseChannel.load(index, args.reverse) if args.reverse else None
+    families: FamilyContext | None = None
+    if config.augment_families:
+        if args.rename_lexicon is None:
+            parser.error("--rename-lexicon is required when augment_families")
+        families = FamilyContext.build(train, catalog, args.rename_lexicon)
+    synthetic: pd.DataFrame | None = None
+    if config.synthetic_latin_rows > 0:
+        exclude: list[str] = []
+        if args.synthetic_exclude is not None:
+            exclude = [line.strip() for line in args.synthetic_exclude.read_text(encoding="utf-8").splitlines()]
+        synthetic = synthetic_latin_rows(
+            train, catalog, config.synthetic_latin_rows, [v for v in exclude if v], config.synthetic_seed
+        )
+        logger.info("[DATA] synthetic_latin_rows=%d excluded_ids=%d", len(synthetic), len(exclude))
 
     translit: TranslitFn | None = None
     shots: tuple[tuple[str, str], ...] = ()
@@ -535,6 +602,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         rerank: CandidateScoreFn | None = None
         if config.llm_enabled:
             rerank = transliterator.score_candidates
+        if reverse is not None or synthetic is not None:
+            parser.error("--cv supports the default recipe without --reverse only")
         report = cross_validate(train, catalog, config, args.diagnostics, translit, rerank)
         logger.info(
             "[EVAL] cv weighted_score=%.4f hangul_accuracy=%.4f non_hangul_accuracy=%.4f",
@@ -543,7 +612,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             report.non_hangul_accuracy,
         )
     if args.out is not None:
-        bundle = fit_bundle(train, catalog, config, translit, shots)
+        bundle = fit_bundle(
+            train, catalog, config, translit, shots, reverse=reverse, families=families, synthetic=synthetic
+        )
         bundle.save(args.out)
         logger.info("[SYS] artifacts written path=%s", args.out)
     return 0

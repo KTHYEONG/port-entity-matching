@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -10,10 +11,11 @@ import lightgbm as lgb
 
 from port_entity_matching.catalog import CatalogIndex
 from port_entity_matching.config import MatchConfig, config_from_dict, config_to_dict
-from port_entity_matching.features import FEATURE_NAMES
+from port_entity_matching.features import feature_names
 from port_entity_matching.maps import AttributeMaps
 from port_entity_matching.memory import CallSignMemory
 from port_entity_matching.ranker import RankerEnsemble
+from port_entity_matching.reverse import ReverseChannel
 from port_entity_matching.version import __version__
 
 __all__ = ["ArtifactBundle"]
@@ -35,11 +37,20 @@ class ArtifactBundle:
     memory: CallSignMemory
     config: MatchConfig
     fewshot: tuple[tuple[str, str], ...] = ()
+    reverse: ReverseChannel | None = None
 
     def save(self, model_dir: str | Path) -> None:
-        """Write the ensemble members, attribute maps, call-sign memory and manifest."""
+        """Write the ensemble members, attribute maps, call-sign memory, rendering files and manifest."""
         destination = Path(model_dir)
         destination.mkdir(parents=True, exist_ok=True)
+        reverse_files: list[str] = []
+        if self.reverse is not None:
+            for source in self.reverse.files:
+                if source.resolve() != (destination / source.name).resolve():
+                    shutil.copyfile(source, destination / source.name)
+                reverse_files.append(source.name)
+            if len(set(reverse_files)) != len(reverse_files):
+                raise ValueError("Rendering file names must be unique")
         files: list[str] = []
         for index, booster in enumerate(self.ranker.boosters):
             name = MEMBER_FILE_TEMPLATE.format(index=index)
@@ -52,7 +63,7 @@ class ArtifactBundle:
             encoding="utf-8",
         )
         manifest = {
-            "feature_names": list(FEATURE_NAMES),
+            "feature_names": list(feature_names(self.reverse is not None)),
             "config": config_to_dict(self.config),
             "package_version": __version__,
             "ensemble": {
@@ -62,6 +73,8 @@ class ArtifactBundle:
             },
             "llm": {"fewshot_file": FEWSHOT_FILE, "weights_dir": LLM_WEIGHTS_DIR},
         }
+        if reverse_files:
+            manifest["reverse"] = {"files": reverse_files}
         (destination / MANIFEST_FILE).write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8"
         )
@@ -76,8 +89,15 @@ class ArtifactBundle:
         manifest = json.loads((source / MANIFEST_FILE).read_text(encoding="utf-8"))
         if not isinstance(manifest, dict):
             raise ValueError(f"Artifact manifest {source / MANIFEST_FILE} must contain a JSON object")
-        feature_names = manifest.get("feature_names")
-        if feature_names != list(FEATURE_NAMES):
+        reverse_section = manifest.get("reverse")
+        reverse_names: list[str] = []
+        if reverse_section is not None:
+            raw_files = reverse_section.get("files") if isinstance(reverse_section, dict) else None
+            if not isinstance(raw_files, list) or not raw_files or not all(isinstance(f, str) for f in raw_files):
+                raise ValueError(f"Artifact manifest {source / MANIFEST_FILE} has a malformed reverse section")
+            reverse_names = raw_files
+        expected_names = list(feature_names(bool(reverse_names)))
+        if manifest.get("feature_names") != expected_names:
             raise ValueError("Artifact manifest feature names do not match the current feature set")
         raw_config = manifest.get("config", {})
         if not isinstance(raw_config, dict):
@@ -103,7 +123,7 @@ class ArtifactBundle:
             if not path.is_file():
                 raise FileNotFoundError(f"Artifact file not found: {path}")
             booster = lgb.Booster(model_file=str(path))
-            if booster.feature_name() != list(FEATURE_NAMES):
+            if booster.feature_name() != expected_names:
                 raise ValueError("Booster feature names do not match the current feature set")
             boosters.append(booster)
         ranker = RankerEnsemble(
@@ -137,4 +157,12 @@ class ArtifactBundle:
                     raise ValueError(f"Artifact fewshot file {fewshot_path} has a malformed pair")
                 parsed.append((entry[0], entry[1]))
             fewshot = tuple(parsed)
-        return cls(ranker=ranker, maps=maps, memory=memory, config=config_from_dict(raw_config), fewshot=fewshot)
+        reverse = ReverseChannel.load(index, [source / name for name in reverse_names]) if reverse_names else None
+        return cls(
+            ranker=ranker,
+            maps=maps,
+            memory=memory,
+            config=config_from_dict(raw_config),
+            fewshot=fewshot,
+            reverse=reverse,
+        )

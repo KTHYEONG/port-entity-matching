@@ -5,7 +5,7 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -25,6 +25,9 @@ from port_entity_matching.normalize import (
     sorted_token_key,
 )
 from port_entity_matching.records import QueryRecord
+
+if TYPE_CHECKING:
+    from port_entity_matching.reverse import ReverseChannel
 
 __all__ = [
     "SRC_FALLBACK",
@@ -79,8 +82,9 @@ def generate_candidates(
     index: CatalogIndex,
     memory: CallSignMemory | None,
     config: MatchConfig,
+    reverse: ReverseChannel | None = None,
 ) -> list[CandidateSet]:
-    """Return one non-empty CandidateSet per record, in input order."""
+    """Return one non-empty CandidateSet per record, in input order; `reverse` adds its Hangul candidates."""
     if config.query_chunk < 1 or config.max_candidates < 1:
         raise ValueError("query_chunk and max_candidates must be positive")
     if min(config.name_top_k, config.hangul_key_top_k, config.hangul_window_keep, config.latin_exact_gt_cap) < 0:
@@ -99,6 +103,8 @@ def generate_candidates(
     step = config.query_chunk
     for start in range(0, len(records), step):
         results.extend(_process_chunk(records[start : start + step], index, memory, config))
+    if reverse is not None:
+        results = reverse.extend(records, results, config)
     return results
 
 

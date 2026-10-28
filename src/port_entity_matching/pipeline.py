@@ -192,8 +192,9 @@ class Matcher:
     def _rank_chunk(self, records: Sequence[QueryRecord]) -> list[_Ranked]:
         """Retrieve, featurize and score one chunk of records."""
         config = self.bundle.config
-        candidate_sets = generate_candidates(records, self.index, self.bundle.memory, config)
-        features = build_features(records, candidate_sets, self.index, self.bundle.maps, config)
+        reverse = self.bundle.reverse
+        candidate_sets = generate_candidates(records, self.index, self.bundle.memory, config, reverse)
+        features = build_features(records, candidate_sets, self.index, self.bundle.maps, config, reverse)
         scores = score_ensemble(self.bundle.ranker, features, config)
         if self.transliterator is not None:
             started = time.perf_counter()

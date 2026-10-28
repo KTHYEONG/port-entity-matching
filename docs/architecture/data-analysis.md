@@ -500,9 +500,47 @@ rerank vs. Qwen translit without rerank, correct-row counts):
 
 The gain plateaus for `w` in 0.15–0.4.
 
-**Reverse channel (catalog Latin→Hangul by LLM), measured and deprioritized:**
-exact 0.314, jamo 0.802 against human Hangul; pool top-1 0.835 vs rule key 0.908
-(sum 0.935); full-catalog cost ≈292 min.
+**Reverse channel (catalog Latin→Hangul by LLM).** First measured on a pool
+(exact 0.314, jamo 0.802 against human Hangul) and deprioritized; adopted on
+2026-10-27 after an LB complement probe showed that jamo matching against Midm
+catalog renderings fixes 17 of the 41 Korean errors of the then-best model.
+Production design and LB history are in §2.9.
+
+### 2.9 Production Recipe `rev2syn` (LB best, 2026-10-27)
+LB 0.9525342223 (K 505/532, L 1713/1784). Components, all fitted on `train.csv` and `vessel_catalog.csv` only:
+- **LLM reader:** Kanana-1.5-2.1B with a noise-robust back-translation LoRA (`tools/llm/train_bt_noise_lora.py`):
+  Midm catalog renderings → catalog names, train target vessels excluded, half the Hangul inputs with 1–2 syllable/jamo edits.
+- **Reverse channel** (`reverse.py`): every catalog name is rendered to Hangul offline by Midm-2.0-Mini and by
+  Kanana (`tools/llm/render_catalog.py`; catalog-side precompute, row-independent). For a Hangul row, the jamo
+  top-20 vessels plus the first 5 within ±10% tonnage among the jamo top-200 join the candidates. Three features
+  (`rev_jamo_sim`, `rev_jamo_rank`, `rev_ton_rank`) enter the ranker. The rendering files ship in the model dir
+  (manifest `reverse` section).
+- **Training-only damage families** (`families.py`): truncation, operator-prefix rename, notation variants,
+  wrong tonnage (p 0.3), Hangul syllable/jamo noise (p 0.6), vessel-type noise (p 0.3).
+- **Catalog-synthetic Latin rows** (`synthetic.py`): 15,000 uncurated catalog vessels with a broad damage mixture;
+  maps and call-sign memory are fitted on real train rows only.
+
+LB steps (K / L correct rows): knn 491 / 1712.5 → +reverse (Midm) 499 / 1712 → +Kanana rendering 502 / 1712.5 →
++synthetic Latin 505 / 1713. Rejected on LB: a third rendering (Midm beam-4 n-best, K 504), synthetic Korean rows
+(K 501), higher rerank weights (w 0.5: K 502; w 0.7: K 500). Retrain noise is about ±2 K / ±4 L, so only gains of
+3 or more K rows count.
+
+Reproduction from tracked code was verified on 2026-10-28: the refit reproduces the five ranker members, attribute
+maps, call-sign memory and few-shot file of the LB model byte-for-byte (CPU, ~11 min). Generated inputs, not in git:
+the rendering caches under `artifacts/cache/`, the transliteration cache, and `artifacts/recipe/synlat_exclude_ids.txt`
+(vessels held out of synthetic rows for the local evaluation panels). LLM renderings and LoRA weights come from GPU
+runs that are not bit-reproducible, so the shipped files are the reference.
+
+```bash
+uv run python -m port_entity_matching.train --train data/raw/open/train.csv \
+  --catalog data/raw/open/vessel_catalog.csv --out artifacts/model_rev2syn \
+  --llm-model artifacts/hf/kanana_bt_noise --recipe rev2syn \
+  --reverse artifacts/cache/rev_midm_catalog.jsonl artifacts/cache/rev_kanana_catalog.jsonl \
+  --rename-lexicon artifacts/cache/rev_midm_catalog.jsonl \
+  --synthetic-exclude artifacts/recipe/synlat_exclude_ids.txt
+uv run python tools/build_submit.py --model-dir artifacts/model_rev2syn \
+  --out artifacts/submit_rev2syn.zip --llm-dir artifacts/hf/kanana_bt_noise
+```
 
 ### Decisions
 - **Pretrained models allowed (revised 2026-10-23).** The original self-imposed "no LLMs or large neural models" decision is withdrawn: the competition explicitly allows publicly available general pretrained weights, and the server ships torch, transformers and an L4 GPU. LB decoding showed that the rule-based Korean name channel does not generalize to test-style Hangul names (test Korean name-only 0.628 vs CV 0.874). Constraints that still hold: weights ship inside the ZIP (no runtime downloads), fine-tuning uses only `train.csv`/`vessel_catalog.csv`, inference stays deterministic and row-independent, and inference time and ZIP size remain tie-breakers.

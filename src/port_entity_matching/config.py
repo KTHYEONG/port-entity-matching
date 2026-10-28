@@ -62,6 +62,38 @@ class MatchConfig:
     llm_rerank_enabled: bool = True
     llm_rerank_top_k: int = 10
     llm_rerank_weight: float = 0.2
+    reverse_top_k: int = 20
+    reverse_pool: int = 200
+    reverse_tonnage_top_k: int = 5
+    reverse_tonnage_window: float = 0.1
+    augment_families: bool = False
+    augment_wrong_tonnage_rate: float = 0.0
+    augment_type_noise_rate: float = 0.0
+    augment_hangul_noise_rate: float = 0.0
+    synthetic_latin_rows: int = 0
+    synthetic_seed: int = 0
+
+
+# Named training recipes: overrides applied on top of MatchConfig defaults. "rev2syn" is the LB-best recipe
+# (reverse channel + damage families + 15k synthetic Latin rows); it also needs the rendering files at fit time.
+RECIPES: dict[str, dict[str, object]] = {
+    "default": {},
+    "rev2syn": {
+        "augment_families": True,
+        "augment_wrong_tonnage_rate": 0.3,
+        "augment_type_noise_rate": 0.3,
+        "augment_hangul_noise_rate": 0.6,
+        "synthetic_latin_rows": 15000,
+        "synthetic_seed": 0,
+    },
+}
+
+
+def recipe_config(name: str) -> MatchConfig:
+    """MatchConfig for a named recipe; ValueError for an unknown name."""
+    if name not in RECIPES:
+        raise ValueError(f"Unknown recipe: {name}")
+    return config_from_dict(RECIPES[name])
 
 
 def config_to_dict(config: MatchConfig) -> dict[str, int | float]:

@@ -41,8 +41,9 @@ from port_entity_matching.normalize import (
     sorted_token_key,
 )
 from port_entity_matching.records import QueryRecord
+from port_entity_matching.reverse import REVERSE_FEATURE_NAMES, ReverseChannel
 
-__all__ = ["FEATURE_NAMES", "build_features"]
+__all__ = ["FEATURE_NAMES", "build_features", "feature_names"]
 
 FEATURE_NAMES: tuple[str, ...] = (
     "is_hangul",
@@ -145,23 +146,32 @@ _LLM_NAMES: tuple[str, ...] = (
 Scorer = Callable[[str, str], float]
 
 
+def feature_names(reverse: bool) -> tuple[str, ...]:
+    """Ranker column order: the base features, plus the reverse-channel features when that channel is on."""
+    return FEATURE_NAMES + REVERSE_FEATURE_NAMES if reverse else FEATURE_NAMES
+
+
 def build_features(
     records: Sequence[QueryRecord],
     candidate_sets: Sequence[CandidateSet],
     index: CatalogIndex,
     maps: AttributeMaps,
     config: MatchConfig,
+    reverse: ReverseChannel | None = None,
 ) -> NDArray[np.float32]:
-    """Return the float32 feature matrix; rows follow the records and each set's position order."""
+    """Return the float32 feature matrix (columns: feature_names(reverse is not None)); rows follow the records."""
     if len(records) != len(candidate_sets):
         raise ValueError("records and candidate_sets must have the same length")
+    names = feature_names(reverse is not None)
     sizes = [len(candidate_set.positions) for candidate_set in candidate_sets]
-    matrix = np.full((sum(sizes), len(FEATURE_NAMES)), np.nan, dtype=np.float32)
+    matrix = np.full((sum(sizes), len(names)), np.nan, dtype=np.float32)
     offset = 0
     for record, candidate_set in zip(records, candidate_sets, strict=True):
         size = len(candidate_set.positions)
         if size:
-            matrix[offset : offset + size] = _record_features(record, candidate_set, index, maps, config)
+            matrix[offset : offset + size] = _record_features(
+                record, candidate_set, index, maps, config, reverse, names
+            )
         offset += size
     return matrix
 
@@ -172,6 +182,8 @@ def _record_features(
     index: CatalogIndex,
     maps: AttributeMaps,
     config: MatchConfig,
+    reverse: ReverseChannel | None,
+    names: tuple[str, ...],
 ) -> NDArray[np.float32]:
     positions = candidate_set.positions
     size = len(positions)
@@ -189,9 +201,11 @@ def _record_features(
     _tonnage_columns(record, positions, index, columns, config)
     _attribute_columns(record, positions, index, maps, columns)
     _context_columns(columns, positions, index, candidate_set, hangul)
+    if reverse is not None:
+        columns.update(reverse.columns(record, positions, config, hangul))
 
-    matrix = np.empty((size, len(FEATURE_NAMES)), dtype=np.float32)
-    for column, name in enumerate(FEATURE_NAMES):
+    matrix = np.empty((size, len(names)), dtype=np.float32)
+    for column, name in enumerate(names):
         matrix[:, column] = columns[name]
     return matrix
 
@@ -331,11 +345,15 @@ def _llm_columns(
     candidate_token_str = [" ".join(sorted(index.tokens[position])) for position in positions]
     query_sorted = [sorted_token_key(latin_tokens(alt)) for alt in cleaned]
     query_token_str = [" ".join(latin_tokens(alt)) for alt in cleaned]
-    dl_matrix = np.vstack([_cdist(key, candidate_canonical, DamerauLevenshtein.normalized_similarity) for key in canonicals])
+    dl_matrix = np.vstack(
+        [_cdist(key, candidate_canonical, DamerauLevenshtein.normalized_similarity) for key in canonicals]
+    )
     sorted_matrix = np.vstack(
         [_cdist(key, candidate_sorted, DamerauLevenshtein.normalized_similarity) for key in query_sorted]
     )
-    token_matrix = np.vstack([_cdist(query, candidate_token_str, fuzz.token_set_ratio) for query in query_token_str]) / 100.0
+    token_matrix = (
+        np.vstack([_cdist(query, candidate_token_str, fuzz.token_set_ratio) for query in query_token_str]) / 100.0
+    )
     columns["llm_dl_sim"] = dl_matrix.max(axis=0)
     columns["llm_sorted_sim"] = sorted_matrix.max(axis=0)
     columns["llm_token_set"] = token_matrix.max(axis=0)
@@ -475,7 +493,8 @@ def _order_invariant_columns(
         columns["name_token_cover_cand"] = cover_c
         columns["name_token_fuzzy_cover"] = fuzzy
         columns["token_count_diff"] = np.array(
-            [abs(len(query_tokens) - len(latin_tokens(index.names[position]))) for position in positions], dtype=np.float64
+            [abs(len(query_tokens) - len(latin_tokens(index.names[position]))) for position in positions],
+            dtype=np.float64,
         )
 
 

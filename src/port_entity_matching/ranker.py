@@ -30,6 +30,7 @@ def train_ranker(
     labels: NDArray[np.int64],
     group_sizes: Sequence[int],
     config: MatchConfig,
+    feature_names: Sequence[str] = FEATURE_NAMES,
 ) -> lgb.Booster:
     """Fit a lambdarank model; ValueError on size mismatch or a group without exactly one positive."""
     matrix = np.asarray(features, dtype=np.float32)
@@ -37,8 +38,8 @@ def train_ranker(
     if len(group_sizes) == 0 or any(not isinstance(size, Integral) or size <= 0 for size in group_sizes):
         raise ValueError("group sizes must be positive integers and non-empty")
     sizes = [int(size) for size in group_sizes]
-    if matrix.ndim != 2 or matrix.shape[1] != len(FEATURE_NAMES):
-        raise ValueError(f"features must have {len(FEATURE_NAMES)} columns")
+    if matrix.ndim != 2 or matrix.shape[1] != len(feature_names):
+        raise ValueError(f"features must have {len(feature_names)} columns")
     if matrix.shape[0] != targets.shape[0]:
         raise ValueError("features and labels must have the same number of rows")
     if sum(sizes) != matrix.shape[0]:
@@ -53,7 +54,7 @@ def train_ranker(
             raise ValueError("every group must contain exactly one positive label")
         offset += size
 
-    dataset = lgb.Dataset(matrix, label=targets, group=sizes, feature_name=list(FEATURE_NAMES))
+    dataset = lgb.Dataset(matrix, label=targets, group=sizes, feature_name=list(feature_names))
     params: dict[str, object] = {
         "objective": "lambdarank",
         "metric": "ndcg",
@@ -127,6 +128,7 @@ def train_ensemble(
     labels: NDArray[np.int64],
     group_sizes: Sequence[int],
     config: MatchConfig,
+    feature_names: Sequence[str] = FEATURE_NAMES,
 ) -> RankerEnsemble:
     """Fit config.ensemble_size lambdarank members; same validation errors as train_ranker."""
     if config.ensemble_size < 1:
@@ -136,7 +138,7 @@ def train_ensemble(
     stds: list[float] = []
     for member in range(config.ensemble_size):
         member_config = replace(config, seed=config.seed + member)
-        booster = train_ranker(features, labels, group_sizes, member_config)
+        booster = train_ranker(features, labels, group_sizes, member_config, feature_names)
         scores = score_pairs(booster, features, member_config)
         means.append(float(np.mean(scores)))
         stds.append(_finite_std(scores))
