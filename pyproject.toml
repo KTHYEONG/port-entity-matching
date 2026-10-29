@@ -94,7 +94,7 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "-ra -q --import-mode=importlib -m \"not slow\""
 pythonpath = [".", "src"]
-markers = ["slow: marks slow integration tests"]
+markers = ["slow: marks slow integration tests", "heavy: marks manual heavyweight checks"]
 
 [dependency-groups]
 dev = [

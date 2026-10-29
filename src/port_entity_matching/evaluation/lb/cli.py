@@ -1,4 +1,4 @@
-"""Ledger CLI: register, attach, record, facts, show and seed.
+"""Ledger CLI: register, attach, record, facts, show, seed, interval, gate, design, verdict.
 
 Development-only; never imported by ``submission/`` or ``pipeline.py``.
 """
@@ -15,15 +15,21 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, cast
 
+import pandas as pd
+
 from port_entity_matching.evaluation.lb.decode import DecodeError
+from port_entity_matching.evaluation.lb.feasible import FeasibilityError
 from port_entity_matching.evaluation.lb.ledger import (
     DEFAULT_LEDGER_PATH,
     ChannelSpec,
     Decoded,
+    Fact,
+    FactKind,
     Ledger,
     LedgerEntry,
     LedgerError,
 )
+from port_entity_matching.evaluation.lb.response import ResponseMatrix
 
 __all__ = ["build_parser", "main"]
 
@@ -33,7 +39,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ledger", type=Path, default=DEFAULT_LEDGER_PATH)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    reg = sub.add_parser("register")
+    reg = sub.add_parser(
+        "register",
+        help="Register a probe entry.",
+        description=(
+            "Probe workflow: the prediction of a new entry comes from "
+            "`lb interval` on a gate-passing frame (source=\"feasible_lp\"); "
+            "otherwise source=\"none\" with prediction [-N, N] and a decision "
+            "table that states what each outcome changes."
+        ),
+    )
     reg.add_argument("--entry", type=Path, required=True)
 
     att = sub.add_parser("attach")
@@ -52,13 +67,39 @@ def build_parser() -> argparse.ArgumentParser:
 
     seed = sub.add_parser("seed")
     seed.add_argument("--csv", dest="csv_path", type=Path, required=True)
-    for command in (reg, att, rec, facts, seed, sub.choices["show"]):
+
+    interval = sub.add_parser("interval", help="Set-membership interval for one target key.")
+    interval.add_argument("--frame", type=Path, required=True)
+    interval.add_argument("--script", choices=("K", "L"), required=True)
+    interval.add_argument("--kinds", required=True, help="KEY=KIND,... with KIND in abs|comp|net")
+    interval.add_argument("--target", required=True)
+    interval.add_argument("--unknown-process", action="append", default=[], help="Training process names")
+    interval.add_argument("--ignore", action="append", default=[], help="Fact keys to skip")
+
+    gate = sub.add_parser("gate", help="Leave-one-key-out validation gate.")
+    gate.add_argument("--frame", type=Path, required=True)
+    gate.add_argument("--script", choices=("K", "L"), required=True)
+    gate.add_argument("--kinds", required=True, help="KEY=KIND,... with KIND in abs|comp|net")
+    gate.add_argument("--held-out", required=True, help="KEY,... held-out keys")
+
+    design = sub.add_parser("design", help="Rank candidate measurement policies.")
+    design.add_argument("--frame", type=Path, required=True)
+    design.add_argument("--script", choices=("K", "L"), required=True)
+    design.add_argument("--kinds", required=True, help="KEY=KIND,... with KIND in abs|comp|net")
+    design.add_argument("--candidates", required=True, help="KEY,... candidate keys")
+    design.add_argument("--targets", required=True, help="KEY,... target keys")
+
+    verdict = sub.add_parser("verdict", help="LB verdict from public net and churn.")
+    verdict.add_argument("--net", type=float, required=True)
+    verdict.add_argument("--churn", type=float, required=True)
+    verdict.add_argument("--threshold", type=float, default=0.9)
+    for command in (reg, att, rec, facts, seed, interval, gate, design, sub.choices["show"]):
         command.add_argument("--ledger", type=Path, default=argparse.SUPPRESS)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """CLI over the ledger: register, attach, record, facts, show, seed."""
+    """CLI over the ledger: register, attach, record, facts, show, seed, interval, gate, design, verdict."""
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
@@ -72,10 +113,108 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run_facts(args)
         if args.command == "show":
             return _run_show(args)
+        if args.command == "interval":
+            return _run_interval(args)
+        if args.command == "gate":
+            return _run_gate(args)
+        if args.command == "design":
+            return _run_design(args)
+        if args.command == "verdict":
+            return _run_verdict(args)
         return _run_seed(args)
-    except (LedgerError, DecodeError) as error:
+    except FeasibilityError as error:
+        sys.stderr.write(f"LIBRARY INCONSISTENT: {error}\n")
+        return 2
+    except (LedgerError, DecodeError, ValueError) as error:
         sys.stderr.write(f"error: {error}\n")
         return 2
+
+
+def _parse_kinds(spec: str) -> dict[str, FactKind]:
+    kinds: dict[str, FactKind] = {}
+    for raw in spec.split(","):
+        item = raw.strip()
+        if not item:
+            continue
+        key, sep, kind = item.partition("=")
+        if not sep or not key or kind not in ("abs", "comp", "net"):
+            raise LedgerError(f"Invalid kinds entry {item!r}: expected KEY=KIND with KIND in abs|comp|net")
+        kinds[key] = cast("FactKind", kind)
+    if not kinds:
+        raise LedgerError("Empty --kinds: expected KEY=KIND,...")
+    return kinds
+
+
+def _split_keys(values: Sequence[str] | str) -> list[str]:
+    parts = [values] if isinstance(values, str) else list(values)
+    out: list[str] = []
+    for part in parts:
+        out.extend(item.strip() for item in part.split(","))
+    return [item for item in out if item]
+
+
+def _load_frame_and_facts(
+    args: argparse.Namespace,
+) -> tuple[ResponseMatrix, list[Fact]]:
+    from port_entity_matching.evaluation.lb.response import response_matrix
+
+    frame = pd.read_csv(Path(args.frame), dtype=str)
+    kinds = _parse_kinds(str(args.kinds))
+    facts = Ledger.load(Path(args.ledger)).facts()
+    matrix = response_matrix(frame, args.script, kinds, "base")
+    return matrix, facts
+
+
+def _run_interval(args: argparse.Namespace) -> int:
+    from port_entity_matching.evaluation.lb.feasible import classify, feasible_interval
+    from port_entity_matching.evaluation.lb.response import circular_cells
+
+    matrix, facts = _load_frame_and_facts(args)
+    unknown = circular_cells(matrix, _split_keys(list(args.unknown_process)))
+    interval = feasible_interval(matrix, facts, str(args.target), unknown_cells=unknown, ignore=_split_keys(list(args.ignore)))
+    verdict = classify(interval)
+    sys.stdout.write(
+        f"target={args.target} lo={interval.lo} hi={interval.hi} "
+        f"verdict={verdict} unknown_cells={len(unknown)}\n"
+    )
+    return 0
+
+
+def _run_gate(args: argparse.Namespace) -> int:
+    from port_entity_matching.evaluation.lb.feasible import loo_gate
+
+    matrix, facts = _load_frame_and_facts(args)
+    held_out = _split_keys(str(args.held_out))
+    report = loo_gate(matrix, facts, held_out)
+    for key in held_out:
+        interval = report.intervals[key]
+        hit = interval.lo <= report.truth[key] <= interval.hi
+        sys.stdout.write(f"{key} lo={interval.lo} hi={interval.hi} truth={report.truth[key]} hit={hit}\n")
+    status = "GATE PASS" if report.passes else "GATE FAIL"
+    sys.stdout.write(f"coverage={report.coverage:.4f} decisive={report.decisive} {status}\n")
+    return 0 if report.passes else 3
+
+
+def _run_design(args: argparse.Namespace) -> int:
+    from port_entity_matching.evaluation.lb.design import rank_probes
+
+    matrix, facts = _load_frame_and_facts(args)
+    scores = rank_probes(matrix, facts, _split_keys(str(args.candidates)), _split_keys(str(args.targets)))
+    for score in scores:
+        sys.stdout.write(
+            f"{score.candidate} expected_width={score.expected_width:.4f} "
+            f"worst_width={score.worst_width:.4f} feasible_points={score.feasible_points}\n"
+        )
+    return 0
+
+
+def _run_verdict(args: argparse.Namespace) -> int:
+    from port_entity_matching.evaluation.lb.decision import lb_verdict, private_gain_probability
+
+    prob = private_gain_probability(float(args.net), float(args.churn))
+    verdict = lb_verdict(float(args.net), float(args.churn), float(args.threshold))
+    sys.stdout.write(f"p_gain={prob:.4f} verdict={verdict}\n")
+    return 0
 
 
 def _parse_entry_file(path: Path) -> LedgerEntry:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 from pathlib import Path
@@ -207,3 +208,134 @@ def test_register_cli_round_trip(tmp_path: Path, capsys) -> None:
     )
     assert lb_main(["--ledger", str(ledger_path), "register", "--entry", str(entry_file)]) == 0
     assert "registered id=cli1" in capsys.readouterr().out
+
+
+def _seed_facts(ledger_path: Path, rows: list[tuple[str, str, float]]) -> None:
+    csv_path = ledger_path.with_suffix(".csv")
+    with open(csv_path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["entry_id", "created", "channel", "policy_key", "kind", "base", "value"])
+        for entry_id, key, value in rows:
+            writer.writerow([entry_id, "2026-10-29", "K", key, "abs", "", value])
+    assert lb_main(["--ledger", str(ledger_path), "seed", "--csv", str(csv_path)]) == 0
+
+
+def _probe_frame(path: Path, p_right_on_c2: bool) -> None:
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["sample_id", "script", "cell", "target_vessel_id", "base", "a", "p"])
+        for i in range(20):
+            writer.writerow([f"s0_{i}", "K", "K|g1|clean|exact", "V1", "VX", "V1", "V1"])
+        for i in range(20):
+            p = "V1" if p_right_on_c2 else "VX"
+            writer.writerow([f"s1_{i}", "K", "K|g2|clean|exact", "V1", "VX", "VX", p])
+
+
+def test_gate_failure_exit_code(tmp_path: Path, capsys) -> None:
+    ledger_path = tmp_path / "ledger.jsonl"
+    _seed_facts(ledger_path, [("e1", "a", 266.0), ("e2", "p", 0.0)])
+    frame = tmp_path / "frame.csv"
+    _probe_frame(frame, p_right_on_c2=True)
+    code = lb_main([
+        "--ledger", str(ledger_path), "gate", "--frame", str(frame),
+        "--script", "K", "--kinds", "a=abs,p=abs", "--held-out", "p",
+    ])
+    assert code == 3
+    assert "GATE FAIL" in capsys.readouterr().out
+
+
+def test_gate_pass_exit_code(tmp_path: Path, capsys) -> None:
+    ledger_path = tmp_path / "ledger.jsonl"
+    _seed_facts(ledger_path, [("e1", "a", 266.0), ("e2", "p", 266.0)])
+    frame = tmp_path / "frame.csv"
+    _probe_frame(frame, p_right_on_c2=False)
+    code = lb_main([
+        "--ledger", str(ledger_path), "gate", "--frame", str(frame),
+        "--script", "K", "--kinds", "a=abs,p=abs", "--held-out", "p",
+    ])
+    assert code == 0
+    assert "GATE PASS" in capsys.readouterr().out
+
+
+def test_inconsistent_library_exit_code(tmp_path: Path, capsys) -> None:
+    ledger_path = tmp_path / "ledger.jsonl"
+    _seed_facts(ledger_path, [("e1", "a", 10.0), ("e2", "a", 100.0)])
+    frame = tmp_path / "frame.csv"
+    _probe_frame(frame, p_right_on_c2=False)
+    code = lb_main([
+        "--ledger", str(ledger_path), "interval", "--frame", str(frame),
+        "--script", "K", "--kinds", "a=abs,p=abs", "--target", "p",
+    ])
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "LIBRARY INCONSISTENT" in err
+    assert "Traceback" not in err
+
+
+def test_interval_success_reports_verdict(tmp_path: Path, capsys) -> None:
+    ledger_path = tmp_path / "ledger.jsonl"
+    _seed_facts(ledger_path, [("e1", "a", 266.0)])
+    frame = tmp_path / "frame.csv"
+    _probe_frame(frame, p_right_on_c2=False)
+    code = lb_main([
+        "--ledger", str(ledger_path), "interval", "--frame", str(frame),
+        "--script", "K", "--kinds", "a=abs,p=abs", "--target", "p",
+    ])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "target=p" in out
+    assert "verdict=" in out
+    assert "unknown_cells=0" in out
+
+
+def test_design_lists_ranked_probes(tmp_path: Path, capsys) -> None:
+    ledger_path = tmp_path / "ledger.jsonl"
+    _seed_facts(ledger_path, [("e1", "a", 266.0)])
+    frame = tmp_path / "frame.csv"
+    _probe_frame(frame, p_right_on_c2=False)
+    code = lb_main([
+        "--ledger", str(ledger_path), "design", "--frame", str(frame),
+        "--script", "K", "--kinds", "a=abs,p=abs",
+        "--candidates", "a,p", "--targets", "p",
+    ])
+    assert code == 0
+    assert "expected_width=" in capsys.readouterr().out
+
+
+def test_verdict_subcommand(tmp_path: Path, capsys) -> None:
+    ledger_path = tmp_path / "ledger.jsonl"
+    code = lb_main(["--ledger", str(ledger_path), "verdict", "--net", "3", "--churn", "12"])
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "p_gain=" in out
+    assert "verdict=inconclusive" in out
+
+
+def test_invalid_kinds_rejected_without_traceback(tmp_path: Path, capsys) -> None:
+    ledger_path = tmp_path / "ledger.jsonl"
+    _seed_facts(ledger_path, [("e1", "a", 266.0)])
+    frame = tmp_path / "frame.csv"
+    _probe_frame(frame, p_right_on_c2=False)
+    code = lb_main([
+        "--ledger", str(ledger_path), "interval", "--frame", str(frame),
+        "--script", "K", "--kinds", "a=bogus", "--target", "p",
+    ])
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "error:" in err
+    assert "Traceback" not in err
+
+
+def test_empty_kinds_rejected_without_traceback(tmp_path: Path, capsys) -> None:
+    ledger_path = tmp_path / "ledger.jsonl"
+    _seed_facts(ledger_path, [("e1", "a", 266.0)])
+    frame = tmp_path / "frame.csv"
+    _probe_frame(frame, p_right_on_c2=False)
+    code = lb_main([
+        "--ledger", str(ledger_path), "interval", "--frame", str(frame),
+        "--script", "K", "--kinds", "", "--target", "p",
+    ])
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "error:" in err
+    assert "Traceback" not in err
