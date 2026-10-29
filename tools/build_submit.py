@@ -8,6 +8,7 @@ The archive has no top-level folder: ``script.py``, ``requirements.txt`` and
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import shutil
 import subprocess
@@ -163,7 +164,32 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--out", type=Path, default=REPO_ROOT / "artifacts" / "submit.zip")
     parser.add_argument("--smoke-data", type=Path, default=None, help="directory with test.csv and vessel_catalog.csv")
     parser.add_argument("--llm-dir", type=Path, default=DEFAULT_LLM_DIR, help="transliteration weights directory")
+    parser.add_argument("--ledger", type=Path, default=REPO_ROOT / "artifacts" / "eval" / "lb" / "ledger.jsonl")
+    parser.add_argument("--ledger-id", type=str, default=None)
+    parser.add_argument("--local-only", action="store_true")
     args = parser.parse_args(argv)
+
+    if args.ledger_id is None and not args.local_only:
+        print(
+            "refusing to package: register a ledger entry (tools/lb.py register) or pass --local-only",
+            file=sys.stderr,
+        )
+        return 2
+    if args.ledger_id is not None and args.local_only:
+        print("refusing to package: pass exactly one of --ledger-id or --local-only", file=sys.stderr)
+        return 2
+
+    ledger = None
+    if args.ledger_id is not None:
+        sys.path.insert(0, str(REPO_ROOT / "src"))
+        from port_entity_matching.evaluation.lb.ledger import Ledger  # noqa: PLC0415
+
+        ledger = Ledger.load(Path(args.ledger))
+        current = {entry.entry_id: entry for entry in ledger.entries()}
+        entry = current.get(args.ledger_id)
+        if entry is None or entry.status != "registered":
+            print(f"refusing to package: ledger entry '{args.ledger_id}' is not registered", file=sys.stderr)
+            return 2
 
     zip_path = build_submit(args.model_dir, args.out, llm_dir=args.llm_dir)
     with zipfile.ZipFile(zip_path) as archive:
@@ -173,6 +199,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.smoke_data is not None:
         smoke_test(zip_path, args.smoke_data)
         print("smoke_ok")
+
+    if ledger is not None and args.ledger_id is not None:
+        digest = hashlib.sha256()
+        with open(zip_path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        try:
+            ledger.attach_zip(args.ledger_id, digest.hexdigest())
+        except ValueError as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 2
+        print(f"ledger_id={args.ledger_id} sha256={digest.hexdigest()}")
+    elif args.local_only:
+        print("local_only=1")
     return 0
 
 

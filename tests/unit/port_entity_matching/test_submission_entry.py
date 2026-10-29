@@ -206,7 +206,7 @@ def test_zip_build_is_byte_identical_and_smoke_runs(tmp_path: Path, capsys: pyte
     second = build_submit(model_dir, tmp_path / "second.zip")
     assert before == second.read_bytes()
     assert main([
-        "--model-dir", str(model_dir), "--out", str(first), "--smoke-data", str(root / "data")
+        "--model-dir", str(model_dir), "--out", str(first), "--smoke-data", str(root / "data"), "--local-only"
     ]) == 0
     assert "smoke_ok" in capsys.readouterr().out
 
