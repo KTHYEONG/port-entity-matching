@@ -48,6 +48,10 @@ class CallSignMemory:
             return None
         return self._positions.get(call_sign.strip())
 
+    def known_positions(self) -> frozenset[int]:
+        """Catalog positions of every memorized vessel."""
+        return frozenset(self._positions.values())
+
     def __len__(self) -> int:
         """Number of memorized call signs."""
         return len(self._positions)

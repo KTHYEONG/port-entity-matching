@@ -7,7 +7,7 @@ lives here so that downstream modules never embed magic numbers.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from typing import Any, cast
 
 
@@ -72,6 +72,18 @@ class MatchConfig:
     augment_hangul_noise_rate: float = 0.0
     synthetic_latin_rows: int = 0
     synthetic_seed: int = 0
+    # Inference-only knobs for Latin records (0 = off / use the shared value); fitting never reads them.
+    latin_wide_name_top_k: int = 0
+    latin_wide_prefilter_k: int = 0
+    latin_wide_token_top_k: int = 0
+    latin_wratio_top_k: int = 0
+    latin_wratio_tonnage_k: int = 0
+    latin_wratio_pool: int = 200
+    latin_wratio_tonnage_window: float = 0.1
+    # Test vessels are disjoint from train (LB-confirmed), so a ranked train vessel without a call-sign hit is
+    # re-picked as the best non-train candidate within the top `exclude_train_top_k`.
+    exclude_train_vessels: bool = False
+    exclude_train_top_k: int = 50
 
 
 # Named training recipes: overrides applied on top of MatchConfig defaults. "rev2syn" is the LB-best recipe
@@ -85,8 +97,31 @@ RECIPES: dict[str, dict[str, object]] = {
         "augment_hangul_noise_rate": 0.6,
         "synthetic_latin_rows": 15000,
         "synthetic_seed": 0,
+        "latin_wide_name_top_k": 100,
+        "latin_wide_prefilter_k": 1000,
+        "latin_wide_token_top_k": 60,
+        "latin_wratio_top_k": 10,
+        "latin_wratio_tonnage_k": 5,
     },
 }
+
+
+def latin_inference_config(config: MatchConfig) -> MatchConfig | None:
+    """Config for ranking Latin records at inference, or None when no Latin-only knob is set."""
+    if not (
+        config.latin_wide_name_top_k
+        or config.latin_wide_prefilter_k
+        or config.latin_wide_token_top_k
+        or config.latin_wratio_top_k
+        or config.latin_wratio_tonnage_k
+    ):
+        return None
+    return replace(
+        config,
+        name_top_k=config.latin_wide_name_top_k or config.name_top_k,
+        latin_prefilter_k=config.latin_wide_prefilter_k or config.latin_prefilter_k,
+        token_top_k=config.latin_wide_token_top_k or config.token_top_k,
+    )
 
 
 def recipe_config(name: str) -> MatchConfig:

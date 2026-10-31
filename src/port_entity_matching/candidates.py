@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import dataclasses
+import math
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from numpy.typing import NDArray
-from rapidfuzz import process
+from rapidfuzz import fuzz, process
 from rapidfuzz.distance import OSA, DamerauLevenshtein, Levenshtein
 
 from port_entity_matching.catalog import CatalogIndex
@@ -40,7 +42,9 @@ __all__ = [
     "SRC_TONNAGE",
     "CandidateSet",
     "_top_k_desc",
+    "extend_latin_wratio",
     "generate_candidates",
+    "wratio_key",
 ]
 
 Positions = NDArray[np.int64]
@@ -54,6 +58,9 @@ SRC_FALLBACK: int = 16
 SRC_SORTED: int = 32
 SRC_TOKEN_INDEX: int = 64
 SRC_LLM: int = 128
+
+_WRATIO_TOKEN_RE = re.compile(r"[A-Z0-9]+")
+_WRATIO_QUERY_CHUNK = 128
 
 
 @dataclass(frozen=True, eq=False)
@@ -106,6 +113,73 @@ def generate_candidates(
     if reverse is not None:
         results = reverse.extend(records, results, config)
     return results
+
+
+def wratio_key(name: str) -> str:
+    """Space-joined [A-Z0-9] runs of the uppercased raw name: the WRatio retrieval key."""
+    return " ".join(_WRATIO_TOKEN_RE.findall(str(name).upper()))
+
+
+def extend_latin_wratio(
+    records: Sequence[QueryRecord],
+    candidate_sets: Sequence[CandidateSet],
+    index: CatalogIndex,
+    catalog_keys: Sequence[str],
+    config: MatchConfig,
+) -> list[CandidateSet]:
+    """Add each Latin record's WRatio top-n and first tonnage-window hits (SRC_NAME) to its set; Hangul sets pass.
+
+    WRatio tolerates token reordering and partial names that the edit-distance sources miss. The pool is the top
+    ``latin_wratio_pool`` catalog keys per record ordered by (-score, catalog position); tonnage hits are pool members
+    within ``latin_wratio_tonnage_window`` (log ratio) of the record's IGT (else GT).
+    """
+    if config.latin_wratio_top_k < 0 or config.latin_wratio_tonnage_k < 0 or config.latin_wratio_pool < 1:
+        raise ValueError("latin_wratio limits must be non-negative and the pool positive")
+    if len(catalog_keys) != len(index.vessel_ids):
+        raise ValueError("catalog_keys must align with the catalog index")
+    out = list(candidate_sets)
+    if config.latin_wratio_top_k == 0 and config.latin_wratio_tonnage_k == 0:
+        return out
+    queries = [
+        (slot, key)
+        for slot, record in enumerate(records)
+        if not is_hangul_name(record.vessel_name) and (key := wratio_key(record.vessel_name))
+    ]
+    keys = list(catalog_keys)
+    limit = min(config.latin_wratio_pool, len(keys))
+    for start in range(0, len(queries), _WRATIO_QUERY_CHUNK):
+        chunk = queries[start : start + _WRATIO_QUERY_CHUNK]
+        matrix = process.cdist(
+            [key for _, key in chunk], keys, scorer=fuzz.WRatio, dtype=np.float32, workers=config.num_threads
+        )
+        for (slot, _), row in zip(chunk, matrix, strict=True):
+            pool = np.argpartition(-row, limit)[:limit] if limit < len(keys) else np.arange(len(keys))
+            order = sorted((int(position) for position in pool), key=lambda position: (-row[position], position))
+            added = order[: config.latin_wratio_top_k] + _within_tonnage(order, records[slot], index, config)
+            out[slot] = _with_positions(out[slot], added, SRC_NAME)
+    return out
+
+
+def _within_tonnage(order: Sequence[int], record: QueryRecord, index: CatalogIndex, config: MatchConfig) -> list[int]:
+    tonnage = record.international_gross_tonnage or record.gross_tonnage
+    if not tonnage or config.latin_wratio_tonnage_k == 0:
+        return []
+    hits: list[int] = []
+    for position in order:
+        catalog_gt = float(index.gt[position])
+        if catalog_gt > 0 and abs(math.log(catalog_gt / tonnage)) <= config.latin_wratio_tonnage_window:
+            hits.append(position)
+            if len(hits) == config.latin_wratio_tonnage_k:
+                break
+    return hits
+
+
+def _with_positions(candidate_set: CandidateSet, positions: Sequence[int], bit: int) -> CandidateSet:
+    sources = dict(zip(candidate_set.positions.tolist(), candidate_set.sources.tolist(), strict=True))
+    for position in positions:
+        sources.setdefault(int(position), bit)
+    keys = sorted(sources)
+    return CandidateSet(np.asarray(keys, dtype=np.int64), np.asarray([sources[key] for key in keys], dtype=np.uint8))
 
 
 def _process_chunk(

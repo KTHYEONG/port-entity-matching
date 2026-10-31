@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from port_entity_matching.config import MatchConfig, config_from_dict, config_to_dict
+from port_entity_matching.config import (
+    MatchConfig,
+    config_from_dict,
+    config_to_dict,
+    latin_inference_config,
+    recipe_config,
+)
 
 
 def test_round_trip_preserves_values() -> None:
@@ -117,3 +123,28 @@ def test_old_manifest_without_notation_fields_uses_defaults() -> None:
     assert config.augment_latin_rate == 0.3
     assert config.augment_tonnage_low == 0.05
     assert config.augment_tonnage_high == 0.25
+
+
+def test_latin_inference_config_off_by_default() -> None:
+    assert latin_inference_config(MatchConfig()) is None
+
+
+def test_latin_inference_config_overrides_only_set_knobs() -> None:
+    config = MatchConfig(latin_wide_name_top_k=100, latin_wratio_top_k=10)
+    latin = latin_inference_config(config)
+    assert latin is not None
+    assert (latin.name_top_k, latin.latin_prefilter_k, latin.token_top_k) == (100, 200, 30)
+
+
+def test_rev2syn_recipe_carries_combo_inference_knobs() -> None:
+    latin = latin_inference_config(recipe_config("rev2syn"))
+    assert latin is not None
+    assert (latin.name_top_k, latin.latin_prefilter_k, latin.token_top_k) == (100, 1000, 60)
+    assert (latin.latin_wratio_top_k, latin.latin_wratio_tonnage_k) == (10, 5)
+
+
+def test_train_vessel_exclusion_off_by_default_and_round_trips() -> None:
+    assert MatchConfig().exclude_train_vessels is False
+    config = config_from_dict({"exclude_train_vessels": True, "exclude_train_top_k": 7})
+    assert config_from_dict(config_to_dict(config)) == config
+    assert config_from_dict({}).exclude_train_top_k == 50

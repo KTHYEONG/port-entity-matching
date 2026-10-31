@@ -474,3 +474,80 @@ def test_memory_override_wins_over_rerank(matcher: Matcher) -> None:
     assert matcher.predict(without_memory) == [ranked_second]
     assert matcher.predict(records) == ["V00"]
     assert matcher.predict_topk(records, k=2)[0].vessel_ids[0] == "V00"
+
+
+def _latin_knob_matcher(model_dir: Path) -> Matcher:
+    base = Matcher.from_dir(model_dir, _catalog_frame())
+    config = replace(base.bundle.config, latin_wide_name_top_k=5, latin_wratio_top_k=3, latin_wratio_tonnage_k=2)
+    return Matcher(base.index, replace(base.bundle, config=config), base.transliterator)
+
+
+def test_latin_inference_knobs_leave_hangul_predictions_unchanged(matcher: Matcher, model_dir: Path) -> None:
+    rows = [
+        _record("R0", "글로비스 스피릿", None, 5000),
+        _record("R1", "CALIDA", None, 61332),
+        _record("R2", "카시마 마루", None, 8000),
+        _record("R3", "ROAD SHINING", None, 2000),
+        _record("R4", "흥아", None, 5000),
+    ]
+    widened = _latin_knob_matcher(model_dir).predict_topk(_records(rows), k=3)
+    base = matcher.predict_topk(_records(rows), k=3)
+    for slot in (0, 2, 4):
+        assert widened[slot] == base[slot]
+
+
+def test_latin_inference_knobs_keep_row_independence(model_dir: Path) -> None:
+    widened = _latin_knob_matcher(model_dir)
+    rows = [
+        _record("R0", "ROAD SHINING", None, 2000),
+        _record("R1", "글로비스 스피릿", None, 5000),
+        _record("R2", "GRAND ACE 12", None, 1000),
+        _record("R3", "DILAN", None, 168208),
+    ]
+    batch = widened.predict(_records(rows))
+    alone = [widened.predict(_records([row]))[0] for row in rows]
+    shuffled = widened.predict(_records(rows[::-1]))
+    assert batch == alone
+    assert batch == shuffled[::-1]
+
+
+def _excluding_matcher(model_dir: Path, known: tuple[str, ...], top_k: int = 50) -> Matcher:
+    from port_entity_matching.memory import CallSignMemory
+
+    base = Matcher.from_dir(model_dir, _catalog_frame())
+    train = _train_frame()
+    memory = CallSignMemory.fit(train[train["target_vessel_id"].isin(known)], base.index)
+    config = replace(base.bundle.config, exclude_train_vessels=True, exclude_train_top_k=top_k)
+    return Matcher(base.index, replace(base.bundle, config=config, memory=memory), base.transliterator)
+
+
+def test_train_vessel_is_skipped_without_memory_hit(matcher: Matcher, model_dir: Path) -> None:
+    records = _records([_record("R1", "CALIDA", None, 61332)])
+    ranked = matcher.predict_topk(records, k=3)[0].vessel_ids
+    excluding = _excluding_matcher(model_dir, ("V04",))
+    assert ranked[0] == "V04"
+    assert excluding.predict(records) == [ranked[1]]
+    assert excluding.predict_topk(records, k=3)[0].vessel_ids[0] == ranked[1]
+
+
+def test_memory_hit_keeps_its_train_vessel(model_dir: Path) -> None:
+    records = _records([_record("R1", "CALIDA", "CS_V04_5", 61332)])
+    assert _excluding_matcher(model_dir, ("V04",)).predict(records) == ["V04"]
+
+
+def test_exclusion_keeps_top_when_window_holds_only_train_vessels(model_dir: Path) -> None:
+    records = _records([_record("R1", "CALIDA", None, 61332)])
+    assert _excluding_matcher(model_dir, ("V04",), top_k=1).predict(records) == ["V04"]
+
+
+def test_exclusion_keeps_row_independence(model_dir: Path) -> None:
+    excluding = _excluding_matcher(model_dir, ("V04", "V00"))
+    rows = [
+        _record("R0", "글로비스 스피릿", None, 5000),
+        _record("R1", "CALIDA", None, 61332),
+        _record("R2", "흥아", None, 5000),
+    ]
+    together = excluding.predict(_records(rows))
+    alone = [excluding.predict(_records([row]))[0] for row in rows]
+    shuffled = excluding.predict(_records(rows[::-1]))[::-1]
+    assert together == alone == shuffled

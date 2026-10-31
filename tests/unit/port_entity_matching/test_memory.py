@@ -136,3 +136,11 @@ def test_literal_nan_call_sign_and_raw_vessel_id_round_trip(tmp_path) -> None:
     path = tmp_path / "memory.json"
     memory.to_json(path)
     assert CallSignMemory.from_json(path, index).lookup("nan") == 0
+
+
+def test_known_positions_cover_memorized_vessels() -> None:
+    index = _index()
+    memory = CallSignMemory.fit(
+        _train([{"call_sign": "A", "target_vessel_id": "V0"}, {"call_sign": "B", "target_vessel_id": "V2"}]), index
+    )
+    assert memory.known_positions() == frozenset({index.id_to_pos["V0"], index.id_to_pos["V2"]})

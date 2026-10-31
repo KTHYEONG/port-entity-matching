@@ -17,8 +17,9 @@ from pathlib import Path
 import pandas as pd
 
 from port_entity_matching.artifacts import ArtifactBundle
-from port_entity_matching.candidates import generate_candidates
+from port_entity_matching.candidates import extend_latin_wratio, generate_candidates, wratio_key
 from port_entity_matching.catalog import CatalogIndex
+from port_entity_matching.config import MatchConfig, latin_inference_config
 from port_entity_matching.features import build_features
 from port_entity_matching.normalize import is_hangul_name
 from port_entity_matching.ranker import score_ensemble, select_top1
@@ -78,6 +79,8 @@ class Matcher:
         self.llm_load_seconds = 0.0
         self.llm_seconds = 0.0
         self.rerank_seconds = 0.0
+        self._wratio_keys: list[str] | None = None
+        self._known: frozenset[int] | None = None
 
     @classmethod
     def from_dir(cls, model_dir: str | Path, catalog: pd.DataFrame) -> Matcher:
@@ -111,11 +114,7 @@ class Matcher:
             len(records),
         )
         self._log_summary(records, ranked)
-        predictions: list[str] = []
-        for item in ranked:
-            position = item.memory_position if item.memory_position is not None else item.positions[0]
-            predictions.append(self.index.vessel_ids[position])
-        return predictions
+        return [self.index.vessel_ids[self._head(item)] for item in ranked]
 
     def predict_topk(self, records: Sequence[QueryRecord], k: int = 3) -> list[Prediction]:
         """Ranked top-k ids and scores per record for error analysis."""
@@ -134,8 +133,8 @@ class Matcher:
         for record, item in zip(records, ranked, strict=True):
             positions = item.positions
             scores = item.scores
-            if item.memory_position is not None:
-                head = item.memory_position
+            head = self._head(item)
+            if head != positions[0]:
                 head_score = scores[positions.index(head)]
                 rest = tuple(
                     (position, score) for position, score in zip(positions, scores, strict=True) if position != head
@@ -153,6 +152,23 @@ class Matcher:
                 )
             )
         return predictions
+
+    def _head(self, item: _Ranked) -> int:
+        """Selected position: the call-sign memory hit, else the top candidate, skipping train vessels when enabled."""
+        if item.memory_position is not None:
+            return item.memory_position
+        config = self.bundle.config
+        if config.exclude_train_vessels and item.positions:
+            known = self._known_positions()
+            for position in item.positions[: config.exclude_train_top_k]:
+                if position not in known:
+                    return position
+        return item.positions[0]
+
+    def _known_positions(self) -> frozenset[int]:
+        if self._known is None:
+            self._known = self.bundle.memory.known_positions()
+        return self._known
 
     def _apply_llm(self, records: Sequence[QueryRecord]) -> list[QueryRecord]:
         """Attach transliterated alt names for Hangul records lacking them."""
@@ -181,19 +197,36 @@ class Matcher:
         return attached
 
     def _rank(self, records: Sequence[QueryRecord]) -> list[_Ranked]:
-        """Rank candidates for every record, processing fixed-size chunks."""
+        """Rank candidates for every record in fixed-size chunks; Latin records use the Latin inference config if set."""
         config = self.bundle.config
+        latin_config = latin_inference_config(config)
+        if latin_config is None:
+            return self._rank_group(records, config, wratio=False)
+        latin_slots = [slot for slot, record in enumerate(records) if not is_hangul_name(record.vessel_name)]
+        latin_set = set(latin_slots)
+        hangul_slots = [slot for slot in range(len(records)) if slot not in latin_set]
+        ranked: list[_Ranked | None] = [None] * len(records)
+        for slots, group_config, wratio in ((hangul_slots, config, False), (latin_slots, latin_config, True)):
+            group = self._rank_group([records[slot] for slot in slots], group_config, wratio)
+            for slot, item in zip(slots, group, strict=True):
+                ranked[slot] = item
+        return [item for item in ranked if item is not None]
+
+    def _rank_group(self, records: Sequence[QueryRecord], config: MatchConfig, wratio: bool) -> list[_Ranked]:
         step = config.batch_size
         ranked: list[_Ranked] = []
         for start in range(0, len(records), step):
-            ranked.extend(self._rank_chunk(records[start : start + step]))
+            ranked.extend(self._rank_chunk(records[start : start + step], config, wratio))
         return ranked
 
-    def _rank_chunk(self, records: Sequence[QueryRecord]) -> list[_Ranked]:
+    def _rank_chunk(self, records: Sequence[QueryRecord], config: MatchConfig, wratio: bool) -> list[_Ranked]:
         """Retrieve, featurize and score one chunk of records."""
-        config = self.bundle.config
         reverse = self.bundle.reverse
         candidate_sets = generate_candidates(records, self.index, self.bundle.memory, config, reverse)
+        if wratio:
+            if self._wratio_keys is None:
+                self._wratio_keys = [wratio_key(name) for name in self.index.names]
+            candidate_sets = extend_latin_wratio(records, candidate_sets, self.index, self._wratio_keys, config)
         features = build_features(records, candidate_sets, self.index, self.bundle.maps, config, reverse)
         scores = score_ensemble(self.bundle.ranker, features, config)
         if self.transliterator is not None:

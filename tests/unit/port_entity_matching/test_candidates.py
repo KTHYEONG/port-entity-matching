@@ -15,7 +15,10 @@ from port_entity_matching.candidates import (
     SRC_TOKEN,
     SRC_TOKEN_INDEX,
     SRC_TONNAGE,
+    CandidateSet,
+    extend_latin_wratio,
     generate_candidates,
+    wratio_key,
 )
 from port_entity_matching.catalog import CatalogIndex
 from port_entity_matching.config import MatchConfig
@@ -1071,3 +1074,82 @@ def test_llm_over_cap_rescores_other_channels_for_retrieved_positions() -> None:
     result = generate_candidates([record], index, None, config)[0]
     assert result.positions.tolist() == [0]
     assert _sources_of(result, 0) & SRC_LLM
+
+def _wratio_setup() -> tuple[CatalogIndex, list[str]]:
+    index = CatalogIndex.build(
+        _catalog_frame(
+            [
+                ("V0", "Ocean Star", 5000.0),
+                ("V1", "Star Ocean Pioneer", 12000.0),
+                ("V2", "Pioneer Star", 5100.0),
+                ("V3", "Golden Bridge", 30000.0),
+            ]
+        )
+    )
+    return index, [wratio_key(name) for name in index.names]
+
+
+def test_wratio_key_keeps_alnum_runs_only() -> None:
+    assert wratio_key("m/v Ocean-Star No.7 Ⅱ") == "M V OCEAN STAR NO 7"
+
+
+def test_wratio_extension_adds_latin_hits_with_name_bit() -> None:
+    index, keys = _wratio_setup()
+    config = MatchConfig(latin_wratio_top_k=2, latin_wratio_tonnage_k=0)
+    record = _record("Q0", "PIONEER STAR OCEAN")
+    empty = generate_candidates([record], index, None, MatchConfig(name_top_k=0, token_top_k=0))
+    extended = extend_latin_wratio([record], empty, index, keys, config)[0]
+    added = set(extended.positions.tolist()) - set(empty[0].positions.tolist())
+    assert added
+    assert all(_sources_of(extended, position) == SRC_NAME for position in added)
+
+
+def test_wratio_extension_tonnage_hits_respect_window() -> None:
+    index, keys = _wratio_setup()
+    config = MatchConfig(latin_wratio_top_k=0, latin_wratio_tonnage_k=5, latin_wratio_tonnage_window=0.1)
+    record = _record("Q0", "STAR", gross_tonnage=5000.0)
+    base = [CandidateSet(np.asarray([3], dtype=np.int64), np.asarray([SRC_NAME], dtype=np.uint8))]
+    extended = extend_latin_wratio([record], base, index, keys, config)[0]
+    assert set(extended.positions.tolist()) == {0, 2, 3}
+
+
+def test_wratio_extension_leaves_hangul_and_disabled_sets_unchanged() -> None:
+    index, keys = _wratio_setup()
+    records = [_record("Q0", "오션 스타", gross_tonnage=5000.0), _record("Q1", "OCEAN STAR")]
+    base = generate_candidates(records, index, None, MatchConfig())
+    on = extend_latin_wratio(records, base, index, keys, MatchConfig(latin_wratio_top_k=4))
+    off = extend_latin_wratio(records, base, index, keys, MatchConfig())
+    assert on[0].positions.tolist() == base[0].positions.tolist()
+    assert [s.positions.tolist() for s in off] == [s.positions.tolist() for s in base]
+
+
+def test_wratio_extension_is_row_independent() -> None:
+    index, keys = _wratio_setup()
+    config = MatchConfig(latin_wratio_top_k=2, latin_wratio_tonnage_k=2, latin_wratio_pool=3)
+    records = [_record("Q0", "STAR PIONEER", gross_tonnage=5000.0), _record("Q1", "GOLDN BRIDGE"), _record("Q2", "")]
+    base = generate_candidates(records, index, None, MatchConfig())
+    batch = extend_latin_wratio(records, base, index, keys, config)
+    for slot, record in enumerate(records):
+        alone = extend_latin_wratio([record], [base[slot]], index, keys, config)[0]
+        assert alone.positions.tolist() == batch[slot].positions.tolist()
+        assert alone.sources.tolist() == batch[slot].sources.tolist()
+
+
+def test_wratio_extension_rejects_misaligned_keys() -> None:
+    index, keys = _wratio_setup()
+    record = _record("Q0", "OCEAN STAR")
+    base = generate_candidates([record], index, None, MatchConfig())
+    with pytest.raises(ValueError, match="align"):
+        extend_latin_wratio([record], base, index, keys[:-1], MatchConfig(latin_wratio_top_k=1))
+
+
+@pytest.mark.parametrize(
+    "config",
+    [MatchConfig(latin_wratio_top_k=-1), MatchConfig(latin_wratio_tonnage_k=-1), MatchConfig(latin_wratio_pool=0)],
+)
+def test_wratio_extension_rejects_invalid_limits(config: MatchConfig) -> None:
+    index, keys = _wratio_setup()
+    record = _record("Q0", "OCEAN STAR")
+    base = generate_candidates([record], index, None, MatchConfig())
+    with pytest.raises(ValueError, match="latin_wratio"):
+        extend_latin_wratio([record], base, index, keys, config)
