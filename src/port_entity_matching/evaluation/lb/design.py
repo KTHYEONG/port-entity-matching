@@ -5,7 +5,7 @@ Development-only; never imported by ``submission/`` or ``pipeline.py``.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, replace
 
 import numpy as np
@@ -31,7 +31,7 @@ class ProbeScore:
 
 def rank_probes(
     matrix: ResponseMatrix, facts: Sequence[Fact], candidates: Sequence[str], targets: Sequence[str],
-    grid: int = 5, z: float = 2.0,
+    grid: int = 5, z: float = 2.0, ignore: Collection[str] = (),
 ) -> list[ProbeScore]:
     """Rank candidates by mean target-interval width after observing them."""
     if grid < 2:
@@ -45,7 +45,7 @@ def rank_probes(
     scored: list[ProbeScore] = []
     for candidate in candidates:
         kind = matrix.kinds[candidate]
-        current = feasible_interval(matrix, script_facts, candidate, z=z)
+        current = feasible_interval(matrix, script_facts, candidate, z=z, ignore=ignore)
         step = (current.hi - current.lo) / (grid - 1)
         widths: list[float] = []
         for i in range(grid):
@@ -56,7 +56,7 @@ def rank_probes(
             )
             augmented = [*script_facts, hype]
             try:
-                point_widths = [_target_width(matrix, augmented, target, z) for target in targets]
+                point_widths = [_target_width(matrix, augmented, target, z, ignore) for target in targets]
             except FeasibilityError:
                 continue
             widths.append(sum(point_widths) / len(point_widths))
@@ -73,7 +73,7 @@ def rank_probes(
 
 
 def _target_width(
-    matrix: ResponseMatrix, augmented: list[Fact], target: str, z: float,
+    matrix: ResponseMatrix, augmented: list[Fact], target: str, z: float, ignore: Collection[str] = (),
 ) -> float:
     """Target interval width given a hypothetical observation, exact for self-targets."""
     if target == augmented[-1].policy_key:
@@ -87,7 +87,7 @@ def _target_width(
             kinds={**matrix.kinds, alias: matrix.kinds[target]},
             values=np.vstack([matrix.values, matrix.values[index]]),
         )
-        interval: Interval = feasible_interval(extended, augmented, alias, z=z)
+        interval: Interval = feasible_interval(extended, augmented, alias, z=z, ignore=ignore)
         return float(interval.hi - interval.lo)
-    other: Interval = feasible_interval(matrix, augmented, target, z=z)
+    other: Interval = feasible_interval(matrix, augmented, target, z=z, ignore=ignore)
     return float(other.hi - other.lo)

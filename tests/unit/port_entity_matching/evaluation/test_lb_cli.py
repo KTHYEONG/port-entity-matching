@@ -339,3 +339,133 @@ def test_empty_kinds_rejected_without_traceback(tmp_path: Path, capsys) -> None:
     err = capsys.readouterr().err
     assert "error:" in err
     assert "Traceback" not in err
+
+
+def test_gate_ignores_fact_keys_without_frame_column(tmp_path: Path, capsys) -> None:
+    ledger_path = tmp_path / "ledger.jsonl"
+    _seed_facts(ledger_path, [("e1", "a", 266.0), ("e2", "p", 266.0), ("e3", "nocol", 5.0)])
+    frame = tmp_path / "frame.csv"
+    _probe_frame(frame, p_right_on_c2=False)
+    args = [
+        "--ledger",
+        str(ledger_path),
+        "gate",
+        "--frame",
+        str(frame),
+        "--script",
+        "K",
+        "--kinds",
+        "a=abs,p=abs",
+        "--held-out",
+        "p",
+    ]
+    assert lb_main(args) == 2
+    assert lb_main([*args, "--ignore", "nocol"]) == 0
+    assert "GATE PASS" in capsys.readouterr().out
+
+
+def test_design_accepts_ignore(tmp_path: Path, capsys) -> None:
+    ledger_path = tmp_path / "ledger.jsonl"
+    _seed_facts(ledger_path, [("e1", "a", 266.0), ("e3", "nocol", 5.0)])
+    frame = tmp_path / "frame.csv"
+    _probe_frame(frame, p_right_on_c2=False)
+    code = lb_main(
+        [
+            "--ledger",
+            str(ledger_path),
+            "design",
+            "--frame",
+            str(frame),
+            "--script",
+            "K",
+            "--kinds",
+            "a=abs,p=abs",
+            "--candidates",
+            "p",
+            "--targets",
+            "p",
+            "--ignore",
+            "nocol",
+        ]
+    )
+    assert code == 0
+    assert "\np expected_width=" in capsys.readouterr().out
+
+
+def test_show_marks_legacy_entries(tmp_path: Path, capsys) -> None:
+    ledger_path = tmp_path / "ledger.jsonl"
+    _seed_facts(ledger_path, [("e1", "a", 266.0)])
+    assert lb_main(["--ledger", str(ledger_path), "show"]) == 0
+    line = capsys.readouterr().out.strip()
+    assert "K_action=LEGACY" in line and "UNPLANNED" not in line
+
+
+def _base_zip(path: Path) -> Path:
+    import zipfile
+
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("script.py", "print('base')\n")
+        archive.writestr("requirements.txt", "# none\n")
+        archive.writestr("model/artifacts/manifest.json", "{}")
+    return path
+
+
+def _probe_args(tmp_path: Path, plan: dict) -> list[str]:
+    script = tmp_path / "probe_script.py"
+    script.write_text("print('probe')\n", encoding="utf-8")
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    return [
+        "--base-zip",
+        str(_base_zip(tmp_path / "base.zip")),
+        "--script",
+        str(script),
+        "--plan",
+        str(plan_path),
+        "--out",
+        str(tmp_path / "probe.zip"),
+    ]
+
+
+def test_probe_packaging_refuses_without_registration(tmp_path: Path) -> None:
+    from tools.build_probe import main
+
+    assert main(_probe_args(tmp_path, {"K": {}, "L": {}})) == 2
+    assert not (tmp_path / "probe.zip").exists()
+
+
+def test_probe_packaging_refuses_policy_mismatch(tmp_path: Path, capsys) -> None:
+    from tools.build_probe import main
+
+    ledger_path = tmp_path / "ledger.jsonl"
+    _registered(Ledger.load(ledger_path))
+    args = _probe_args(tmp_path, {"K": {"kind": "base"}, "L": {}})
+    assert main([*args, "--ledger", str(ledger_path), "--ledger-id", "e1"]) == 2
+    assert "differs from ledger entry" in capsys.readouterr().err
+    assert not (tmp_path / "probe.zip").exists()
+
+
+def test_probe_packaging_attaches_digest_and_swaps_script(tmp_path: Path) -> None:
+    import zipfile
+
+    from tools.build_probe import main
+
+    ledger_path = tmp_path / "ledger.jsonl"
+    _registered(Ledger.load(ledger_path))
+    args = _probe_args(tmp_path, {"K": {}, "L": {}})
+    assert main([*args, "--ledger", str(ledger_path), "--ledger-id", "e1"]) == 0
+    out = tmp_path / "probe.zip"
+    entry = Ledger.load(ledger_path).entries()[0]
+    assert entry.status == "packaged"
+    assert entry.zip_sha256 == hashlib.sha256(out.read_bytes()).hexdigest()
+    with zipfile.ZipFile(out) as archive:
+        assert archive.read("script.py").decode() == "print('probe')\n"
+        assert json.loads(archive.read("probe.json")) == {"K": {}, "L": {}}
+        assert "model/artifacts/manifest.json" in archive.namelist()
+
+
+def test_probe_packaging_local_only(tmp_path: Path, capsys) -> None:
+    from tools.build_probe import main
+
+    assert main([*_probe_args(tmp_path, {"K": {}, "L": {}}), "--local-only"]) == 0
+    assert "local_only=1" in capsys.readouterr().out

@@ -81,6 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
     gate.add_argument("--script", choices=("K", "L"), required=True)
     gate.add_argument("--kinds", required=True, help="KEY=KIND,... with KIND in abs|comp|net")
     gate.add_argument("--held-out", required=True, help="KEY,... held-out keys")
+    gate.add_argument("--ignore", action="append", default=[], help="Fact keys to skip")
 
     design = sub.add_parser("design", help="Rank candidate measurement policies.")
     design.add_argument("--frame", type=Path, required=True)
@@ -88,6 +89,7 @@ def build_parser() -> argparse.ArgumentParser:
     design.add_argument("--kinds", required=True, help="KEY=KIND,... with KIND in abs|comp|net")
     design.add_argument("--candidates", required=True, help="KEY,... candidate keys")
     design.add_argument("--targets", required=True, help="KEY,... target keys")
+    design.add_argument("--ignore", action="append", default=[], help="Fact keys to skip")
 
     verdict = sub.add_parser("verdict", help="LB verdict from public net and churn.")
     verdict.add_argument("--net", type=float, required=True)
@@ -185,7 +187,7 @@ def _run_gate(args: argparse.Namespace) -> int:
 
     matrix, facts = _load_frame_and_facts(args)
     held_out = _split_keys(str(args.held_out))
-    report = loo_gate(matrix, facts, held_out)
+    report = loo_gate(matrix, facts, held_out, ignore=_split_keys(list(args.ignore)))
     for key in held_out:
         interval = report.intervals[key]
         hit = interval.lo <= report.truth[key] <= interval.hi
@@ -199,7 +201,13 @@ def _run_design(args: argparse.Namespace) -> int:
     from port_entity_matching.evaluation.lb.design import rank_probes
 
     matrix, facts = _load_frame_and_facts(args)
-    scores = rank_probes(matrix, facts, _split_keys(str(args.candidates)), _split_keys(str(args.targets)))
+    scores = rank_probes(
+        matrix,
+        facts,
+        _split_keys(str(args.candidates)),
+        _split_keys(str(args.targets)),
+        ignore=_split_keys(list(args.ignore)),
+    )
     for score in scores:
         sys.stdout.write(
             f"{score.candidate} expected_width={score.expected_width:.4f} "
@@ -298,7 +306,9 @@ def _run_show(args: argparse.Namespace) -> int:
             l_count: Any = entry.decoded.l
         else:
             k_count, l_count = "-", "-"
-        if entry.status == "scored":
+        if entry.legacy:
+            k_action, l_action = "LEGACY", "LEGACY"
+        elif entry.status == "scored":
             k_action, l_action = _scored_actions(ledger, entry)
         else:
             k_action, l_action = "-", "-"

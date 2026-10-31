@@ -243,3 +243,6 @@ tmp/
 
 # Presentation notes and preserved experiment evidence (local only)
 docs/presentation/
+
+# CatBoost training logs
+catboost_info/

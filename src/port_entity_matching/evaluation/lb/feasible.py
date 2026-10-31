@@ -178,7 +178,13 @@ def classify(interval: Interval, threshold: float = 0.0) -> Verdict:
     return "lb_required"
 
 
-def loo_gate(matrix: ResponseMatrix, facts: Sequence[Fact], held_out: Sequence[str], z: float = 2.0) -> GateReport:
+def loo_gate(
+    matrix: ResponseMatrix,
+    facts: Sequence[Fact],
+    held_out: Sequence[str],
+    z: float = 2.0,
+    ignore: Collection[str] = (),
+) -> GateReport:
     """Leave-one-key-out intervals for each held-out fact key against its LB value."""
     if len(held_out) == 0:
         raise ValueError("held_out must not be empty")
@@ -194,7 +200,7 @@ def loo_gate(matrix: ResponseMatrix, facts: Sequence[Fact], held_out: Sequence[s
         if key not in by_key:
             raise ValueError(f"No LB fact for held-out key {key!r}")
         rest = [fact for fact in facts if not (fact.channel == matrix.script and fact.policy_key == key)]
-        intervals[key] = feasible_interval(matrix, rest, key, z=z)
+        intervals[key] = feasible_interval(matrix, rest, key, z=z, ignore=ignore)
         values = by_key[key]
         if any(value != values[0] for value in values[1:]):
             raise ValueError(f"Conflicting LB facts for held-out key {key!r}")
