@@ -542,6 +542,57 @@ uv run python tools/build_submit.py --model-dir artifacts/model_rev2syn \
   --out artifacts/submit_rev2syn.zip --llm-dir artifacts/hf/kanana_bt_noise
 ```
 
+### 2.10 Latin Inference Widening (`combo`, LB 0.9563, 2026-10-30)
+LB 0.9563 (K 505, L 1735.5): rev2syn for Hangul rows; for Latin rows the same ranker sees a wider candidate set.
+LB probes on the fixed rev2syn model showed that most Latin errors were retrieval misses. A WRatio + tonnage-gated
+name policy rescued 28.5 of 71 Latin errors, and 16.5 of those were outside the base candidate set.
+- **Inference-only knobs** (`MatchConfig.latin_*`, applied by `Matcher` to Latin rows only; fitting never reads them):
+  `name_top_k` 30→100, `latin_prefilter_k` 200→1000, `token_top_k` 30→60, plus `extend_latin_wratio`. That step adds
+  the WRatio top-10 and the first 5 hits within ±10% tonnage among the WRatio top-200 as `SRC_NAME` candidates.
+  Hangul rows keep the fitted config, so K predictions are unchanged.
+- **LB steps (L):** rev2syn 1713 → WRatio 10/5 1732.5 → + wide knobs 1735.5. Rejected: WRatio 30/10 (1732),
+  extra partial-ratio candidates (1735.5, no gain), tonnage window 0.15 + exact-GT cap 200 (no gain).
+- The knobs live in recipe `rev2syn`, so a refit writes them into the manifest while the fitted files stay
+  byte-identical. `artifacts/model_rev2syn_combo` is `model_rev2syn` with only the manifest changed.
+- **Public size:** L counts decode in half-row steps while K counts are always integers. So the public set is most
+  likely 532 Hangul + 3,568 Latin rows (full test ≈ 8,200 rows). Timing rehearsals use an 8,200-row frame.
+
+### 2.11 Final Model and Catalog-Renderer Survey (LB 0.9595, 2026-10-31)
+**Final model (`artifacts/model_final`, `submit_final.zip`).** `rev2syn_combo` plus the token-dictionary rendering file
+(`rev_dict_catalog.jsonl`, built by `token_renderings.py`) plus `exclude_train_vessels` (top 50). The output on the
+8,200-row timing frame is byte-identical to the LB probe that scored 0.95945 (K 507/532, L 1738.5/1784 units). It runs in
+about 470 s locally (about 16 min projected on the server) and is 4.18 GB. `tools/derive_model.py` derives such a model
+from a fitted one without refitting (extra rendering files, inference-only config), which keeps the fitted ensemble,
+maps and call-sign memory byte-identical across probes.
+
+**Renderer survey.** The reverse channel (§2.9) depends on how closely a catalog rendering matches the clerk spelling.
+Exact-match rate on 150 held-out train Hangul vessels, 12 train few-shot pairs, greedy decoding, 4-bit weights for the
+4–8B candidates on a 12 GB GPU (the shipped 2B models were measured earlier in bf16 on the same kind of sample). No public benchmark measures name transliteration, so candidates (permissive license, supported by
+transformers 4.57.6, fits 12 GB) were compared on this task directly.
+
+| Renderer | Exact | s/name |
+|---|---|---|
+| Midm-2.0-Mini 2.3B (shipped) / Kanana 1.5 2.1B (shipped) | 51% / 46% | |
+| Kanana 1.5 8B | 64% | 0.22 |
+| A.X-4.0-Light 7B | 57% | 0.11 |
+| Tri-7B | 56% | 0.91 |
+| Qwen3-4B | 34% | 0.44 |
+| Midm-2.0-Base 11.5B | not measurable (over 25 min on 12 GB) | |
+
+Union of renderings per name: shipped 62% → + Kanana-8B 72% → + A.X 77% → + Tri-7B 79% (Tri is too slow to render the catalog).
+
+**LB outcome: no effect.** Adding the Kanana-8B renderings gave K 507 (equal), adding A.X on top gave K 506 (−1), and a
+rendering by standard loanword orthography plus a Latin numeral fix plus a tolerant tonnage parser (probe53) and wider
+LLM retrieval and rerank (5 beams, top 20, probe54) both gave K 507 / L 1738.5. A 17-point gain in rendering accuracy
+does not move K, so the remaining K errors are not rendering or retrieval misses (compare rank-2 rescues in §3.2).
+None of these renderings is shipped.
+
+**Compliance of catalog pre-rendering.** The renderings use only catalog names as input and public pretrained weights,
+which the rules allow. The organizer answer on record covers train-based LLM augmentation ("allowed for methods using
+train data; generation data and the full generation, preprocessing and training code may be requested at code
+verification"). The direct question about pre-rendering catalog names (talkboard, 10-12) has no organizer answer, so the
+generation scripts, prompts and decoding settings are kept for the verification request.
+
 ### Decisions
 - **Pretrained models allowed (revised 2026-10-23).** The original self-imposed "no LLMs or large neural models" decision is withdrawn: the competition explicitly allows publicly available general pretrained weights, and the server ships torch, transformers and an L4 GPU. LB decoding showed that the rule-based Korean name channel does not generalize to test-style Hangul names (test Korean name-only 0.628 vs CV 0.874). Constraints that still hold: weights ship inside the ZIP (no runtime downloads), fine-tuning uses only `train.csv`/`vessel_catalog.csv`, inference stays deterministic and row-independent, and inference time and ZIP size remain tie-breakers.
 - **Call-sign memory: adopted as a deterministic override.** It is a lookup table fitted on `train.csv` (allowed training artifact, row-independent). The hash is a stable vessel identity: 1:1 in train and invariant to renames and script. It has no effect if test is vessel-disjoint and is exact otherwise. Vessel-disjoint CV cannot learn its weight, so it is applied as a rule after ranking rather than as a ranker feature. Its effect is measured by an on/off LB probe.
@@ -576,6 +627,82 @@ The out-of-fold run leaves 32 errors over 12,222 rows (24 Korean rows over 13 ve
 6. **Non-Korean name changes and look-alikes** (8 rows) — examples include `BOW SUCCESS` → Fairchem Success, `HAFNIA WREN` → BW Wren, `HAFNIA MERLIN` → BW Merlin, `NAVIG8 VICTORIA` → Hafnia Viridian, and the spelling confusion `DIIJLAH` → Dijilah vs Dijlah. All targets were retrieved; retrieval failure is not the cause of these ranking errors.
 
 Error margins are informative for the field workflow: 6 of the 24 Korean errors have a top-1/top-2 margin below 1.3, i.e. a low-margin review queue would catch roughly a quarter of them, while the remaining errors have a large margin and need better features rather than better ranking.
+
+### 3.2 Test residuals located by LB complement probes (2026-10-30)
+Base: K rev2syn 505/532 (27 errors), L combo 1735.5/1784 (97 of 3,568 rows). A complement probe emits a policy's
+pick only where it differs from the base, so its K count is the number of base errors that policy fixes.
+
+| Signal (K) | Rescued of 27 |
+|---|---|
+| Ranker rank 2 / rank 3 | 9 / 4 |
+| LLM forward readings, WRatio-nearest (`fwdfz`) / reverse-rendering likelihood (`rlinf`) | 3 / 3 |
+| Jamo-nearest name (`namek`) / exact-GT candidate (`tonex`) / blank type+flag | 2 / 2 / 2 |
+| Rule transliteration (`rule`) / DWT-or-size as GT | 1 / 1 |
+
+- **Attribute channels are exhausted.** Type, flag, tonnage and DWT/size each explain ≤2 K errors, and blanking
+  Latin tonnage rescues 12 Latin rows (6 LB units) while switching about a quarter of Latin rows.
+- **Near misses are not arbitrable.** On the K pool, non-rank signals overlap rank 2/3 for 195 of 259 rescues.
+  Consensus overrides (switch when 2–6 of up to 23 alternative arbiters agree on one non-base candidate) were
+  projected to the test base rate (27 errors vs 505 correct rows). Every gate is ≤ +0.2 rows; looser gates
+  are strongly negative. This matches the LB: all 16 K net changes on rev2syn were ≤0.
+- **Implication.** About 13 errors are near misses that no available arbiter separates. About 11 are deep errors
+  that no known signal reaches. Further K gains need a new information source, not re-weighting of existing ones.
+- **New information sources tested after this (all K complement/net probes):** pinyin-to-hanja reading keys 0,
+  an 8B QLoRA reader in place of the 1-2B readers 0, same-name / digit-sister swap 2, CatBoost pairlogit ranker
+  net −3. Neither reader capacity nor ranker family limits K.
+- **Where the leaderboard gap likely comes from.** In train, 93% of Hangul rows share their call sign with another
+  Hangul row of the same vessel, and only 4 share it with a Latin row. Voting each prediction across its
+  call-sign group (margin-weighted) on out-of-fold predictions cuts Korean errors from 100 to 6 on the Hangul twin
+  frame and from 21 to 19 on clean train. Applied to test, such grouping would bring our 27 public K errors close to
+  the top-10 median of 7, matching the observation that the gap to the top is K-only. Grouping test rows is a
+  cross-row group vote, which the competition rules forbid (§2.5 row independence), so it is not used. This is a
+  hypothesis about the gap, not evidence about any other team: the public board shows #1 0.98938, #50 0.97216 and
+  #100 0.96026 on 11-01, so many teams are above us, and per-row methods we did not find may explain part of it.
+- **Human-error stress frame (2026-10-30).** One clerk-error operator per Hangul row (25 operators, 80 genuine
+  train renderings + 80 twin renderings each, call sign blank), scored with the production combo model:
+
+  | Operator family | Accuracy (twin / genuine) |
+  |---|---|
+  | Clean; mixed Latin token; spelled-out acronym; vowel, final-consonant, tense/aspirated, keyboard, epenthesis errors; spacing; 호; flag/type missing or wrong | 0.95–1.00 / 0.99–1.00 |
+  | Tonnage missing / ±5–15% / digit typo | 0.93–0.95 / 1.00 |
+  | Adjacent syllables swapped; tokens swapped | 0.89, 0.85 / 0.96, 0.93 |
+  | Number notation (bare or Sino-Korean prefix number) | 0.98 / 0.91 |
+  | Token dropped (abbreviation): last / first | 0.46 / 0.59 (twin), 0.63 / 0.78 (genuine) |
+  | Two name errors + tonnage noise or missing | 0.64 / 0.69 |
+
+  Phonological and orthographic errors are absorbed. Abbreviation by token drop is the dominant weakness, and it is
+  largely irreducible per row: a token-subset rule (record tokens covered by a catalog Hangul rendering, GT within
+  5%, closest GT) fixes 31 and breaks 44 stress rows, because the kept token is shared by sister vessels of similar
+  tonnage. The same ambiguity is what a cross-row call-sign vote would resolve.
+  On the LB, the token-subset complement (probe45) fixes 1 test K error. The rule fixes about 20% of stress
+  token-drop errors, so test abbreviation errors are either rare or unresolvable per row; either way the line is closed.
+- **Train-vessel exclusion (probe47).** Test vessels are disjoint from train (probe10), so a pick that is a train
+  vessel without a call-sign memory hit is certainly wrong on the public set. Re-picking the best non-train candidate
+  in the top 50 lifted the public score to 0.9581 (K +1, L +6 rows). The rule exploits the split design: in field
+  use, known vessels recur and the call-sign memory covers them.
+- **Train token dictionary and acronym spelling as an extra rendering (probe48).** 8,727 catalog names gain a rendering
+  built from train token pairs (Keoyoung→거영) and letter-by-letter acronyms (SITC→에스아이티씨): K +1 (no decisive effect).
+- **Record-vessel prior (probe50, rejected).** A catalog-only classifier (type, unit, flag, size, DWT, GT, name shape;
+  label = train target) separates train vessels from the rest of the catalog with AUC 0.92 (type alone 0.82). Re-ranking
+  the top two non-train candidates by score + 0.2·log prior fixed 20 and broke 5 group-hidden twin OOF errors, but on
+  the LB it cost 4 K and 13 L rows. Test golds are therefore not drawn like the train population, so popularity
+  priors fitted on train targets do not transfer.
+- **Final-day hypothesis checks (2026-10-31, simulation first, then LB).** The organizers added "diverse cases" to the
+  evaluation data on 10-14 (original 3,000 rows kept; train, catalog and metric unchanged), and the question of whether
+  the Hangul names are original clerk records or generated from catalog names has no answer on the board. Hypotheses that
+  the added rows carry unseen notation were tested on the production model without the LLM, with clean exact-name
+  records of vessels that are not train targets:
+
+  | Hypothesis | Simulation | LB |
+  |---|---|---|
+  | Same-name catalog vessels (623 rows, 311 names; train targets include none, vs 0.8% of the catalog) are mishandled | 99.8% with tonnage, 91% without | not needed |
+  | Catalog strata absent from train (digit names, passenger or landing-craft types, GT < 500) are mishandled | 100% each | not needed |
+  | Number notation variants (Sino-Korean 일·이, English-Hangul 원·투, Roman, number words) | K 0.83–0.86, L 0.88–0.89 (as if the number were dropped); train has none (314 digit vessels, 0 variants) | variant renderings (K) 507, equal |
+  | Latin abbreviation: initial of first or last token, token dropped, 12-character cut | 0.94–0.96; last token dropped 0.81 | not tested |
+  | Catalog renderings by standard orthography instead of clerk habit | 32% of renderings differ | 507, equal |
+
+  The notation weakness is real in simulation (fixes reach K 0.99, L 0.96–0.99), but the public rows contain no
+  such variants, so the line is closed. Every per-row lever tried on the last day left K at 507.
 
 ## 4. Field Applicability
 - Operator workflow: top-k candidate recommendation with score margin; low-margin rows go to a human review queue in the field (not in the competition output).
