@@ -1,3 +1,10 @@
+---
+paths:
+  - "src/**"
+  - "tests/**"
+  - "tools/**"
+  - "docs/specs/**"
+---
 # Vessel Matching Domain Directives
 
 > **Goal: maximize the competition score (see `AGENTS.md` §2.5) with a deterministic, row-independent matcher. Experiment freely via `tools/evaluate.py`; keep `scratch/` for one-off probes only, and keep the submitted path reproducible and compliant.**

@@ -1,3 +1,8 @@
+---
+paths:
+  - "src/**"
+  - "tools/**"
+---
 # Code Style & Engineering Standards
 
 > **Respect existing layout and conventions. Keep typed contracts at boundaries. The submission path must stay simple, self-contained, and Python-only.**

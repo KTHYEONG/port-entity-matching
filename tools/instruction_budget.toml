@@ -1,0 +1,285 @@
+agents_file = "AGENTS.md"
+rules_dir = ".agents/rules"
+agents_max_lines = 100
+always_loaded_max_bytes = 9500
+scoped_rules_max_bytes = 16000
+
+[[retention]]
+file = "AGENTS.md"
+phrase = "Deterministic & Pure Canonicalization"
+
+[[retention]]
+file = "AGENTS.md"
+phrase = "Explainable Linkages (dev/analysis path)"
+
+[[retention]]
+file = "AGENTS.md"
+phrase = "Ambiguity"
+
+[[retention]]
+file = "AGENTS.md"
+phrase = "Workspace Hygiene"
+
+[[retention]]
+file = "AGENTS.md"
+phrase = "Bias Toward Action & Diagnostic Autonomy"
+
+[[retention]]
+file = "AGENTS.md"
+phrase = "Skills"
+
+[[retention]]
+file = "AGENTS.md"
+phrase = "Task"
+
+[[retention]]
+file = "AGENTS.md"
+phrase = "Metric"
+
+[[retention]]
+file = "AGENTS.md"
+phrase = "Row independence (critical)"
+
+[[retention]]
+file = "AGENTS.md"
+phrase = "Data allowlist"
+
+[[retention]]
+file = "AGENTS.md"
+phrase = "Submission contract"
+
+[[retention]]
+file = "AGENTS.md"
+phrase = "Environment match"
+
+[[retention]]
+file = "AGENTS.md"
+phrase = "Runtime budget"
+
+[[retention]]
+file = "AGENTS.md"
+phrase = "Reproducibility"
+
+[[retention]]
+file = "AGENTS.md"
+phrase = "Finals rubric (100)"
+
+[[retention]]
+file = "AGENTS.md"
+phrase = "Limits and schedule"
+
+[[retention]]
+file = "AGENTS.md"
+phrase = "Data handling"
+
+[[retention]]
+file = "AGENTS.md"
+phrase = "Consent terms"
+
+[[retention]]
+file = "AGENTS.md"
+phrase = "Quality Gate"
+
+[[retention]]
+file = "AGENTS.md"
+phrase = "Test Runner"
+
+[[retention]]
+file = "AGENTS.md"
+phrase = "Git Commits"
+
+[[retention]]
+file = "AGENTS.md"
+phrase = "Natural Korean"
+
+[[retention]]
+file = "AGENTS.md"
+phrase = "Technical English"
+
+[[retention]]
+file = ".agents/rules/code-style.md"
+phrase = "Python only"
+
+[[retention]]
+file = ".agents/rules/code-style.md"
+phrase = "Thin entry point"
+
+[[retention]]
+file = ".agents/rules/code-style.md"
+phrase = "Pinned dependencies"
+
+[[retention]]
+file = ".agents/rules/code-style.md"
+phrase = "Reproducibility"
+
+[[retention]]
+file = ".agents/rules/documentation.md"
+phrase = "Self-Documenting Code First"
+
+[[retention]]
+file = ".agents/rules/documentation.md"
+phrase = "Rationale-Only Standard"
+
+[[retention]]
+file = ".agents/rules/documentation.md"
+phrase = "Caller Contracts, Not Spec Echoes"
+
+[[retention]]
+file = ".agents/rules/documentation.md"
+phrase = "Contract-Driven Documentation"
+
+[[retention]]
+file = ".agents/rules/documentation.md"
+phrase = "Consistent Semantic Convention"
+
+[[retention]]
+file = ".agents/rules/documentation.md"
+phrase = "Private Helpers"
+
+[[retention]]
+file = ".agents/rules/documentation.md"
+phrase = "Stable Boundaries & Semantics"
+
+[[retention]]
+file = ".agents/rules/documentation.md"
+phrase = "Coherent In-Place Updates"
+
+[[retention]]
+file = ".agents/rules/documentation.md"
+phrase = "Contract & Code Reconciliation"
+
+[[retention]]
+file = ".agents/rules/documentation.md"
+phrase = "Single source"
+
+[[retention]]
+file = ".agents/rules/documentation.md"
+phrase = "Finals material"
+
+[[retention]]
+file = ".agents/rules/documentation.md"
+phrase = "All Documentation & In-line Comments"
+
+[[retention]]
+file = ".agents/rules/domain.md"
+phrase = "Problem shape"
+
+[[retention]]
+file = ".agents/rules/domain.md"
+phrase = "Row independence"
+
+[[retention]]
+file = ".agents/rules/domain.md"
+phrase = "Metric alignment"
+
+[[retention]]
+file = ".agents/rules/domain.md"
+phrase = "Deterministic & pure"
+
+[[retention]]
+file = ".agents/rules/domain.md"
+phrase = "Missing/dirty fields"
+
+[[retention]]
+file = ".agents/rules/domain.md"
+phrase = "Submission path"
+
+[[retention]]
+file = ".agents/rules/domain.md"
+phrase = "Diagnostics path"
+
+[[retention]]
+file = ".agents/rules/domain.md"
+phrase = "Honest validation"
+
+[[retention]]
+file = ".agents/rules/domain.md"
+phrase = "Catalog caveat"
+
+[[retention]]
+file = ".agents/rules/domain.md"
+phrase = "Determinism"
+
+[[retention]]
+file = ".agents/rules/domain.md"
+phrase = "Candidate generation"
+
+[[retention]]
+file = ".agents/rules/domain.md"
+phrase = "Batch processing"
+
+[[retention]]
+file = ".agents/rules/domain.md"
+phrase = "Minimal deterministic cases"
+
+[[retention]]
+file = ".agents/rules/domain.md"
+phrase = "Contract tests"
+
+[[retention]]
+file = ".agents/rules/logging.md"
+phrase = "No sensitive content"
+
+[[retention]]
+file = ".agents/rules/performance.md"
+phrase = "Rehearse the budget"
+
+[[retention]]
+file = ".agents/rules/performance.md"
+phrase = "Package size"
+
+[[retention]]
+file = ".agents/rules/performance.md"
+phrase = "Offline-safe"
+
+[[retention]]
+file = ".agents/rules/testing.md"
+phrase = "Contracts first"
+
+[[retention]]
+file = ".agents/rules/testing.md"
+phrase = "Proportional process"
+
+[[retention]]
+file = ".agents/rules/testing.md"
+phrase = "Behavior over internals"
+
+[[retention]]
+file = ".agents/rules/testing.md"
+phrase = "Minimal inputs"
+
+[[retention]]
+file = ".agents/rules/testing.md"
+phrase = "Row independence"
+
+[[retention]]
+file = ".agents/rules/testing.md"
+phrase = "Determinism"
+
+[[retention]]
+file = ".agents/rules/testing.md"
+phrase = "Submission format"
+
+[[retention]]
+file = ".agents/rules/testing.md"
+phrase = "Entry point"
+
+[[retention]]
+file = ".agents/rules/testing.md"
+phrase = "Speed"
+
+[[retention]]
+file = ".agents/rules/testing.md"
+phrase = "Focus"
+
+[[retention]]
+file = ".agents/rules/testing.md"
+phrase = "Isolation"
+
+[[retention]]
+file = ".agents/rules/testing.md"
+phrase = "Instrumentation"
+
+[[retention]]
+file = ".agents/rules/testing.md"
+phrase = "Mocking"

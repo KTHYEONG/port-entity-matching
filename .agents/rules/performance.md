@@ -1,3 +1,7 @@
+---
+paths:
+  - "src/**"
+---
 # Performance & Resource Directives
 
 > **Correctness first, then speed. The binding constraint is the evaluation server budget (`AGENTS.md` §2.5): 30 min inference, 26 GB RAM, L4 GPU 22.4 GiB, 6 vCPU, no internet. Never gain speed by silently dropping catalog entries, rows, or precision.**

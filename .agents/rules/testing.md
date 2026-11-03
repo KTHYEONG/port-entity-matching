@@ -1,3 +1,8 @@
+---
+paths:
+  - "tests/**"
+  - "tools/**"
+---
 # Testing Directives & Quality Standards
 
 > **Verify observable behavior and interface contracts, not internals. Keep tests small, deterministic, and fast. Competition-critical contracts are always tested.**

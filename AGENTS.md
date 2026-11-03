@@ -32,19 +32,21 @@ Verify code changes against the project's native toolchains before concluding ta
 - **Quality Gate:** `uv run python tools/verify.py`
 - **Test Runner:** `uv run pytest`
 - **Git Commits:** Run the project's `commit` skill.
+- Instruction budget: `uv run python tools/instruction_budget.py`
+- Commit guard: git config core.hooksPath .githooks (one-time per clone). Claude Code also runs a Bash guard hook (`.claude/settings.json`); Codex/agy get only the git hook.
 
 ## 4. Communication & Language
 - **Natural Korean:** Converse, explain rationales, and report findings in Korean (한국어). Inside structured output cards, retain English keys/badges while writing descriptions in Korean.
 - **Technical English:** System instructions, rules, specifications (`docs/specs/`), code, and docstrings are written in English.
 
 ## 5. Domain Rule Routing
-- **Competition Reference:** [competition.md](docs/architecture/competition.md) — *Full rules, schedule, submission contract, and data description.*
-- **Domain Invariants:** [domain.md](.agents/rules/domain.md) — *Vessel matching task model, canonicalization, ambiguity handling, leakage-safe validation, and retrieval scale.*
-- **Testing & Quality:** [testing.md](.agents/rules/testing.md) — *Invariant-driven testing, mandatory row-independence and submission-contract tests, boundaries.*
-- **Architecture & Standards:** [code-style.md](.agents/rules/code-style.md) — *Module boundaries, typing, and the Python-only submission boundary.*
-- **Documentation & Comments:** [documentation.md](.agents/rules/documentation.md) — *Docstrings, architecture docs, and competition documentation.*
-- **Performance & Optimization:** [performance.md](.agents/rules/performance.md) — *30-minute inference budget, memory limits, and efficient candidate retrieval.*
-- **Logging & Diagnostics:** [logging.md](.agents/rules/logging.md) — *Category taxonomy, structured logs, and no evaluation-data logging.*
+- Before touching submission, scoring, data handling, or anything the competition constrains: read `docs/architecture/competition.md`
+- Before touching `src/**`, `tests/**`, `tools/**`, or matching/canonicalization/validation logic: read `.agents/rules/domain.md`
+- Before touching `tests/**`, test tooling, or fixtures: read `.agents/rules/testing.md`
+- Before changing module boundaries, typing contracts, or the submission boundary: read `.agents/rules/code-style.md`
+- Before touching any logging call or log format: read `.agents/rules/logging.md`
+- Before touching inference hot paths, retrieval, or memory/time budgets: read `.agents/rules/performance.md`
+- Before touching docstrings, comments, or `docs/architecture/**`: read `.agents/rules/documentation.md`
 
 ## 6. Workflow Profile
 - verify: `uv run python tools/verify.py`

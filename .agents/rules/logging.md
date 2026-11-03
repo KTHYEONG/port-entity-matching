@@ -1,3 +1,7 @@
+---
+paths:
+  - "src/**"
+---
 # Logging & Diagnostic Directives
 
 > **Logs are concise, structured, and diagnosable. Never suppress tracebacks, never log evaluation data contents, and never delete diagnostic evidence unilaterally.**
