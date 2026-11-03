@@ -4,7 +4,7 @@
 
 ## 1. Paradigm: Invariant-Driven Development
 - **Contracts first:** Prefer strict typing, explicit schemas, and domain invariants over test-first ritual. Define interface and invariants before code; avoid tests that freeze internal APIs.
-- **Proportional process:** Bug fixes, localized changes, and probes: implement directly with targeted guard tests. Complex multi-component work: write a spec under `docs/specs/` first. Skills (`probe`, `spec`, `implement`, `check`) are independent tools, not a pipeline.
+- **Proportional process:** Bug fixes, localized changes, and probes: implement directly with targeted guard tests. Complex multi-component work: write a spec under `docs/specs/` first.
 - **Behavior over internals:** Assert return values, outputs, and error conditions, not private details or mock call counts.
 - **Minimal inputs:** Use tiny in-memory fixtures. Unit tests never load the full `data/` files.
 
