@@ -10,7 +10,7 @@
 
 ## 2. Autonomy & Execution Contract
 - **Bias Toward Action & Diagnostic Autonomy:** For data queries, exploratory scratch diagnostics, and empirical root-cause isolation, execute immediately without asking for permission. When investigating matching anomalies or edge-case entities, proactively run one-off probes under `scratch/` to discover ground truth, and take routine measurements with `tools/evaluate.py`. Never modify production pipeline code or commit in response to open-ended diagnostic queries.
-- **Skills as On-Demand Tools:** Skills (`probe`, `spec`, `implement`, `check`, `refactor`, `commit`) are modular, independent utilities—NOT a mandatory sequential conveyor belt. When explicitly invoked via slash commands (`/probe`, `/spec`, etc.), execute only that targeted skill and halt for user review. Specs live under `docs/specs/` (gitignored).
+- **Skills:** user-level and project-agnostic (`probe`, `spec`, `implement`, `check`, `refactor`, `commit`, `ship`); this project's policy is the Workflow Profile in §6. Individual slash invocations execute only that skill and halt for user review; `/ship` is the explicit autonomy opt-in for the approved implement → check → commit chain. Specs live under `docs/specs/` (gitignored).
 
 ## 2.5 Competition Hard Rules (DACON "AI Technology Competition for Solving Port Challenges")
 Source: https://dacon.io/competitions/official/236771 (organizer: MOF; host: Ulsan Port Authority). These rules take precedence over any conflicting rule below or in `.agents/rules/`. Violation can disqualify the team.
@@ -45,3 +45,15 @@ Verify code changes against the project's native toolchains before concluding ta
 - **Documentation & Comments:** [documentation.md](.agents/rules/documentation.md) — *Docstrings, architecture docs, and competition documentation.*
 - **Performance & Optimization:** [performance.md](.agents/rules/performance.md) — *30-minute inference budget, memory limits, and efficient candidate retrieval.*
 - **Logging & Diagnostics:** [logging.md](.agents/rules/logging.md) — *Category taxonomy, structured logs, and no evaluation-data logging.*
+
+## 6. Workflow Profile
+- verify: `uv run python tools/verify.py`
+- test_scoped: `uv run pytest {files}`
+- spec_dir: `docs/specs` (untracked; archive finished specs to `docs/specs/_done/`)
+- scratch_dir: `scratch/` (never commit)
+- high_risk_paths: `src/port_entity_matching/**`, the submission `script.py` path
+- hard_stops: using other test rows or test-file distribution (row-independence violation); external vessel DBs or labeled outside data; network access or downloads at inference time; transmitting competition data outside the machine; committing `data/` contents or raw catalogs; any code/model change after the preliminary round (leaderboard closes 11.01); breaking the `submit.zip` contract (`script.py`, `requirements.txt`, `output/submission.csv`); any `rm` without previewing exact targets
+- commit_style: Korean `<type>: <summary <=50 chars>` + `- **Why:** <rationale>`; types feat/fix/refactor/chore/docs; no AI or co-author trailers; every commit via `/commit`
+- artifact_language: English
+- report_language: Korean (card keys stay English)
+- rules: `.agents/rules/*.md`
